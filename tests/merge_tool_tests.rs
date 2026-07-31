@@ -2,9 +2,8 @@ use std::path::PathBuf;
 use std::{env, fs, process::Command};
 
 use git_agent::merge_tool::{
-    MergeArgs, MergeConnectorDebug, MergeLanguage, MergeLineKind, MergeSide, MergeTheme,
-    merge_debug_label, merge_language_label, merge_theme_label, parse_merge_args, three_way_merge,
-    write_merge_output,
+    MergeArgs, MergeLanguage, MergeLineKind, MergeSide, MergeTheme, merge_language_label,
+    merge_theme_label, parse_merge_args, three_way_merge, write_merge_output,
 };
 
 #[test]
@@ -114,7 +113,7 @@ fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     assert!(source.contains("\"merge_local_scroll\""));
     assert!(source.contains("\"merge_result_scroll\""));
     assert!(source.contains("\"merge_remote_scroll\""));
-    assert!(source.contains("id_salt(scroll_id)"));
+    assert!(source.contains(".id_salt((scroll_id, app.display_epoch))"));
     assert!(source.contains("toggle_theme("));
     assert!(source.contains("toggle_language("));
     assert!(source.contains("side_conflict_nav("));
@@ -132,7 +131,7 @@ fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     assert!(source.contains("offset: [3, 4]"));
     assert!(source.contains("bg_stroke = egui::Stroke::NONE"));
     assert!(source.contains("shared_scroll_y"));
-    assert!(source.contains("let frame_scroll_y = result_scroll_y;"));
+    assert!(source.contains("let frame_scroll_y = result_output.scroll_y;"));
     assert!(source.contains(".vertical_scroll_offset(scroll_y)"));
     assert!(source.contains("merge_editable_result_row("));
     assert!(source.contains("paint_merge_block_connectors("));
@@ -145,7 +144,7 @@ fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     assert!(!source.contains("egui::Button::new(\"v\")"));
     assert!(source.contains("\"使用我的版本\""));
     assert!(source.contains("\"使用他的版本\""));
-    assert!(!source.contains(".stroke("));
+    assert!(source.contains(".stroke(egui::Stroke::NONE)"));
     assert!(!source.contains("ui.separator()"));
     assert!(source.contains("\"合并修订\""));
     assert!(source.contains("\"中文\""));
@@ -163,26 +162,6 @@ fn merge_toolbar_labels_show_current_theme_and_language() {
     );
     assert_eq!(merge_language_label(MergeLanguage::Chinese), "中文");
     assert_eq!(merge_language_label(MergeLanguage::English), "EN");
-}
-
-#[test]
-fn merge_toolbar_labels_show_debug_state() {
-    assert_eq!(
-        merge_debug_label(MergeLanguage::Chinese, MergeConnectorDebug::Off),
-        "辅助线"
-    );
-    assert_eq!(
-        merge_debug_label(MergeLanguage::Chinese, MergeConnectorDebug::Guides),
-        "隐藏辅助线"
-    );
-    assert_eq!(
-        merge_debug_label(MergeLanguage::Chinese, MergeConnectorDebug::Log),
-        "日志辅助线"
-    );
-    assert_eq!(
-        merge_debug_label(MergeLanguage::English, MergeConnectorDebug::Off),
-        "Guides"
-    );
 }
 
 #[test]

@@ -1528,6 +1528,22 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{5f53}\u{524d}\u{5904}\u{4e8e}\u{5206}\u{79bb} HEAD\u{ff0c}\u{65e0}\u{6cd5}\u{63a8}\u{9001}\u{5230}\u{8fdc}\u{7aef}\u{5206}\u{652f}\u{3002}\u{8bf7}\u{5148}\u{68c0}\u{51fa}\u{6216}\u{521b}\u{5efa}\u{672c}\u{5730}\u{5206}\u{652f}\u{3002}",
     ),
     (
+        "push.non_fast_forward.title",
+        "\u{8fdc}\u{7aef}\u{6709}\u{65b0}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "push.non_fast_forward.message",
+        "\u{8fdc}\u{7aef}\u{5206}\u{652f}\u{5305}\u{542b}\u{672c}\u{5730}\u{5c1a}\u{672a}\u{5408}\u{5e76}\u{7684}\u{63d0}\u{4ea4}\u{3002}\u{662f}\u{5426}\u{5148}\u{62c9}\u{53d6}\u{5e76}\u{5408}\u{5e76}\u{ff0c}\u{7136}\u{540e}\u{7ee7}\u{7eed}\u{63a8}\u{9001}\u{ff1f}",
+    ),
+    (
+        "push.non_fast_forward.pull_and_push",
+        "\u{62c9}\u{53d6}\u{5e76}\u{5408}\u{5e76}\u{540e}\u{7ee7}\u{7eed}\u{63a8}\u{9001}",
+    ),
+    (
+        "push.non_fast_forward.cancel",
+        "\u{53d6}\u{6d88}\u{63a8}\u{9001}",
+    ),
+    (
         "push.force_confirm.title",
         "\u{786e}\u{8ba4}\u{5b89}\u{5168}\u{5f3a}\u{63a8}",
     ),
@@ -1645,6 +1661,16 @@ const EN: &[(&str, &str)] = &[
         "push.detached_error",
         "Current repository is in detached HEAD and cannot be pushed to a remote branch. Check out or create a local branch first.",
     ),
+    ("push.non_fast_forward.title", "Remote Has New Commits"),
+    (
+        "push.non_fast_forward.message",
+        "The remote branch contains commits that are not merged locally. Pull and merge before continuing the push?",
+    ),
+    (
+        "push.non_fast_forward.pull_and_push",
+        "Pull, Merge, and Continue Push",
+    ),
+    ("push.non_fast_forward.cancel", "Cancel Push"),
     ("push.force_confirm.title", "Confirm Safe Force Push"),
     (
         "push.force_confirm.message",
@@ -2527,7 +2553,7 @@ const EN: &[(&str, &str)] = &[
     ("worktree.conflicts.empty", "No conflicted files"),
     ("worktree.accept_yours", "Accept Yours"),
     ("worktree.accept_theirs", "Accept Theirs"),
-    ("worktree.merge", "Merge..."),
+    ("worktree.merge", "Merge Code"),
     ("stash.title", "Stashes"),
     ("stash.none", "No stashes"),
     ("stash.create", "Stash changes"),
@@ -2745,7 +2771,7 @@ const ZH: &[(&str, &str)] = &[
     ("worktree.conflicts.empty", "没有冲突文件"),
     ("worktree.accept_yours", "接受本地"),
     ("worktree.accept_theirs", "接受远端"),
-    ("worktree.merge", "合并..."),
+    ("worktree.merge", "合并代码"),
     ("stash.title", "贮藏"),
     ("stash.none", "没有贮藏"),
     ("stash.create", "贮藏更改"),

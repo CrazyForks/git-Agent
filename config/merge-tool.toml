@@ -1,0 +1,5 @@
+# Build-time merge-tool diagnostics.
+# Change connector_guides to true only when visual alignment debugging is needed,
+# then rebuild the merge executable and reopen the merge window.
+connector_guides = false
+connector_log = false

@@ -223,6 +223,8 @@ pub struct RepositorySnapshot {
     pub status: Vec<String>,
     pub staged: Vec<WorktreeFile>,
     pub unstaged: Vec<WorktreeFile>,
+    #[serde(default)]
+    pub conflicts: Vec<WorktreeFile>,
     pub commits: Vec<Commit>,
     pub date_commits: Vec<Commit>,
     pub topology_commits: Vec<Commit>,
@@ -349,6 +351,7 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let (staged, unstaged) = parse_status_entries(&status);
+    let conflicts = collect_worktree_conflicts(&staged, &unstaged);
 
     let mut branches = load_branches(&root).unwrap_or_default();
     if branches.is_empty() && branch != "HEAD" {
@@ -382,6 +385,7 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
         status,
         staged,
         unstaged,
+        conflicts,
         commits: Vec::new(),
         date_commits: Vec::new(),
         topology_commits: Vec::new(),
@@ -393,6 +397,21 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
         config,
         git_flow_config,
     })
+}
+
+fn collect_worktree_conflicts(
+    staged: &[WorktreeFile],
+    unstaged: &[WorktreeFile],
+) -> Vec<WorktreeFile> {
+    let mut files = BTreeMap::new();
+    for file in staged.iter().chain(unstaged) {
+        if file.is_conflicted() {
+            files
+                .entry(file.path.clone())
+                .or_insert_with(|| file.clone());
+        }
+    }
+    files.into_values().collect()
 }
 
 impl RepositorySnapshot {
@@ -3382,6 +3401,10 @@ fn rebase_edit_in_progress(root: &Path) -> bool {
 
 pub fn repository_rebase_in_progress(root: impl AsRef<Path>) -> bool {
     rebase_in_progress(root.as_ref())
+}
+
+pub fn repository_merge_in_progress(root: impl AsRef<Path>) -> bool {
+    merge_in_progress(root.as_ref())
 }
 
 pub fn repository_rebase_edit_in_progress(root: impl AsRef<Path>) -> bool {

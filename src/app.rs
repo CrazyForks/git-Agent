@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -106,6 +106,9 @@ const TOOLBAR_BUTTON_MIN_WIDTH: f32 = 48.0;
 const TOOLBAR_BUTTON_MAX_WIDTH: f32 = 160.0;
 const TOOLBAR_DOUBLE_CLICK_DELAY: f64 = 0.28;
 const FILE_ROW_HEIGHT: f32 = 24.0;
+const DIFF_CACHE_CAPACITY: usize = 20;
+const LARGE_WORKTREE_CACHE_LIMIT: usize = 20_000;
+const WORKTREE_TREE_MODE_FILE_LIMIT: usize = 10_000;
 const FILE_ROW_ICON_SLOT: f32 = 24.0;
 const FILE_ROW_LEFT_INSET: f32 = 10.0;
 const BRANCH_CURRENT_BADGE_RIGHT_GAP: f32 = 4.0;
@@ -163,7 +166,12 @@ const PUSH_LOCAL_BRANCH_COLUMN_WIDTH: f32 = 160.0;
 const PUSH_TRACK_COLUMN_WIDTH: f32 = 58.0;
 const PUSH_TABLE_COLUMN_GAP: f32 = 8.0;
 const PUSH_TABLE_ROW_HEIGHT: f32 = 28.0;
-const PUSH_TABLE_BODY_TEXT_Y_OFFSET: f32 = 3.0;
+const PUSH_TABLE_MAX_VISIBLE_ROWS: usize = 12;
+const PUSH_TABLE_BODY_MAX_HEIGHT: f32 = PUSH_TABLE_ROW_HEIGHT * PUSH_TABLE_MAX_VISIBLE_ROWS as f32;
+const PUSH_TABLE_BODY_TEXT_Y_OFFSET: f32 = 0.0;
+// Temporary visual calibration for the push branch grid. Keep this enabled until the
+// user confirms every text/control baseline is aligned, then remove it with the guide.
+const PUSH_TABLE_DEBUG_GUIDES: bool = false;
 const ACTION_DIALOG_TITLE_HEIGHT: f32 = 34.0;
 const ACTION_DIALOG_TITLE_SIZE: f32 = 16.0;
 const CHECKOUT_DIALOG_WIDTH: f32 = 980.0;
@@ -413,6 +421,7 @@ pub struct GitAgentApp {
     source_tab_open: bool,
     repo_source_tab: RepoSourceTab,
     snapshot: Option<RepositorySnapshot>,
+    repository_transition_focus_clear_pending: bool,
     snapshot_cache: HashMap<String, RepositorySnapshot>,
     layout: GraphLayout,
     selected_commit: Option<usize>,
@@ -478,6 +487,7 @@ pub struct GitAgentApp {
     file_search_hashes: HashSet<String>,
     details_cache: HashMap<String, CommitDetails>,
     diff_cache: HashMap<String, FileDiff>,
+    diff_cache_order: VecDeque<String>,
     selected_file_path: Option<String>,
     history_diff_display_mode: DiffDisplayMode,
     history_sort_order: HistorySortOrder,
@@ -506,6 +516,9 @@ pub struct GitAgentApp {
     pending_pull_action: Option<PullActionDialog>,
     pending_push_action: Option<PushActionDialog>,
     pending_force_push_confirm: Option<ConfirmForcePushDialog>,
+    pending_non_fast_forward_push: Option<PushAfterPullPlan>,
+    pending_push_after_pull: Option<PushAfterPullPlan>,
+    pending_push_recovery_candidate: Option<PushAfterPullPlan>,
     pending_rewritten_history_prompt_root: Option<PathBuf>,
     pending_rewritten_history_prompt: Option<RewrittenHistoryPrompt>,
     pending_credential_retry: Option<PendingCredentialRetryAction>,
@@ -713,8 +726,10 @@ struct RepoCommitState {
     no_verify: bool,
     gpg_sign: bool,
     message_history: Vec<String>,
-    /// Draft belongs to this repository store, never to the global visible editor.
+    /// Kept only for backwards-compatible deserialization. New drafts are scoped to a branch.
     draft_message: String,
+    #[serde(default)]
+    draft_messages_by_branch: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1045,6 +1060,24 @@ struct ConfirmForcePushDialog {
     remote: String,
     branches: Vec<git::PushBranchSpec>,
     options: git::PushOptions,
+}
+
+#[derive(Clone, Debug)]
+enum PushAfterPullRetry {
+    Quick,
+    Selected {
+        remote: String,
+        branches: Vec<git::PushBranchSpec>,
+        options: git::PushOptions,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct PushAfterPullPlan {
+    root: PathBuf,
+    remote: String,
+    remote_branch: String,
+    retry: PushAfterPullRetry,
 }
 
 #[derive(Clone, Debug)]
@@ -2055,7 +2088,21 @@ fn repo_snapshot_cache_path_for(path: &Path) -> Option<PathBuf> {
 
 const REPOSITORY_SNAPSHOT_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+fn repository_snapshot_is_cacheable(snapshot: &RepositorySnapshot) -> bool {
+    snapshot.status.len() <= LARGE_WORKTREE_CACHE_LIMIT
+}
+
+fn remove_cached_repository_snapshot(path: &Path) {
+    if let Some(cache_path) = repo_snapshot_cache_path_for(path) {
+        let _ = fs::remove_file(cache_path);
+    }
+}
+
 fn save_cached_repository_snapshot(snapshot: &RepositorySnapshot) {
+    if !repository_snapshot_is_cacheable(snapshot) {
+        remove_cached_repository_snapshot(&snapshot.root);
+        return;
+    }
     let snapshot = core_only_repository_snapshot(snapshot.clone());
     let Some(path) = repo_snapshot_cache_path_for(&snapshot.root) else {
         return;
@@ -2077,14 +2124,22 @@ fn load_cached_repository_snapshot(path: &Path) -> Option<RepositorySnapshot> {
         let _ = fs::remove_file(cache_path);
         return None;
     }
-    fs::read_to_string(cache_path)
+    let snapshot: RepositorySnapshot = fs::read_to_string(&cache_path)
         .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .map(core_only_repository_snapshot)
+        .and_then(|raw| serde_json::from_str(&raw).ok())?;
+    if !repository_snapshot_is_cacheable(&snapshot) {
+        let _ = fs::remove_file(cache_path);
+        return None;
+    }
+    Some(core_only_repository_snapshot(snapshot))
 }
 
 fn repo_state_key(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn commit_message_draft_key(path: &Path, branch: &str) -> String {
+    format!("{}::{branch}", repo_state_key(path))
 }
 
 fn default_repo_tab_name(root: &Path) -> String {
@@ -2103,32 +2158,33 @@ fn repo_tab_name_from_alias(root: &Path, alias: Option<&str>) -> String {
         .unwrap_or_else(|| default_repo_tab_name(root))
 }
 
-fn repository_snapshots_equal_for_refresh(
+fn repository_core_snapshots_equal_for_refresh(
     left: &RepositorySnapshot,
     right: &RepositorySnapshot,
 ) -> bool {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    normalize_repository_snapshot_refresh_labels(&mut left);
-    normalize_repository_snapshot_refresh_labels(&mut right);
-    left == right
-}
+    let stashes_equal = left.stashes.len() == right.stashes.len()
+        && left
+            .stashes
+            .iter()
+            .zip(&right.stashes)
+            .all(|(left, right)| left.selector == right.selector && left.message == right.message);
 
-fn normalize_repository_snapshot_refresh_labels(snapshot: &mut RepositorySnapshot) {
-    for commits in [
-        &mut snapshot.commits,
-        &mut snapshot.date_commits,
-        &mut snapshot.topology_commits,
-        &mut snapshot.all_date_commits,
-        &mut snapshot.all_topology_commits,
-    ] {
-        for commit in commits {
-            commit.relative_time.clear();
-        }
-    }
-    for stash in &mut snapshot.stashes {
-        stash.relative_time.clear();
-    }
+    left.root == right.root
+        && left.branch == right.branch
+        && left.merge_message == right.merge_message
+        && left.rebase_in_progress == right.rebase_in_progress
+        && left.rebase_editing == right.rebase_editing
+        && left.upstream == right.upstream
+        && left.branches == right.branches
+        && left.remotes == right.remotes
+        && stashes_equal
+        && left.tags == right.tags
+        && left.status == right.status
+        && left.staged == right.staged
+        && left.unstaged == right.unstaged
+        && left.conflicts == right.conflicts
+        && left.config == right.config
+        && left.git_flow_config == right.git_flow_config
 }
 
 fn clear_snapshot_history(snapshot: &mut RepositorySnapshot) {
@@ -2433,6 +2489,7 @@ impl GitAgentApp {
             source_tab_open: tabs_state.source_tab_open,
             repo_source_tab: RepoSourceTab::Local,
             snapshot: None,
+            repository_transition_focus_clear_pending: false,
             snapshot_cache: HashMap::new(),
             layout: GraphLayout::default(),
             selected_commit: None,
@@ -2500,6 +2557,7 @@ impl GitAgentApp {
             file_search_hashes: HashSet::new(),
             details_cache: HashMap::new(),
             diff_cache: HashMap::new(),
+            diff_cache_order: VecDeque::new(),
             selected_file_path: None,
             history_diff_display_mode: DiffDisplayMode::Blocks,
             history_sort_order: HistorySortOrder::Date,
@@ -2528,6 +2586,9 @@ impl GitAgentApp {
             pending_pull_action: None,
             pending_push_action: None,
             pending_force_push_confirm: None,
+            pending_non_fast_forward_push: None,
+            pending_push_after_pull: None,
+            pending_push_recovery_candidate: None,
             pending_rewritten_history_prompt_root: None,
             pending_rewritten_history_prompt: None,
             pending_credential_retry: None,
@@ -3096,6 +3157,11 @@ impl GitAgentApp {
     }
 
     fn cache_repository_snapshot(&mut self, snapshot: &RepositorySnapshot) {
+        if !repository_snapshot_is_cacheable(snapshot) {
+            self.snapshot_cache.remove(&repo_state_key(&snapshot.root));
+            remove_cached_repository_snapshot(&snapshot.root);
+            return;
+        }
         let snapshot = core_only_repository_snapshot(snapshot.clone());
         save_cached_repository_snapshot(&snapshot);
         self.snapshot_cache
@@ -3131,6 +3197,7 @@ impl GitAgentApp {
         self.search_selected_commit = None;
         self.details_cache.clear();
         self.diff_cache.clear();
+        self.diff_cache_order.clear();
         self.file_search_task = None;
         self.blame_task = None;
         self.pending_blame_action = None;
@@ -3147,18 +3214,58 @@ impl GitAgentApp {
         self.worktree_selection = WorktreeSelectionState::default();
     }
 
+    /// Receivers are cheap cancellation boundaries: dropping one prevents stale branch data
+    /// from updating the active view while the underlying Git process winds down.
+    fn invalidate_branch_sensitive_tasks(&mut self, root: &Path) {
+        let key = repo_state_key(root);
+        self.repo_history_tasks.remove(&key);
+        self.queued_repo_history_loads.remove(&key);
+        self.foreground_repo_history_loads.remove(&key);
+
+        if !self.active_repo_root_matches(root) {
+            return;
+        }
+        self.details_task = None;
+        self.diff_task = None;
+        self.file_search_task = None;
+        self.blame_task = None;
+        self.loading_details_hash = None;
+        self.loading_diff_key = None;
+        self.file_search_started_at = None;
+        self.pending_blame_action = None;
+    }
+
     fn apply_repository_snapshot(&mut self, mut snapshot: RepositorySnapshot) {
+        let outgoing_branch = self.snapshot.as_ref().and_then(|current| {
+            (paths_equal(&current.root, &snapshot.root) && current.branch != snapshot.branch)
+                .then(|| current.branch.clone())
+        });
+        let repository_transition = self.snapshot.as_ref().is_some_and(|current| {
+            !paths_equal(&current.root, &snapshot.root) || current.branch != snapshot.branch
+        });
+        if repository_transition {
+            if let Some(branch) = outgoing_branch.as_deref() {
+                self.save_commit_message_draft_for_branch(branch);
+            }
+            self.commit_message.clear();
+            self.invalidate_branch_sensitive_tasks(&snapshot.root);
+        }
+        self.repository_transition_focus_clear_pending |= repository_transition;
         self.apply_history_sort_order_to_snapshot(&mut snapshot);
         self.layout = graph::layout(&snapshot.commits);
         self.selected_commit = (!snapshot.commits.is_empty()).then_some(0);
         self.search_selected_commit = None;
         self.sync_active_tab_with_snapshot(&snapshot);
+        if repository_transition {
+            self.load_commit_message_draft_for_branch(&snapshot.root, &snapshot.branch);
+        }
         self.apply_sidebar_tree_state_for_repo(&snapshot.root);
         self.apply_merge_commit_message_default(&snapshot);
         self.maybe_prepare_rewritten_history_prompt(&snapshot);
         self.snapshot = Some(snapshot);
         self.details_cache.clear();
         self.diff_cache.clear();
+        self.diff_cache_order.clear();
         self.file_search_task = None;
         self.blame_task = None;
         self.pending_blame_action = None;
@@ -3174,6 +3281,21 @@ impl GitAgentApp {
         self.selected_worktree_file = None;
         self.worktree_selection = WorktreeSelectionState::default();
         self.request_selected_details();
+    }
+
+    /// A branch or repository transition can remove the focused widget in the same frame.
+    /// Clear egui's focus before AccessKit rebuilds its accessibility tree from that new UI.
+    fn clear_focus_after_repository_transition(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.repository_transition_focus_clear_pending) {
+            return;
+        }
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+            memory.stop_text_input();
+        });
+        ctx.request_repaint();
     }
 
     fn apply_repository_history(
@@ -3216,9 +3338,7 @@ impl GitAgentApp {
         let Some(current) = self.snapshot.as_ref() else {
             return false;
         };
-        let mut current = current.clone();
-        clear_snapshot_history(&mut current);
-        repository_snapshots_equal_for_refresh(&current, snapshot)
+        repository_core_snapshots_equal_for_refresh(current, snapshot)
     }
 
     fn maybe_prepare_rewritten_history_prompt(&mut self, snapshot: &RepositorySnapshot) {
@@ -4781,6 +4901,8 @@ impl GitAgentApp {
         }
 
         let has_local_changes = !snapshot.status.is_empty();
+        let root = snapshot.root.clone();
+        self.invalidate_branch_sensitive_tasks(&root);
         if strategy == BranchCheckoutStrategy::PreserveLocalChanges && !has_local_changes {
             let checkout_name = name.clone();
             self.start_undoable_git_action(
@@ -4791,7 +4913,6 @@ impl GitAgentApp {
             self.pending_branch_checkout = Some(name);
             return;
         }
-        let root = snapshot.root.clone();
 
         let (sender, receiver) = mpsc::channel();
         self.branch_checkout_task = Some(receiver);
@@ -5039,6 +5160,8 @@ impl GitAgentApp {
         branches: Vec<git::PushBranchSpec>,
         options: git::PushOptions,
     ) {
+        self.pending_push_recovery_candidate =
+            self.selected_push_after_pull_plan(&remote, &branches, options);
         self.start_credential_retry_action(
             PendingCredentialRetryAction::Push {
                 remote,
@@ -5047,6 +5170,78 @@ impl GitAgentApp {
             },
             false,
         );
+    }
+
+    fn selected_push_after_pull_plan(
+        &self,
+        remote: &str,
+        branches: &[git::PushBranchSpec],
+        options: git::PushOptions,
+    ) -> Option<PushAfterPullPlan> {
+        if options.force || branches.len() != 1 {
+            return None;
+        }
+        let snapshot = self.snapshot.as_ref()?;
+        let current = current_named_local_branch(snapshot)?;
+        let branch = branches.first()?;
+        if current.name != branch.local_branch
+            || remote.trim().is_empty()
+            || branch.remote_branch.trim().is_empty()
+        {
+            return None;
+        }
+        Some(PushAfterPullPlan {
+            root: snapshot.root.clone(),
+            remote: remote.to_owned(),
+            remote_branch: branch.remote_branch.clone(),
+            retry: PushAfterPullRetry::Selected {
+                remote: remote.to_owned(),
+                branches: branches.to_vec(),
+                options,
+            },
+        })
+    }
+
+    fn quick_push_after_pull_plan(&self) -> Option<PushAfterPullPlan> {
+        quick_push_after_pull_plan_for_snapshot(self.snapshot.as_ref()?)
+    }
+
+    fn push_recovery_plan_for_error(&mut self, root: &Path) -> Option<PushAfterPullPlan> {
+        if self
+            .pending_push_recovery_candidate
+            .as_ref()
+            .is_some_and(|plan| paths_equal(&plan.root, root))
+        {
+            return self.pending_push_recovery_candidate.take();
+        }
+
+        self.snapshot
+            .as_ref()
+            .filter(|snapshot| paths_equal(&snapshot.root, root))
+            .and_then(quick_push_after_pull_plan_for_snapshot)
+    }
+
+    fn resume_push_after_pull(&mut self, plan: PushAfterPullPlan) {
+        self.pending_push_recovery_candidate = None;
+        match plan.retry {
+            PushAfterPullRetry::Quick => {
+                self.start_remote_git_action_with_status("status.pushing", |root| git::push(root));
+            }
+            PushAfterPullRetry::Selected {
+                remote,
+                branches,
+                options,
+            } => {
+                self.start_credential_retry_action(
+                    PendingCredentialRetryAction::Push {
+                        remote,
+                        branches,
+                        options,
+                    },
+                    false,
+                );
+            }
+        }
     }
 
     fn start_pull_request_push_with_credential_retry(
@@ -5392,6 +5587,9 @@ impl GitAgentApp {
         self.pending_pull_action = None;
         self.pending_push_action = None;
         self.pending_force_push_confirm = None;
+        self.pending_non_fast_forward_push = None;
+        self.pending_push_after_pull = None;
+        self.pending_push_recovery_candidate = None;
         self.pending_merge_action = None;
         self.pending_interactive_rebase_action = None;
         self.pending_rewritten_history_prompt = None;
@@ -5414,6 +5612,7 @@ impl GitAgentApp {
             self.error = Some(self.tr("push.detached_error").to_owned());
             return;
         }
+        self.pending_push_recovery_candidate = self.quick_push_after_pull_plan();
         self.start_remote_git_action_with_status("status.pushing", |root| git::push(root));
     }
 
@@ -6052,6 +6251,26 @@ impl GitAgentApp {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
                     self.remote_git_status_key = None;
+                    if self
+                        .pending_push_after_pull
+                        .as_ref()
+                        .is_some_and(|plan| paths_equal(&plan.root, &root))
+                    {
+                        let plan = self
+                            .pending_push_after_pull
+                            .take()
+                            .expect("push plan exists");
+                        self.pending_push_recovery_candidate = None;
+                        self.pending_credential_retry = None;
+                        self.credential_retry_in_progress = false;
+                        self.loading_repo = false;
+                        self.error = None;
+                        self.last_notice = None;
+                        self.resume_push_after_pull(plan);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    self.pending_push_recovery_candidate = None;
                     let pull_request_to_open = self
                         .pending_pull_request_open_after_push
                         .take()
@@ -6099,6 +6318,36 @@ impl GitAgentApp {
                     self.loading_repo = false;
                     let mut message = error.to_string();
                     let auth_error = github_authentication_error(&message);
+                    if !auth_error && non_fast_forward_push_error(&message) {
+                        if let Some(plan) = self.push_recovery_plan_for_error(&root) {
+                            self.pending_non_fast_forward_push = Some(plan);
+                            self.pending_credential_retry = None;
+                            self.credential_retry_in_progress = false;
+                            self.error = None;
+                            self.last_notice = None;
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
+                    self.pending_push_recovery_candidate = None;
+                    let pull_after_push_failed = self
+                        .pending_push_after_pull
+                        .as_ref()
+                        .is_some_and(|plan| paths_equal(&plan.root, &root));
+                    if pull_after_push_failed && git::repository_merge_in_progress(&root) {
+                        self.pending_push_after_pull = None;
+                        self.pending_credential_retry = None;
+                        self.credential_retry_in_progress = false;
+                        self.active_view = MainView::Workspace;
+                        self.error = None;
+                        self.last_notice = None;
+                        self.load_repository_uncached(root);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if pull_after_push_failed {
+                        self.pending_push_after_pull = None;
+                    }
                     let was_login_retry = self.credential_retry_in_progress;
                     self.credential_retry_in_progress = false;
                     if was_login_retry && auth_error {
@@ -6126,6 +6375,9 @@ impl GitAgentApp {
                     self.remote_git_status_key = None;
                     self.pending_rewritten_history_prompt_root = None;
                     self.pending_pull_request_open_after_push = None;
+                    self.pending_non_fast_forward_push = None;
+                    self.pending_push_after_pull = None;
+                    self.pending_push_recovery_candidate = None;
                     self.loading_repo = false;
                     self.error = Some("Remote Git action stopped unexpectedly".to_owned());
                     self.last_notice = None;
@@ -6345,7 +6597,11 @@ impl GitAgentApp {
             match receiver.try_recv() {
                 Ok(Ok(diff)) => {
                     self.loading_diff_key = None;
-                    self.diff_cache.insert(diff.key.clone(), diff);
+                    insert_bounded_diff_cache(
+                        &mut self.diff_cache,
+                        &mut self.diff_cache_order,
+                        diff,
+                    );
                     ctx.request_repaint();
                 }
                 Ok(Err(error)) => {
@@ -6822,27 +7078,63 @@ impl GitAgentApp {
         let Some(root) = self.active_repo_root() else {
             return;
         };
-        let key = repo_state_key(&root);
-        self.commit_state.draft_message = self.commit_message.clone();
-        self.save_commit_state_for_active_repo();
-        if self.commit_message.is_empty() {
-            self.commit_message_drafts.remove(&key);
-        } else {
-            self.commit_message_drafts
-                .insert(key, self.commit_message.clone());
+        let branch = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| paths_equal(&snapshot.root, &root))
+            .map(|snapshot| snapshot.branch.clone());
+        if let Some(branch) = branch.as_deref() {
+            self.save_commit_message_draft_for_branch(branch);
         }
     }
 
     fn load_commit_message_draft_for_active_repo(&mut self) {
-        self.commit_message = self.commit_state.draft_message.clone();
-        if let Some(root) = self.active_repo_root() {
-            let key = repo_state_key(&root);
-            if self.commit_message.is_empty() {
-                self.commit_message_drafts.remove(&key);
-            } else {
-                self.commit_message_drafts
-                    .insert(key, self.commit_message.clone());
-            }
+        self.commit_message.clear();
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+        let branch = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| paths_equal(&snapshot.root, &root))
+            .map(|snapshot| snapshot.branch.clone());
+        if let Some(branch) = branch.as_deref() {
+            self.load_commit_message_draft_for_branch(&root, branch);
+        }
+    }
+
+    fn save_commit_message_draft_for_branch(&mut self, branch: &str) {
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+        let draft_key = commit_message_draft_key(&root, branch);
+        self.commit_state.draft_message.clear();
+        if self.commit_message.is_empty() {
+            self.commit_state.draft_messages_by_branch.remove(branch);
+            self.commit_message_drafts.remove(&draft_key);
+        } else {
+            self.commit_state
+                .draft_messages_by_branch
+                .insert(branch.to_owned(), self.commit_message.clone());
+            self.commit_message_drafts
+                .insert(draft_key, self.commit_message.clone());
+        }
+        self.save_commit_state_for_active_repo();
+    }
+
+    fn load_commit_message_draft_for_branch(&mut self, root: &Path, branch: &str) {
+        self.commit_message = self
+            .commit_state
+            .draft_messages_by_branch
+            .get(branch)
+            .cloned()
+            .unwrap_or_default();
+        let draft_key = commit_message_draft_key(root, branch);
+        if self.commit_message.is_empty() {
+            self.commit_message_drafts.remove(&draft_key);
+        } else {
+            self.commit_message_drafts
+                .insert(draft_key, self.commit_message.clone());
         }
     }
 
@@ -6926,6 +7218,15 @@ impl GitAgentApp {
                 "status.committing_and_pushing"
             } else {
                 "status.committing"
+            };
+            self.pending_push_recovery_candidate = if push_immediately
+                && push_target
+                    .as_ref()
+                    .is_some_and(|(_, _, has_upstream)| *has_upstream)
+            {
+                self.quick_push_after_pull_plan()
+            } else {
+                None
             };
             self.start_remote_git_action_with_status(status_key, move |root| {
                 git::commit_with_options(root, &message, options)?;
@@ -7043,6 +7344,7 @@ impl App for GitAgentApp {
         self.pull_action_modal(ctx);
         self.push_action_modal(ctx);
         self.force_push_confirm_modal(ctx);
+        self.non_fast_forward_push_modal(ctx);
         self.create_pull_request_action_modal(ctx);
         self.archive_action_modal(ctx);
         self.interactive_rebase_action_modal(ctx);
@@ -7066,6 +7368,7 @@ impl App for GitAgentApp {
         self.repository_benchmark_progress_modal(ctx);
         self.error_modal(ctx);
         self.toast_overlay(ctx);
+        self.clear_focus_after_repository_transition(ctx);
     }
 }
 
@@ -9790,10 +10093,10 @@ impl GitAgentApp {
             return;
         };
 
-        let staged = snapshot.staged.clone();
-        let unstaged = snapshot.unstaged.clone();
         let conflict_files = worktree_conflict_files(snapshot);
         let status_count = snapshot.status.len();
+        let has_staged = !snapshot.staged.is_empty();
+        let has_unstaged = !snapshot.unstaged.is_empty();
         let mut worktree_action = None;
         let mut selected_worktree_after_draw = None;
         let worktree_selection = self.worktree_selection.clone();
@@ -9840,7 +10143,7 @@ impl GitAgentApp {
                     ui,
                     None,
                     self.tr("worktree.stage_all"),
-                    !unstaged.is_empty(),
+                    has_unstaged,
                 )
                 .clicked()
                 {
@@ -9850,7 +10153,7 @@ impl GitAgentApp {
                     ui,
                     None,
                     self.tr("worktree.unstage_all"),
-                    !staged.is_empty(),
+                    has_staged,
                 )
                 .clicked()
                 {
@@ -9898,8 +10201,6 @@ impl GitAgentApp {
                 ui.set_clip_rect(left_rect);
                 self.workspace_main_panel(
                     ui,
-                    &staged,
-                    &unstaged,
                     &worktree_selection,
                     &mut worktree_action,
                     &mut selected_worktree_after_draw,
@@ -9920,8 +10221,6 @@ impl GitAgentApp {
         } else {
             self.workspace_main_panel(
                 ui,
-                &staged,
-                &unstaged,
                 &worktree_selection,
                 &mut worktree_action,
                 &mut selected_worktree_after_draw,
@@ -9932,17 +10231,23 @@ impl GitAgentApp {
             self.handle_worktree_action(action);
         }
         if let Some(selected) = selected_worktree_after_draw {
-            let files = if selected.file.staged {
-                &staged
-            } else {
-                &unstaged
-            };
-            self.worktree_selection.apply(
-                files,
-                &selected.file.path,
-                selected.file.staged,
-                selected.modifiers,
-            );
+            {
+                let snapshot = self
+                    .snapshot
+                    .as_ref()
+                    .expect("workspace selection requires an active snapshot");
+                let files = if selected.file.staged {
+                    &snapshot.staged
+                } else {
+                    &snapshot.unstaged
+                };
+                self.worktree_selection.apply(
+                    files,
+                    &selected.file.path,
+                    selected.file.staged,
+                    selected.modifiers,
+                );
+            }
             self.selected_worktree_file = Some(selected.file);
             self.selected_file_path = None;
             self.selected_diff_rows.clear();
@@ -9953,8 +10258,6 @@ impl GitAgentApp {
     fn workspace_main_panel(
         &mut self,
         ui: &mut Ui,
-        staged: &[WorktreeFile],
-        unstaged: &[WorktreeFile],
         worktree_selection: &WorktreeSelectionState,
         worktree_action: &mut Option<WorktreeMenuAction>,
         selected_worktree_after_draw: &mut Option<WorktreeRowClick>,
@@ -9967,21 +10270,38 @@ impl GitAgentApp {
             self.layout_prefs.workspace_staged_pct,
         );
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(layout.staged_rect), |ui| {
-            worktree_table(
-                ui,
-                self.tr("worktree.staged"),
-                staged,
-                true,
-                layout.staged_rect.height(),
-                self.language,
-                worktree_selection,
-                self.worktree_display_mode,
-                &mut self.worktree_collapsed_dirs,
-                worktree_action,
-                selected_worktree_after_draw,
-            );
-        });
+        let staged_title = self.tr("worktree.staged").to_owned();
+        let unstaged_title = self.tr("worktree.unstaged").to_owned();
+        let language = self.language;
+        let display_mode = self.worktree_display_mode;
+        let staged_len = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.staged.len())
+            .unwrap_or_default();
+        {
+            let staged = self
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.staged.as_slice())
+                .unwrap_or_default();
+            let collapsed_dirs = &mut self.worktree_collapsed_dirs;
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(layout.staged_rect), |ui| {
+                worktree_table(
+                    ui,
+                    &staged_title,
+                    staged,
+                    true,
+                    layout.staged_rect.height(),
+                    language,
+                    worktree_selection,
+                    display_mode,
+                    collapsed_dirs,
+                    worktree_action,
+                    selected_worktree_after_draw,
+                );
+            });
+        }
         if let Some(delta) = horizontal_resize_delta(
             ui,
             layout.staged_unstaged_splitter_rect,
@@ -9993,24 +10313,32 @@ impl GitAgentApp {
                 ((layout.staged_rect.height() + delta) / table_total).clamp(0.24, 0.76);
             self.layout_prefs.save();
         }
-        ui.allocate_new_ui(
-            egui::UiBuilder::new().max_rect(layout.unstaged_rect),
-            |ui| {
-                worktree_table(
-                    ui,
-                    self.tr("worktree.unstaged"),
-                    unstaged,
-                    false,
-                    layout.unstaged_rect.height(),
-                    self.language,
-                    worktree_selection,
-                    self.worktree_display_mode,
-                    &mut self.worktree_collapsed_dirs,
-                    worktree_action,
-                    selected_worktree_after_draw,
-                );
-            },
-        );
+        {
+            let unstaged = self
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.unstaged.as_slice())
+                .unwrap_or_default();
+            let collapsed_dirs = &mut self.worktree_collapsed_dirs;
+            ui.allocate_new_ui(
+                egui::UiBuilder::new().max_rect(layout.unstaged_rect),
+                |ui| {
+                    worktree_table(
+                        ui,
+                        &unstaged_title,
+                        unstaged,
+                        false,
+                        layout.unstaged_rect.height(),
+                        language,
+                        worktree_selection,
+                        display_mode,
+                        collapsed_dirs,
+                        worktree_action,
+                        selected_worktree_after_draw,
+                    );
+                },
+            );
+        }
 
         if let Some(delta) = horizontal_resize_delta(
             ui,
@@ -10024,7 +10352,7 @@ impl GitAgentApp {
             self.layout_prefs.save();
         }
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(layout.commit_rect), |ui| {
-            self.commit_panel(ui, staged.len(), layout.commit_rect.height());
+            self.commit_panel(ui, staged_len, layout.commit_rect.height());
         });
         paint_layout_debug_rect(
             ui,
@@ -11399,8 +11727,17 @@ impl GitAgentApp {
         thread::spawn(move || {
             let result = child
                 .wait()
-                .map(|status| status.success())
-                .map_err(Into::into);
+                .map_err(anyhow::Error::from)
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(true)
+                    } else if status.code() == Some(crate::merge_tool::MERGE_TOOL_CANCEL_EXIT_CODE)
+                    {
+                        Ok(false)
+                    } else {
+                        anyhow::bail!("Merge tool exited unexpectedly: {status}")
+                    }
+                });
             let _ = sender.send((root_for_reload, result));
         });
     }
@@ -12182,16 +12519,21 @@ impl GitAgentApp {
                     .small()
                     .color(theme::muted()),
             );
-            ui.group(|ui| {
-                action_checkbox(ui, &mut dialog.commit_merge, self.tr("pull.commit_merge"));
-                action_checkbox(ui, &mut dialog.include_tags, self.tr("pull.include_tags"));
-                action_checkbox(
-                    ui,
-                    &mut dialog.force_merge_commit,
-                    self.tr("pull.force_merge_commit"),
-                );
-                action_checkbox(ui, &mut dialog.rebase, self.tr("pull.rebase"));
-            });
+            let options = egui::Frame::new()
+                .fill(theme::panel_recessed())
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(8, 7))
+                .show(ui, |ui| {
+                    action_checkbox(ui, &mut dialog.commit_merge, self.tr("pull.commit_merge"));
+                    action_checkbox(ui, &mut dialog.include_tags, self.tr("pull.include_tags"));
+                    action_checkbox(
+                        ui,
+                        &mut dialog.force_merge_commit,
+                        self.tr("pull.force_merge_commit"),
+                    );
+                    action_checkbox(ui, &mut dialog.rebase, self.tr("pull.rebase"));
+                });
+            paint_workspace_card_inset_shadow(ui, options.response.rect);
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -12300,9 +12642,10 @@ impl GitAgentApp {
                     .small()
                     .color(theme::muted()),
             );
-            egui::Frame::new()
-                .fill(theme::panel_soft())
-                .stroke(Stroke::new(1.0, theme::inset_shadow()))
+            let branch_table = egui::Frame::new()
+                .fill(theme::panel_recessed())
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(6))
                 .inner_margin(egui::Margin::symmetric(6, 6))
                 .show(ui, |ui| {
                     let table_width = ui.available_width();
@@ -12314,16 +12657,24 @@ impl GitAgentApp {
                         self.tr("push.remote_branch"),
                         self.tr("push.track"),
                     );
-                    for row in &mut dialog.rows {
-                        push_branch_table_row(
-                            ui,
-                            self.language,
-                            table_width,
-                            row,
-                            &remote_branches,
-                        );
-                    }
+                    ScrollArea::vertical()
+                        .id_salt("push_branch_table_body")
+                        .max_height(PUSH_TABLE_BODY_MAX_HEIGHT)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.set_width(table_width);
+                            for row in &mut dialog.rows {
+                                push_branch_table_row(
+                                    ui,
+                                    self.language,
+                                    table_width,
+                                    row,
+                                    &remote_branches,
+                                );
+                            }
+                        });
                 });
+            paint_workspace_card_inset_shadow(ui, branch_table.response.rect);
 
             ui.add_space(8.0);
             let mut all_selected =
@@ -12450,6 +12801,63 @@ impl GitAgentApp {
         }
         if keep_open {
             self.pending_force_push_confirm = Some(dialog);
+        }
+    }
+
+    fn non_fast_forward_push_modal(&mut self, ctx: &egui::Context) {
+        let Some(plan) = self.pending_non_fast_forward_push.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut pull_after_close = None;
+        compact_action_dialog(
+            ctx,
+            self.tr("push.non_fast_forward.title"),
+            ACTION_DIALOG_WIDTH,
+            |ui| {
+                ui.label(
+                    RichText::new(self.tr("push.non_fast_forward.message")).color(theme::text()),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("{}/{}", plan.remote, plan.remote_branch))
+                        .small()
+                        .color(theme::muted()),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if dialog_cancel_button(ui, self.tr("push.non_fast_forward.cancel"))
+                            .clicked()
+                        {
+                            keep_open = false;
+                        }
+                        if dialog_primary_button(
+                            ui,
+                            self.tr("push.non_fast_forward.pull_and_push"),
+                            true,
+                        )
+                        .clicked()
+                        {
+                            pull_after_close = Some(plan.clone());
+                            keep_open = false;
+                        }
+                    });
+                });
+            },
+        );
+
+        if let Some(plan) = pull_after_close {
+            let remote = plan.remote.clone();
+            let remote_branch = plan.remote_branch.clone();
+            self.pending_push_after_pull = Some(plan);
+            self.start_remote_git_action_with_status("status.pulling", move |root| {
+                git::pull_from_remote(root, &remote, &remote_branch, git::PullOptions::default())
+            });
+        }
+        if keep_open {
+            self.pending_non_fast_forward_push = Some(plan);
         }
     }
 
@@ -24507,15 +24915,26 @@ fn tree_empty(ui: &mut Ui, text: &str) {
 }
 
 fn worktree_conflict_files(snapshot: &RepositorySnapshot) -> Vec<WorktreeFile> {
-    let mut files = BTreeMap::new();
-    for file in snapshot.staged.iter().chain(snapshot.unstaged.iter()) {
-        if file.is_conflicted() {
-            files
-                .entry(file.path.clone())
-                .or_insert_with(|| file.clone());
+    snapshot.conflicts.clone()
+}
+
+fn insert_bounded_diff_cache(
+    cache: &mut HashMap<String, FileDiff>,
+    order: &mut VecDeque<String>,
+    diff: FileDiff,
+) {
+    let key = diff.key.clone();
+    if let Some(index) = order.iter().position(|cached_key| cached_key == &key) {
+        order.remove(index);
+    }
+    order.push_back(key.clone());
+    cache.insert(key, diff);
+
+    while order.len() > DIFF_CACHE_CAPACITY {
+        if let Some(expired_key) = order.pop_front() {
+            cache.remove(&expired_key);
         }
     }
-    files.into_values().collect()
 }
 
 fn selected_or_first_conflict<'a>(
@@ -24682,7 +25101,18 @@ fn conflict_resolution_action_button(ui: &mut Ui, text: &str, enabled: bool) -> 
         .fill(theme::panel_soft())
         .stroke(Stroke::NONE)
         .corner_radius(CornerRadius::same(4));
-    let response = ui.add_enabled(enabled, button);
+    let response = ui
+        .allocate_ui_with_layout(
+            CONFLICT_ACTION_BUTTON_SIZE,
+            Layout::top_down(Align::Center),
+            |ui| {
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.add_sized(CONFLICT_ACTION_BUTTON_SIZE, button)
+                })
+            },
+        )
+        .inner
+        .inner;
     if enabled {
         paint_text_button_hover_shadow_for_response(ui, &response);
         pointing_hand_cursor(response)
@@ -24870,72 +25300,86 @@ fn worktree_table(
                 ui.add_space(20.0);
                 ui.label(RichText::new("-").color(theme::muted()));
             } else {
-                ScrollArea::vertical()
-                    .id_salt(("worktree_table_scroll", staged, title))
-                    .max_height((height - 44.0).max(60.0))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_width((width - 28.0).max(80.0));
-                        match display_mode {
-                            WorktreeDisplayMode::Flat => {
-                                for file in files {
-                                    let row_selected = selection.contains(staged, &file.path);
-                                    let response = worktree_file_row(
-                                        ui,
-                                        file,
-                                        staged,
-                                        row_selected,
-                                        language,
-                                        action,
-                                        0,
-                                        &file.display_path,
-                                    );
-                                    if response.clicked() {
-                                        select_worktree_row(ui, file, staged, selected);
-                                    }
-                                }
-                            }
-                            WorktreeDisplayMode::Tree => {
-                                for row in worktree_tree_rows(files, collapsed_dirs) {
-                                    match row {
-                                        WorktreeTreeRow::Directory { path, depth } => {
-                                            let response = worktree_directory_row(
-                                                ui,
-                                                &path,
-                                                depth,
-                                                collapsed_dirs.contains(&path),
-                                                language,
-                                                action,
-                                            );
-                                            if response.clicked() {
-                                                if !collapsed_dirs.insert(path.clone()) {
-                                                    collapsed_dirs.remove(&path);
-                                                }
+                let tree_mode = matches!(display_mode, WorktreeDisplayMode::Tree)
+                    && files.len() <= WORKTREE_TREE_MODE_FILE_LIMIT;
+                if tree_mode {
+                    let rows = worktree_tree_rows(files, collapsed_dirs);
+                    ScrollArea::vertical()
+                        .id_salt(("worktree_table_scroll", staged, title))
+                        .max_height((height - 44.0).max(60.0))
+                        .auto_shrink([false, false])
+                        .show_rows(ui, FILE_ROW_HEIGHT, rows.len(), |ui, row_range| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.set_min_width((width - 28.0).max(80.0));
+                            for row_index in row_range {
+                                let Some(row) = rows.get(row_index) else {
+                                    continue;
+                                };
+                                match row {
+                                    WorktreeTreeRow::Directory { path, depth } => {
+                                        let response = worktree_directory_row(
+                                            ui,
+                                            path,
+                                            *depth,
+                                            collapsed_dirs.contains(path),
+                                            language,
+                                            action,
+                                        );
+                                        if response.clicked() {
+                                            if !collapsed_dirs.insert(path.clone()) {
+                                                collapsed_dirs.remove(path);
                                             }
                                         }
-                                        WorktreeTreeRow::File { file, depth } => {
-                                            let row_selected =
-                                                selection.contains(staged, &file.path);
-                                            let label = worktree_path_basename(&file.display_path);
-                                            let response = worktree_file_row(
-                                                ui,
-                                                file,
-                                                staged,
-                                                row_selected,
-                                                language,
-                                                action,
-                                                depth,
-                                                label,
-                                            );
-                                            if response.clicked() {
-                                                select_worktree_row(ui, file, staged, selected);
-                                            }
+                                    }
+                                    WorktreeTreeRow::File { file, depth } => {
+                                        let row_selected = selection.contains(staged, &file.path);
+                                        let label = worktree_path_basename(&file.display_path);
+                                        let response = worktree_file_row(
+                                            ui,
+                                            file,
+                                            staged,
+                                            row_selected,
+                                            language,
+                                            action,
+                                            *depth,
+                                            label,
+                                        );
+                                        if response.clicked() {
+                                            select_worktree_row(ui, file, staged, selected);
                                         }
                                     }
                                 }
                             }
-                        }
-                    });
+                        });
+                } else {
+                    ScrollArea::vertical()
+                        .id_salt(("worktree_table_scroll", staged, title))
+                        .max_height((height - 44.0).max(60.0))
+                        .auto_shrink([false, false])
+                        .show_rows(ui, FILE_ROW_HEIGHT, files.len(), |ui, row_range| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.set_min_width((width - 28.0).max(80.0));
+                            for row_index in row_range {
+                                let Some(file) = files.get(row_index) else {
+                                    continue;
+                                };
+                                let row_selected = selection.contains(staged, &file.path);
+                                let response = worktree_file_row(
+                                    ui,
+                                    file,
+                                    staged,
+                                    row_selected,
+                                    language,
+                                    action,
+                                    0,
+                                    &file.display_path,
+                                );
+                                if response.clicked() {
+                                    select_worktree_row(ui, file, staged, selected);
+                                }
+                            }
+                        });
+                }
             }
         });
         paint_workspace_card_inset_shadow(ui, panel_rect);
@@ -28352,6 +28796,20 @@ fn current_named_local_branch(snapshot: &RepositorySnapshot) -> Option<&git::Bra
         .find(|branch| !branch.remote && branch.name == branch_name)
 }
 
+fn quick_push_after_pull_plan_for_snapshot(
+    snapshot: &RepositorySnapshot,
+) -> Option<PushAfterPullPlan> {
+    let branch = current_named_local_branch(snapshot)?;
+    let upstream = branch.upstream.as_ref().or(snapshot.upstream.as_ref())?;
+    let (remote, remote_branch) = split_remote_branch_name(&upstream.name)?;
+    Some(PushAfterPullPlan {
+        root: snapshot.root.clone(),
+        remote,
+        remote_branch,
+        retry: PushAfterPullRetry::Quick,
+    })
+}
+
 fn github_authentication_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     let auth_error =
@@ -28360,6 +28818,16 @@ fn github_authentication_error(message: &str) -> bool {
         || message.contains("push access to verify locks")
         || message.contains("git push");
     auth_error && github_context
+}
+
+fn non_fast_forward_push_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("non-fast-forward")
+        || (message.contains("push")
+            && message.contains("rejected")
+            && (message.contains("fetch first")
+                || message.contains("remote contains work that you do not have locally")
+                || message.contains("tip of your current branch is behind")))
 }
 
 #[allow(dead_code)]
@@ -30723,6 +31191,15 @@ fn push_branch_table_header(
     let (row_rect, _) = ui.allocate_exact_size(Vec2::new(table_width, 24.0), Sense::hover());
     let (select_rect, local_rect, remote_rect, track_rect) =
         push_branch_cell_rects(row_rect, remote_width);
+    paint_push_branch_table_debug_guides(
+        ui,
+        row_rect,
+        select_rect,
+        local_rect,
+        remote_rect,
+        track_rect,
+        "push.header",
+    );
     paint_push_branch_text_cell(ui, select_rect, select_label, theme::muted(), 12.0);
     paint_push_branch_text_cell(ui, local_rect, local_branch_label, theme::muted(), 12.0);
     paint_push_branch_text_cell(ui, remote_rect, remote_branch_label, theme::muted(), 12.0);
@@ -30747,6 +31224,55 @@ fn push_branch_cell_rects(row_rect: Rect, remote_width: f32) -> (Rect, Rect, Rec
         Vec2::new(PUSH_TRACK_COLUMN_WIDTH, row_rect.height()),
     );
     (select_rect, local_rect, remote_rect, track_rect)
+}
+
+fn paint_push_branch_table_debug_guides(
+    ui: &Ui,
+    row_rect: Rect,
+    select_rect: Rect,
+    local_rect: Rect,
+    remote_rect: Rect,
+    track_rect: Rect,
+    label: &str,
+) {
+    if !PUSH_TABLE_DEBUG_GUIDES && !layout_debug_enabled() {
+        return;
+    }
+
+    let painter = ui.painter();
+    painter.rect_stroke(
+        row_rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, Color32::from_rgb(236, 156, 40)),
+        egui::StrokeKind::Inside,
+    );
+    for (rect, color) in [
+        (select_rect, Color32::from_rgb(80, 190, 120)),
+        (local_rect, Color32::from_rgb(80, 160, 240)),
+        (remote_rect, Color32::from_rgb(190, 100, 230)),
+        (track_rect, Color32::from_rgb(230, 190, 70)),
+    ] {
+        painter.rect_stroke(
+            rect,
+            CornerRadius::ZERO,
+            Stroke::new(1.0, color),
+            egui::StrokeKind::Inside,
+        );
+    }
+    painter.line_segment(
+        [
+            Pos2::new(row_rect.left(), row_rect.center().y),
+            Pos2::new(row_rect.right(), row_rect.center().y),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(240, 70, 70)),
+    );
+    painter.text(
+        row_rect.left_top() + Vec2::new(2.0, 1.0),
+        Align2::LEFT_TOP,
+        label,
+        FontId::monospace(9.0),
+        Color32::from_rgb(236, 156, 40),
+    );
 }
 
 fn paint_push_branch_text_cell(ui: &mut Ui, rect: Rect, text: &str, color: Color32, size: f32) {
@@ -30836,6 +31362,15 @@ fn push_branch_table_row(
         Rect::from_center_size(track_rect.center(), Vec2::splat(20.0)),
         ("push_branch_track", row.local_branch.as_str()),
         &mut row.track,
+    );
+    paint_push_branch_table_debug_guides(
+        ui,
+        row_rect,
+        select_rect,
+        local_rect,
+        remote_rect,
+        track_rect,
+        "push.row",
     );
 }
 
@@ -31417,6 +31952,64 @@ mod ui_tests {
     }
 
     #[test]
+    fn worktree_table_virtualizes_rows_and_bounds_tree_mode() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let table_start = implementation_source.find("fn worktree_table(").unwrap();
+        let table_end = implementation_source[table_start..]
+            .find("fn clean_worktree_state(")
+            .unwrap();
+        let table_source = &implementation_source[table_start..table_start + table_end];
+
+        assert!(table_source.contains(".show_rows("));
+        assert!(table_source.contains("files.len() <= WORKTREE_TREE_MODE_FILE_LIMIT"));
+        assert!(!table_source.contains("for file in files {"));
+    }
+
+    #[test]
+    fn diff_cache_keeps_only_the_twenty_most_recent_files() {
+        let mut cache = HashMap::new();
+        let mut order = VecDeque::new();
+
+        for index in 0..25 {
+            insert_bounded_diff_cache(
+                &mut cache,
+                &mut order,
+                FileDiff {
+                    key: format!("file-{index}"),
+                    text: format!("diff-{index}"),
+                },
+            );
+        }
+
+        assert_eq!(cache.len(), DIFF_CACHE_CAPACITY);
+        assert_eq!(order.len(), DIFF_CACHE_CAPACITY);
+        assert!((0..5).all(|index| !cache.contains_key(&format!("file-{index}"))));
+        assert!((5..25).all(|index| cache.contains_key(&format!("file-{index}"))));
+
+        insert_bounded_diff_cache(
+            &mut cache,
+            &mut order,
+            FileDiff {
+                key: "file-5".to_owned(),
+                text: "updated".to_owned(),
+            },
+        );
+        insert_bounded_diff_cache(
+            &mut cache,
+            &mut order,
+            FileDiff {
+                key: "file-25".to_owned(),
+                text: "new".to_owned(),
+            },
+        );
+
+        assert!(cache.contains_key("file-5"));
+        assert!(!cache.contains_key("file-6"));
+        assert_eq!(cache["file-5"].text, "updated");
+    }
+
+    #[test]
     fn worktree_selection_uses_windows_ctrl_and_shift_ranges() {
         let files = ["a.txt", "b.txt", "c.txt", "d.txt"]
             .into_iter()
@@ -31949,9 +32542,32 @@ mod ui_tests {
             .find("fn repo_state_key(")
             .unwrap();
         let load_source = &implementation_source[load_start..load_start + load_end];
-        assert!(load_source.contains(".map(core_only_repository_snapshot)"));
+        assert!(load_source.contains("repository_snapshot_is_cacheable(&snapshot)"));
+        assert!(load_source.contains("Some(core_only_repository_snapshot(snapshot))"));
         assert!(load_source.contains("metadata.len() > REPOSITORY_SNAPSHOT_CACHE_MAX_BYTES"));
         assert!(load_source.contains("fs::remove_file(cache_path)"));
+    }
+
+    #[test]
+    fn huge_worktree_snapshots_skip_repository_cache() {
+        let mut snapshot = RepositorySnapshot::default();
+        snapshot.status = vec!["?? generated/file".to_owned(); LARGE_WORKTREE_CACHE_LIMIT];
+        assert!(repository_snapshot_is_cacheable(&snapshot));
+
+        snapshot.status.push("?? generated/overflow".to_owned());
+        assert!(!repository_snapshot_is_cacheable(&snapshot));
+
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let cache_start = implementation_source
+            .find("fn cache_repository_snapshot(&mut self")
+            .unwrap();
+        let cache_end = implementation_source[cache_start..]
+            .find("fn cached_snapshot_for(")
+            .unwrap();
+        let cache_source = &implementation_source[cache_start..cache_start + cache_end];
+        assert!(cache_source.contains("if !repository_snapshot_is_cacheable(snapshot)"));
+        assert!(cache_source.contains("remove_cached_repository_snapshot(&snapshot.root)"));
     }
 
     #[test]
@@ -32906,7 +33522,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn commit_message_draft_is_scoped_per_repository_tab() {
+    fn commit_message_draft_is_scoped_per_repository_branch() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let fields_start = implementation_source
@@ -32918,8 +33534,17 @@ mod ui_tests {
         let fields_source = &implementation_source[fields_start..fields_start + fields_end];
         assert!(fields_source.contains("commit_message_drafts: HashMap<String, String>"));
         assert!(implementation_source.contains("draft_message: String"));
+        assert!(
+            implementation_source.contains("draft_messages_by_branch: BTreeMap<String, String>")
+        );
+        assert!(
+            implementation_source
+                .contains("fn commit_message_draft_key(path: &Path, branch: &str)")
+        );
         assert!(implementation_source.contains("fn save_commit_message_draft_for_active_repo("));
         assert!(implementation_source.contains("fn load_commit_message_draft_for_active_repo("));
+        assert!(implementation_source.contains("fn save_commit_message_draft_for_branch("));
+        assert!(implementation_source.contains("fn load_commit_message_draft_for_branch("));
 
         let load_start = implementation_source
             .find("fn load_repository_with_cache_mode(")
@@ -33217,7 +33842,7 @@ mod ui_tests {
         assert!(workspace_source.contains("workspace_main_layout("));
         assert!(
             workspace_source
-                .contains("self.commit_panel(ui, staged.len(), layout.commit_rect.height())")
+                .contains("self.commit_panel(ui, staged_len, layout.commit_rect.height())")
         );
         assert!(!panel_source.contains("ui.add_space(14.0)"));
         assert!(!panel_source.contains("let panel_height = ui.available_height()"));
@@ -34061,7 +34686,7 @@ mod ui_tests {
 
         assert!(
             workspace_source
-                .contains("self.commit_panel(ui, staged.len(), layout.commit_rect.height())")
+                .contains("self.commit_panel(ui, staged_len, layout.commit_rect.height())")
         );
         assert!(panel_source.contains(
             "fn commit_panel(&mut self, ui: &mut Ui, staged_count: usize, panel_height: f32)"
@@ -37452,7 +38077,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn repository_refresh_comparison_ignores_only_relative_time_labels() {
+    fn repository_core_refresh_comparison_ignores_history_and_relative_time_labels() {
         let commit = Commit {
             hash: "abcdef123456".to_owned(),
             short_hash: "abcdef1".to_owned(),
@@ -37486,14 +38111,14 @@ mod ui_tests {
             commits[0].relative_time = "2 minutes ago".to_owned();
         }
         right.stashes[0].relative_time = "2 minutes ago".to_owned();
-        assert!(repository_snapshots_equal_for_refresh(&left, &right));
+        assert!(repository_core_snapshots_equal_for_refresh(&left, &right));
 
         right.all_date_commits[0].subject = "real repository change".to_owned();
-        assert!(!repository_snapshots_equal_for_refresh(&left, &right));
+        assert!(repository_core_snapshots_equal_for_refresh(&left, &right));
 
         right.all_date_commits[0].subject = left.all_date_commits[0].subject.clone();
         left.status.push(" M src/app.rs".to_owned());
-        assert!(!repository_snapshots_equal_for_refresh(&left, &right));
+        assert!(!repository_core_snapshots_equal_for_refresh(&left, &right));
     }
 
     #[test]
@@ -37575,6 +38200,71 @@ mod ui_tests {
         assert!(modal.contains(".auto_shrink([false, true])"));
         assert!(modal.contains("dialog_footer_row(ui, |ui|"));
         assert!(!modal.contains("ui.with_layout(Layout::right_to_left(Align::Center)"));
+    }
+
+    #[test]
+    fn non_fast_forward_pushes_offer_pull_then_push_recovery() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_non_fast_forward_push: Option<PushAfterPullPlan>",
+            "pending_push_after_pull: Option<PushAfterPullPlan>",
+            "fn non_fast_forward_push_modal(&mut self, ctx: &egui::Context)",
+            "fn push_recovery_plan_for_error(&mut self, root: &Path)",
+            "git::pull_from_remote(root, &remote, &remote_branch, git::PullOptions::default())",
+            "self.resume_push_after_pull(plan);",
+            "git::repository_merge_in_progress(&root)",
+            "push.non_fast_forward.pull_and_push",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        assert!(non_fast_forward_push_error(
+            "git push failed: ! [rejected] main -> main (non-fast-forward)"
+        ));
+        assert!(non_fast_forward_push_error(
+            "git push failed: rejected (fetch first)"
+        ));
+        assert!(non_fast_forward_push_error(
+            "git push failed: To https://git.skyunion.net/ad/amp/frontend-base.git\n\
+             ! [rejected] f/UI-\u{6295}\u{653e} -> f/UI-\u{6295}\u{653e} (fetch first)\n\
+             error: failed to push some refs to 'https://git.skyunion.net/ad/amp/frontend-base.git'\n\
+             hint: Updates were rejected because the remote contains work that you do not have locally."
+        ));
+        assert!(!non_fast_forward_push_error(
+            "git push failed: authentication required"
+        ));
+        assert_eq!(
+            i18n::t(Language::Chinese, "push.non_fast_forward.cancel"),
+            "\u{53d6}\u{6d88}\u{63a8}\u{9001}"
+        );
+    }
+
+    #[test]
+    fn push_recovery_plan_can_be_rebuilt_from_current_branch_upstream() {
+        let snapshot = RepositorySnapshot {
+            root: PathBuf::from("D:/workspace/frontend-base"),
+            branch: "f/UI-\u{6295}\u{653e}".to_owned(),
+            upstream: Some(git::UpstreamStatus {
+                name: "origin/f/UI-\u{6295}\u{653e}".to_owned(),
+                ahead: 1,
+                behind: 1,
+            }),
+            branches: vec![git::Branch {
+                name: "f/UI-\u{6295}\u{653e}".to_owned(),
+                current: true,
+                remote: false,
+                upstream: None,
+            }],
+            ..RepositorySnapshot::default()
+        };
+
+        let plan = quick_push_after_pull_plan_for_snapshot(&snapshot).expect("recovery plan");
+        assert_eq!(plan.root, snapshot.root);
+        assert_eq!(plan.remote, "origin");
+        assert_eq!(plan.remote_branch, "f/UI-\u{6295}\u{653e}");
+        assert!(matches!(plan.retry, PushAfterPullRetry::Quick));
     }
 
     #[test]
@@ -38723,12 +39413,18 @@ diff --git a/file.txt b/file.txt
         assert!(modal_source.contains("push_remote_form_row("));
         assert!(modal_source.contains("push_branch_table_header("));
         assert!(modal_source.contains("push_branch_table_row("));
+        assert!(modal_source.contains(".id_salt(\"push_branch_table_body\")"));
+        assert!(modal_source.contains(".max_height(PUSH_TABLE_BODY_MAX_HEIGHT)"));
+        assert!(modal_source.contains("paint_workspace_card_inset_shadow("));
+        assert!(modal_source.contains(".fill(theme::panel_recessed())"));
+        assert!(modal_source.contains(".stroke(Stroke::NONE)"));
         assert!(!modal_source.contains("egui::Grid::new(\"push_branch_grid\")"));
         assert!(implementation_source.contains(".desired_width(url_width)"));
         assert!(implementation_source.contains("PUSH_SELECT_COLUMN_WIDTH"));
         assert!(implementation_source.contains("PUSH_LOCAL_BRANCH_COLUMN_WIDTH"));
         assert!(implementation_source.contains("PUSH_TRACK_COLUMN_WIDTH"));
         assert!(implementation_source.contains("const PUSH_TABLE_ROW_HEIGHT: f32 = 28.0;"));
+        assert!(implementation_source.contains("const PUSH_TABLE_MAX_VISIBLE_ROWS: usize = 12;"));
         assert!(implementation_source.contains("PUSH_TABLE_BODY_TEXT_Y_OFFSET"));
         assert!(implementation_source.contains("fn push_branch_cell_rects("));
         assert!(implementation_source.contains("fn paint_push_branch_text_cell("));
@@ -39477,6 +40173,73 @@ diff --git a/file.txt b/file.txt
             .unwrap();
         let apply_source = &implementation_source[apply_start..apply_start + apply_end];
         assert!(apply_source.contains("self.apply_merge_commit_message_default(&snapshot);"));
+    }
+
+    #[test]
+    fn repository_transition_clears_stale_accessibility_focus_before_frame_end() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let apply_start = implementation_source
+            .find("fn apply_repository_snapshot(&mut self")
+            .unwrap();
+        let apply_end = implementation_source[apply_start..]
+            .find("fn apply_repository_history(")
+            .unwrap();
+        let apply_source = &implementation_source[apply_start..apply_start + apply_end];
+        assert!(apply_source.contains("current.branch != snapshot.branch"));
+        assert!(apply_source.contains("repository_transition_focus_clear_pending"));
+
+        let focus_start = implementation_source
+            .find("fn clear_focus_after_repository_transition(")
+            .unwrap();
+        let focus_end = implementation_source[focus_start..]
+            .find("fn apply_repository_history(")
+            .unwrap();
+        let focus_source = &implementation_source[focus_start..focus_start + focus_end];
+        assert!(focus_source.contains("memory.surrender_focus(id)"));
+        assert!(focus_source.contains("memory.stop_text_input()"));
+
+        let update_start = implementation_source.find("fn update(&mut self").unwrap();
+        let update_end = implementation_source[update_start..]
+            .find("\n}\n\nimpl GitAgentApp")
+            .unwrap();
+        let update_source = &implementation_source[update_start..update_start + update_end];
+        assert!(update_source.contains("self.clear_focus_after_repository_transition(ctx);"));
+    }
+
+    #[test]
+    fn branch_checkout_invalidates_stale_branch_sensitive_receivers() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let invalidation_start = implementation_source
+            .find("fn invalidate_branch_sensitive_tasks(")
+            .unwrap();
+        let invalidation_end = implementation_source[invalidation_start..]
+            .find("fn apply_repository_snapshot(")
+            .unwrap();
+        let invalidation_source =
+            &implementation_source[invalidation_start..invalidation_start + invalidation_end];
+        for required in [
+            "self.repo_history_tasks.remove(&key)",
+            "self.queued_repo_history_loads.remove(&key)",
+            "self.details_task = None",
+            "self.diff_task = None",
+            "self.file_search_task = None",
+            "self.blame_task = None",
+        ] {
+            assert!(invalidation_source.contains(required), "{required}");
+        }
+
+        let checkout_start = implementation_source
+            .find("fn start_branch_checkout(&mut self")
+            .unwrap();
+        let checkout_end = implementation_source[checkout_start..]
+            .find("fn remote_git_busy(")
+            .unwrap();
+        let checkout_source = &implementation_source[checkout_start..checkout_start + checkout_end];
+        assert!(checkout_source.contains("self.invalidate_branch_sensitive_tasks(&root);"));
     }
 
     #[test]
@@ -40353,8 +41116,11 @@ diff --git a/file.txt b/file.txt
         assert!(
             implementation_source.contains("fn active_snapshot_matches_background_core_refresh(")
         );
-        assert!(implementation_source.contains("clear_snapshot_history(&mut current)"));
-        assert!(implementation_source.contains("repository_snapshots_equal_for_refresh("));
+        assert!(implementation_source.contains("repository_core_snapshots_equal_for_refresh("));
+        assert!(
+            implementation_source
+                .contains("repository_core_snapshots_equal_for_refresh(current, snapshot)")
+        );
 
         let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
         let poll_end = implementation_source[poll_start..]
@@ -40556,6 +41322,8 @@ diff --git a/file.txt b/file.txt
             &implementation_source[action_button_start..action_button_start + action_button_end];
         assert!(header_button_source.contains("paint_text_button_hover_shadow_for_response"));
         assert!(action_button_source.contains("paint_text_button_hover_shadow_for_response"));
+        assert!(action_button_source.contains("Layout::top_down(Align::Center)"));
+        assert!(action_button_source.contains("ui.add_sized(CONFLICT_ACTION_BUTTON_SIZE, button)"));
         assert!(implementation_source.contains("worktree.accept_yours"));
         assert!(implementation_source.contains("worktree.accept_theirs"));
         assert!(implementation_source.contains("worktree.resolve_conflicts"));
@@ -40570,6 +41338,9 @@ diff --git a/file.txt b/file.txt
         assert!(implementation_source.contains("fn merge_tool_busy(&self) -> bool"));
         assert!(implementation_source.contains("self.merge_tool_busy()"));
         assert!(implementation_source.contains(".wait()"));
+        assert!(
+            implementation_source.contains("Some(crate::merge_tool::MERGE_TOOL_CANCEL_EXIT_CODE)")
+        );
         assert!(implementation_source.contains("self.load_repository_uncached(root)"));
         assert!(implementation_source.contains("self.merge_tool_task = Some(receiver)"));
         assert!(implementation_source.contains(".arg(\"--repo-root\")"));
