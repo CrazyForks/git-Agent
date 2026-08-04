@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     env, fs,
     ops::Range,
@@ -9,7 +10,7 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
@@ -21,6 +22,7 @@ use eframe::{
         Sense, Ui, Vec2,
     },
 };
+use similar::{Algorithm, DiffTag, capture_diff_slices};
 
 use crate::dialog;
 
@@ -63,6 +65,39 @@ struct MergeSourceText {
     base: String,
     local: String,
     remote: String,
+}
+
+struct PreparedMergeDocument {
+    initial_document: MergeDocument,
+    document: MergeDocument,
+    sources: MergeSourceText,
+    result_text: String,
+    manual_result_lines: Vec<String>,
+    local_display_rows: Vec<CachedMergeSideDisplayRow>,
+    remote_display_rows: Vec<CachedMergeSideDisplayRow>,
+    local_scroll_anchors: Vec<(f32, f32)>,
+    remote_scroll_anchors: Vec<(f32, f32)>,
+    local_navigation_target: Option<MergeLineActionTarget>,
+    remote_navigation_target: Option<MergeLineActionTarget>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeLoadStage {
+    ReadingFiles,
+    ComparingChanges,
+    PreparingEditor,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MergeLoadProgress {
+    stage: MergeLoadStage,
+    total_bytes: usize,
+    total_lines: usize,
+}
+
+enum MergeLoadEvent {
+    Progress(MergeLoadProgress),
+    Finished(anyhow::Result<PreparedMergeDocument>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,13 +267,14 @@ impl MergePanelGeometry {
 
 struct MergeSidePanelOutput {
     requested_result_scroll_y: Option<f32>,
-    navigation_requested: bool,
+    navigation_target: Option<MergeLineActionTarget>,
     geometry: MergePanelGeometry,
     pending_line_action: Option<(MergeLineActionTarget, MergeLineAction)>,
 }
 
 struct MergeResultPanelOutput {
     scroll_y: f32,
+    viewport_height: f32,
     geometry: MergePanelGeometry,
 }
 
@@ -295,6 +331,8 @@ struct MergeEditSnapshot {
     manual_result_override: bool,
     local_conflict_cursor: usize,
     remote_conflict_cursor: usize,
+    local_navigation_target: Option<MergeLineActionTarget>,
+    remote_navigation_target: Option<MergeLineActionTarget>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -653,58 +691,48 @@ fn diff_changes(
     side: &[String],
     ignore_mode: MergeIgnoreMode,
 ) -> Vec<MergeChange> {
-    let mut lcs = vec![vec![0; side.len() + 1]; base.len() + 1];
-    for base_index in (0..base.len()).rev() {
-        for side_index in (0..side.len()).rev() {
-            lcs[base_index][side_index] =
-                if merge_line_equal(&base[base_index], &side[side_index], ignore_mode) {
-                    lcs[base_index + 1][side_index + 1] + 1
-                } else {
-                    lcs[base_index + 1][side_index].max(lcs[base_index][side_index + 1])
-                };
-        }
-    }
+    let base_keys = base
+        .iter()
+        .map(|line| merge_line_key(line, ignore_mode))
+        .collect::<Vec<_>>();
+    let side_keys = side
+        .iter()
+        .map(|line| merge_line_key(line, ignore_mode))
+        .collect::<Vec<_>>();
 
-    let mut changes = Vec::new();
-    let mut base_index = 0;
-    let mut side_index = 0;
-    let mut pending_start = None;
-    while base_index < base.len() && side_index < side.len() {
-        if merge_line_equal(&base[base_index], &side[side_index], ignore_mode) {
-            if let Some((base_start, side_start)) = pending_start.take() {
-                changes.push(MergeChange {
-                    base_start,
-                    base_end: base_index,
-                    side_start,
-                    side_end: side_index,
-                });
-            }
-            base_index += 1;
-            side_index += 1;
+    let mut changes: Vec<MergeChange> = Vec::new();
+    for operation in capture_diff_slices(Algorithm::Patience, &base_keys, &side_keys) {
+        let (tag, base_range, side_range) = operation.as_tag_tuple();
+        if tag == DiffTag::Equal {
+            continue;
+        }
+        let change = MergeChange {
+            base_start: base_range.start,
+            base_end: base_range.end,
+            side_start: side_range.start,
+            side_end: side_range.end,
+        };
+        if let Some(previous) = changes.last_mut()
+            && previous.base_end == change.base_start
+            && previous.side_end == change.side_start
+        {
+            previous.base_end = change.base_end;
+            previous.side_end = change.side_end;
         } else {
-            pending_start.get_or_insert((base_index, side_index));
-            if lcs[base_index + 1][side_index] > lcs[base_index][side_index + 1] {
-                base_index += 1;
-            } else {
-                side_index += 1;
-            }
+            changes.push(change);
         }
     }
-    if base_index < base.len() || side_index < side.len() {
-        pending_start.get_or_insert((base_index, side_index));
-        base_index = base.len();
-        side_index = side.len();
-    }
-    if let Some((base_start, side_start)) = pending_start.take() {
-        changes.push(MergeChange {
-            base_start,
-            base_end: base_index,
-            side_start,
-            side_end: side_index,
-        });
-    }
-
     changes
+}
+
+fn merge_line_key(line: &str, ignore_mode: MergeIgnoreMode) -> Cow<'_, str> {
+    match ignore_mode {
+        MergeIgnoreMode::None => Cow::Borrowed(line),
+        MergeIgnoreMode::TrimWhitespace => Cow::Borrowed(line.trim()),
+        MergeIgnoreMode::IgnoreWhitespace => {
+            Cow::Owned(line.chars().filter(|ch| !ch.is_whitespace()).collect())
+        }
+    }
 }
 
 fn merge_text_equal(left: &str, right: &str, ignore_mode: MergeIgnoreMode) -> bool {
@@ -1049,9 +1077,14 @@ pub struct MergeToolApp {
     shared_scroll_y: f32,
     local_conflict_cursor: usize,
     remote_conflict_cursor: usize,
+    local_navigation_target: Option<MergeLineActionTarget>,
+    remote_navigation_target: Option<MergeLineActionTarget>,
     theme: MergeTheme,
     language: MergeLanguage,
     status: Option<String>,
+    load_task: Option<Receiver<MergeLoadEvent>>,
+    load_progress: MergeLoadProgress,
+    load_started_at: Option<Instant>,
     write_task: Option<Receiver<anyhow::Result<()>>>,
     undo_stack: Vec<MergeEditSnapshot>,
     redo_stack: Vec<MergeEditSnapshot>,
@@ -1065,17 +1098,23 @@ pub struct MergeToolApp {
 
 impl MergeToolApp {
     pub fn from_args(args: MergeArgs) -> anyhow::Result<Self> {
-        let base = read_text(&args.base)?;
-        let local = read_text(&args.local)?;
-        let remote = read_text(&args.remote)?;
-        let document = three_way_merge(&base, &local, &remote);
-        let mut app = Self::new(args, document);
-        app.sources = Some(MergeSourceText {
-            base,
-            local,
-            remote,
+        let prepared = load_merge_document(&args, |_| {})?;
+        Ok(Self::from_prepared(args, prepared))
+    }
+
+    fn loading(args: MergeArgs) -> Self {
+        let mut app = Self::new(args.clone(), three_way_merge("", "", ""));
+        let (sender, receiver) = mpsc::channel();
+        app.load_task = Some(receiver);
+        app.load_started_at = Some(Instant::now());
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let result = load_merge_document(&args, |progress| {
+                let _ = progress_sender.send(MergeLoadEvent::Progress(progress));
+            });
+            let _ = sender.send(MergeLoadEvent::Finished(result));
         });
-        Ok(app)
+        app
     }
 
     pub fn new(args: MergeArgs, document: MergeDocument) -> Self {
@@ -1099,6 +1138,12 @@ impl MergeToolApp {
             &result_display_rows,
             &remote_display_rows,
         );
+        let local_navigation_target = merge_navigation_targets(&document, MergeSide::Local)
+            .first()
+            .copied();
+        let remote_navigation_target = merge_navigation_targets(&document, MergeSide::Remote)
+            .first()
+            .copied();
         let initial_document = document.clone();
         Self {
             theme: args.theme,
@@ -1117,7 +1162,56 @@ impl MergeToolApp {
             shared_scroll_y: 0.0,
             local_conflict_cursor: 0,
             remote_conflict_cursor: 0,
+            local_navigation_target,
+            remote_navigation_target,
             status: None,
+            load_task: None,
+            load_progress: MergeLoadProgress {
+                stage: MergeLoadStage::ReadingFiles,
+                total_bytes: 0,
+                total_lines: 0,
+            },
+            load_started_at: None,
+            write_task: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            display_epoch: 0,
+            show_cancel_confirm: false,
+            connector_debug: merge_connector_debug_mode(),
+            ignore_mode: MergeIgnoreMode::None,
+            highlight_mode: MergeHighlightMode::Lines,
+            collapse_unchanged: false,
+        }
+    }
+
+    fn from_prepared(args: MergeArgs, prepared: PreparedMergeDocument) -> Self {
+        Self {
+            theme: args.theme,
+            language: args.language,
+            args,
+            sources: Some(prepared.sources),
+            initial_document: prepared.initial_document,
+            document: prepared.document,
+            result_text: prepared.result_text,
+            manual_result_lines: prepared.manual_result_lines,
+            local_display_rows: prepared.local_display_rows,
+            remote_display_rows: prepared.remote_display_rows,
+            local_scroll_anchors: prepared.local_scroll_anchors,
+            remote_scroll_anchors: prepared.remote_scroll_anchors,
+            manual_result_override: false,
+            shared_scroll_y: 0.0,
+            local_conflict_cursor: 0,
+            remote_conflict_cursor: 0,
+            local_navigation_target: prepared.local_navigation_target,
+            remote_navigation_target: prepared.remote_navigation_target,
+            status: None,
+            load_task: None,
+            load_progress: MergeLoadProgress {
+                stage: MergeLoadStage::PreparingEditor,
+                total_bytes: 0,
+                total_lines: 0,
+            },
+            load_started_at: None,
             write_task: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -1161,21 +1255,7 @@ impl MergeToolApp {
                 // as well, otherwise toolbar icons render as the missing-image warning glyph.
                 egui_extras::install_image_loaders(&cc.egui_ctx);
                 apply_merge_theme(&cc.egui_ctx, args.theme);
-                let app = Self::from_args(args).unwrap_or_else(|error| {
-                    let fallback = MergeArgs {
-                        base: PathBuf::new(),
-                        local: PathBuf::new(),
-                        remote: PathBuf::new(),
-                        output: PathBuf::new(),
-                        repo_root: None,
-                        stage: false,
-                        theme: MergeTheme::Dark,
-                        language: MergeLanguage::English,
-                    };
-                    let mut app = Self::new(fallback, three_way_merge("", "", ""));
-                    app.status = Some(error.to_string());
-                    app
-                });
+                let app = Self::loading(args);
                 Ok(Box::new(app))
             }),
         )
@@ -1189,6 +1269,8 @@ impl MergeToolApp {
             manual_result_override: self.manual_result_override,
             local_conflict_cursor: self.local_conflict_cursor,
             remote_conflict_cursor: self.remote_conflict_cursor,
+            local_navigation_target: self.local_navigation_target,
+            remote_navigation_target: self.remote_navigation_target,
         }
     }
 
@@ -1199,6 +1281,8 @@ impl MergeToolApp {
         self.manual_result_override = snapshot.manual_result_override;
         self.local_conflict_cursor = snapshot.local_conflict_cursor;
         self.remote_conflict_cursor = snapshot.remote_conflict_cursor;
+        self.local_navigation_target = snapshot.local_navigation_target;
+        self.remote_navigation_target = snapshot.remote_navigation_target;
         self.rebuild_display_rows();
     }
 
@@ -1223,6 +1307,12 @@ impl MergeToolApp {
         self.shared_scroll_y = 0.0;
         self.local_conflict_cursor = 0;
         self.remote_conflict_cursor = 0;
+        self.local_navigation_target = merge_navigation_targets(&self.document, MergeSide::Local)
+            .first()
+            .copied();
+        self.remote_navigation_target = merge_navigation_targets(&self.document, MergeSide::Remote)
+            .first()
+            .copied();
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.rebuild_display_rows();
@@ -1246,14 +1336,6 @@ impl MergeToolApp {
             0
         } else {
             self.document.unresolved_conflict_count()
-        }
-    }
-
-    fn unresolved_conflict_count_for_side(&self, side: MergeSide) -> usize {
-        if self.manual_result_override {
-            0
-        } else {
-            self.document.unresolved_conflict_count_for_side(side)
         }
     }
 
@@ -1492,6 +1574,40 @@ impl MergeToolApp {
             }
         }
     }
+
+    fn poll_load_task(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.load_task.take() else {
+            return;
+        };
+        loop {
+            match receiver.try_recv() {
+                Ok(MergeLoadEvent::Progress(progress)) => {
+                    self.load_progress = progress;
+                    ctx.request_repaint();
+                }
+                Ok(MergeLoadEvent::Finished(Ok(prepared))) => {
+                    *self = Self::from_prepared(self.args.clone(), prepared);
+                    ctx.request_repaint();
+                    return;
+                }
+                Ok(MergeLoadEvent::Finished(Err(error))) => {
+                    self.status = Some(error.to_string());
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.load_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(40));
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.status = Some(mt(self.language, "analysis_stopped").to_owned());
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn merge_app_icon_data() -> egui::IconData {
@@ -1603,8 +1719,8 @@ fn stage_merge_output(repo_root: &Path, output: &Path) -> anyhow::Result<()> {
 
 impl App for MergeToolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_load_task(ctx);
         self.poll_write_task(ctx);
-        self.handle_keyboard_shortcuts(ctx);
         self.handle_close_request(ctx);
         let palette = merge_palette(self.theme);
         apply_merge_theme(ctx, self.theme);
@@ -1618,6 +1734,14 @@ impl App for MergeToolApp {
             )
             .show(ctx, |ui| merge_custom_title_bar(ui, ctx, self, palette));
 
+        if self.load_task.is_some() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(palette.bg))
+                .show(ctx, |ui| merge_loading_panel(ui, self, palette));
+            return;
+        }
+
+        self.handle_keyboard_shortcuts(ctx);
         egui::TopBottomPanel::top("merge_toolbar")
             .exact_height(38.0)
             .frame(
@@ -1646,6 +1770,113 @@ fn split_lines(text: &str) -> Vec<String> {
 
 fn read_text(path: &Path) -> anyhow::Result<String> {
     fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn load_merge_document(
+    args: &MergeArgs,
+    mut report: impl FnMut(MergeLoadProgress),
+) -> anyhow::Result<PreparedMergeDocument> {
+    let started_at = Instant::now();
+    report(MergeLoadProgress {
+        stage: MergeLoadStage::ReadingFiles,
+        total_bytes: 0,
+        total_lines: 0,
+    });
+    let base = read_text(&args.base)?;
+    let local = read_text(&args.local)?;
+    let remote = read_text(&args.remote)?;
+    let read_elapsed = started_at.elapsed();
+    let total_bytes = base.len() + local.len() + remote.len();
+    let total_lines = [
+        base.lines().count(),
+        local.lines().count(),
+        remote.lines().count(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+
+    report(MergeLoadProgress {
+        stage: MergeLoadStage::ComparingChanges,
+        total_bytes,
+        total_lines,
+    });
+    let compare_started_at = Instant::now();
+    let document = three_way_merge(&base, &local, &remote);
+    let compare_elapsed = compare_started_at.elapsed();
+
+    report(MergeLoadProgress {
+        stage: MergeLoadStage::PreparingEditor,
+        total_bytes,
+        total_lines,
+    });
+    let prepare_started_at = Instant::now();
+    let prepared = prepare_merge_document(
+        document,
+        MergeSourceText {
+            base,
+            local,
+            remote,
+        },
+    );
+    let prepare_elapsed = prepare_started_at.elapsed();
+    eprintln!(
+        "[merge-load] file={} bytes={} lines={} read_ms={} compare_ms={} prepare_ms={} total_ms={}",
+        args.output.display(),
+        total_bytes,
+        total_lines,
+        read_elapsed.as_millis(),
+        compare_elapsed.as_millis(),
+        prepare_elapsed.as_millis(),
+        started_at.elapsed().as_millis(),
+    );
+    Ok(prepared)
+}
+
+fn prepare_merge_document(
+    document: MergeDocument,
+    sources: MergeSourceText,
+) -> PreparedMergeDocument {
+    let result_text = document.result_text();
+    let result_display_rows = merge_result_display_rows(&document);
+    let manual_result_lines = result_display_rows
+        .iter()
+        .map(|row| row.text.to_owned())
+        .collect();
+    let local_display_rows = cached_merge_side_display_rows(&document, MergeSide::Local);
+    let remote_display_rows = cached_merge_side_display_rows(&document, MergeSide::Remote);
+    let local_scroll_anchors = merge_cached_scroll_anchors(
+        &document,
+        MergeSide::Local,
+        &result_display_rows,
+        &local_display_rows,
+    );
+    let remote_scroll_anchors = merge_cached_scroll_anchors(
+        &document,
+        MergeSide::Remote,
+        &result_display_rows,
+        &remote_display_rows,
+    );
+    let local_navigation_target = merge_navigation_targets(&document, MergeSide::Local)
+        .first()
+        .copied();
+    let remote_navigation_target = merge_navigation_targets(&document, MergeSide::Remote)
+        .first()
+        .copied();
+    let initial_document = document.clone();
+    PreparedMergeDocument {
+        initial_document,
+        document,
+        sources,
+        result_text,
+        manual_result_lines,
+        local_display_rows,
+        remote_display_rows,
+        local_scroll_anchors,
+        remote_scroll_anchors,
+        local_navigation_target,
+        remote_navigation_target,
+    }
 }
 
 fn parse_theme(value: &str) -> anyhow::Result<MergeTheme> {
@@ -1734,6 +1965,177 @@ fn merge_custom_title_bar(
             }
         });
     });
+}
+
+fn merge_loading_panel(ui: &mut Ui, app: &MergeToolApp, palette: MergePalette) {
+    let card_width = (ui.available_width() - 32.0).clamp(320.0, 520.0);
+    let content_width = card_width - 36.0;
+    let elapsed = app
+        .load_started_at
+        .map(|started_at| started_at.elapsed().as_secs_f32())
+        .unwrap_or_default();
+    let file_name = app
+        .args
+        .output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| app.args.output.to_str().unwrap_or("merge result"));
+
+    ui.add_space(44.0);
+    ui.horizontal(|ui| {
+        ui.add_space(((ui.available_width() - card_width) * 0.5).max(0.0));
+        egui::Frame::new()
+            .fill(palette.panel)
+            .shadow(palette.shadow)
+            .corner_radius(egui::CornerRadius::same(MERGE_PANEL_RADIUS))
+            .inner_margin(egui::Margin::same(18))
+            .show(ui, |ui| {
+                ui.set_min_width(content_width);
+                ui.set_max_width(content_width);
+
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(mt(app.language, "loading_title"))
+                            .size(16.0)
+                            .strong()
+                            .color(palette.text),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{elapsed:.1} s"))
+                                .size(12.0)
+                                .color(palette.muted),
+                        );
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new(file_name).size(13.0).color(palette.text));
+                let scale = merge_loading_scale_label(app.language, app.load_progress);
+                if !scale.is_empty() {
+                    ui.label(RichText::new(scale).size(11.0).color(palette.muted));
+                }
+
+                ui.add_space(12.0);
+                for (index, (stage, label_key)) in [
+                    (MergeLoadStage::ReadingFiles, "loading_reading"),
+                    (MergeLoadStage::ComparingChanges, "loading_comparing"),
+                    (MergeLoadStage::PreparingEditor, "loading_preparing"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    merge_loading_stage_row(
+                        ui,
+                        index,
+                        stage,
+                        label_key,
+                        app.load_progress.stage,
+                        app.language,
+                        palette,
+                    );
+                    if index < 2 {
+                        ui.add_space(5.0);
+                    }
+                }
+            });
+    });
+}
+
+fn merge_loading_stage_row(
+    ui: &mut Ui,
+    index: usize,
+    stage: MergeLoadStage,
+    label_key: &str,
+    current_stage: MergeLoadStage,
+    language: MergeLanguage,
+    palette: MergePalette,
+) {
+    let current_index = merge_load_stage_index(current_stage);
+    let completed = index < current_index;
+    let active = stage == current_stage;
+    let marker_color = if completed || active {
+        palette.accent
+    } else {
+        color_with_opacity(palette.muted, 0.42)
+    };
+    let state_key = if completed {
+        "loading_done"
+    } else if active {
+        "loading_active"
+    } else {
+        "loading_waiting"
+    };
+
+    ui.horizontal(|ui| {
+        let (marker_rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+        ui.painter()
+            .circle_filled(marker_rect.center(), 5.0, marker_color);
+        if completed {
+            let center = marker_rect.center();
+            let stroke = egui::Stroke::new(1.4, Color32::WHITE);
+            ui.painter().line_segment(
+                [center + Vec2::new(-2.4, 0.0), center + Vec2::new(-0.5, 2.0)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [center + Vec2::new(-0.5, 2.0), center + Vec2::new(3.0, -2.2)],
+                stroke,
+            );
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(mt(language, label_key))
+                .size(13.0)
+                .color(if active { palette.text } else { palette.muted }),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new(mt(language, state_key))
+                    .size(11.0)
+                    .color(if active {
+                        palette.accent
+                    } else {
+                        palette.muted
+                    }),
+            );
+        });
+    });
+}
+
+fn merge_load_stage_index(stage: MergeLoadStage) -> usize {
+    match stage {
+        MergeLoadStage::ReadingFiles => 0,
+        MergeLoadStage::ComparingChanges => 1,
+        MergeLoadStage::PreparingEditor => 2,
+    }
+}
+
+fn merge_loading_scale_label(language: MergeLanguage, progress: MergeLoadProgress) -> String {
+    if progress.total_bytes == 0 && progress.total_lines == 0 {
+        return String::new();
+    }
+    let size = merge_format_bytes(progress.total_bytes);
+    match language {
+        MergeLanguage::Chinese => format!("{size} · 最长版本 {} 行", progress.total_lines),
+        MergeLanguage::English => {
+            format!("{size} · longest version {} lines", progress.total_lines)
+        }
+    }
+}
+
+fn merge_format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB)
+    } else if bytes as f64 >= KIB {
+        format!("{:.0} KB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn merge_window_control_button(
@@ -2125,6 +2527,7 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
     let requested_scroll_y = app.shared_scroll_y;
     let mut result_output = MergeResultPanelOutput {
         scroll_y: requested_scroll_y,
+        viewport_height: 0.0,
         geometry: MergePanelGeometry::default(),
     };
     let use_virtual_rows = app.uses_virtual_merge_rows();
@@ -2156,11 +2559,6 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
             )
         })
         .inner;
-    if let Some(scroll_y) = local_output.requested_result_scroll_y {
-        if !app.collapse_unchanged || local_output.navigation_requested {
-            next_shared_scroll_y = scroll_y;
-        }
-    }
     let remote_scroll_y = if use_direct_shared_scroll {
         frame_scroll_y
     } else if use_virtual_rows {
@@ -2180,11 +2578,23 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
             )
         })
         .inner;
-    if let Some(scroll_y) = remote_output.requested_result_scroll_y {
-        if !app.collapse_unchanged || remote_output.navigation_requested {
-            next_shared_scroll_y = scroll_y;
-        }
-    }
+
+    // Navigation is a single result-coordinate action. Resolve it after both side panes render so
+    // the other pane's ordinary scroll synchronization cannot overwrite the requested conflict.
+    let navigation_target = remote_output
+        .navigation_target
+        .or(local_output.navigation_target);
+    let stable_content_height = merge_result_content_height(app);
+    next_shared_scroll_y = merge_next_shared_scroll_y(
+        &app.document,
+        next_shared_scroll_y,
+        local_output.requested_result_scroll_y,
+        remote_output.requested_result_scroll_y,
+        navigation_target,
+        result_output.viewport_height,
+        stable_content_height,
+        app.collapse_unchanged,
+    );
     // Virtual ScrollAreas only record geometry for rows materialized in this frame.
     // The connector painter already ignores blocks without recorded geometry, so keep it
     // enabled for large files and paint only the currently visible conflict fragments.
@@ -2202,7 +2612,8 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         overview,
         app,
         next_shared_scroll_y,
-        &result_output.geometry,
+        result_output.viewport_height,
+        stable_content_height,
         palette,
     ) {
         next_shared_scroll_y = scroll_y;
@@ -2234,7 +2645,7 @@ fn merge_side_panel(
     palette: MergePalette,
 ) -> MergeSidePanelOutput {
     let mut requested_result_scroll_y = None;
-    let mut navigation_requested = false;
+    let mut navigation_target = None;
     let mut geometry = MergePanelGeometry::default();
     let mut pending_line_action = None;
     let path = match side {
@@ -2257,13 +2668,16 @@ fn merge_side_panel(
         let visible_rows = merge_visible_tail_len(rows, app.collapse_unchanged);
         let hidden_rows = rows.len().saturating_sub(visible_rows);
         let display_rows = visible_rows + usize::from(hidden_rows > 0);
+        // `show_rows` captures spacing before entering its callback and uses it to derive both
+        // virtual row indices and total content height. Set dense spacing first; doing this inside
+        // the callback accumulates one default gap per off-screen row and breaks large-file jumps.
+        ui.spacing_mut().item_spacing.y = 0.0;
         let output = ScrollArea::vertical()
             .id_salt((scroll_id, app.display_epoch))
             .vertical_scroll_offset(scroll_y)
             .scroll_bar_visibility(ScrollBarVisibility::AlwaysHidden)
             .auto_shrink([false, false])
             .show_rows(ui, MERGE_CODE_ROW_HEIGHT, display_rows, |ui, row_range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
                 ui.set_min_width(ui.available_width());
                 let cursor = match side {
                     MergeSide::Local => app.local_conflict_cursor,
@@ -2315,10 +2729,8 @@ fn merge_side_panel(
                 &mut pending_line_action,
             );
         }
-        if let Some(conflict_index) = nav_target {
-            navigation_requested = true;
-            requested_result_scroll_y =
-                merge_result_scroll_y_for_conflict(&app.document, conflict_index);
+        if let Some(target) = nav_target {
+            navigation_target = Some(target);
             ui.ctx().request_repaint();
         } else {
             let clamped_scroll_y = merge_clamp_scroll_offset(
@@ -2340,7 +2752,7 @@ fn merge_side_panel(
     });
     MergeSidePanelOutput {
         requested_result_scroll_y,
-        navigation_requested,
+        navigation_target,
         geometry,
         pending_line_action,
     }
@@ -2354,6 +2766,7 @@ fn merge_result_panel(
     palette: MergePalette,
 ) -> MergeResultPanelOutput {
     let mut next_scroll_y = scroll_y;
+    let mut viewport_height = 0.0;
     let mut geometry = MergePanelGeometry::default();
     merge_panel_frame(ui, palette, |ui| {
         result_header(ui, app, palette);
@@ -2387,13 +2800,14 @@ fn merge_result_panel(
         let visible_rows = merge_visible_result_len(&result_row_styles, app.collapse_unchanged);
         let hidden_rows = line_count.saturating_sub(visible_rows);
         let display_rows = visible_rows + usize::from(hidden_rows > 0);
+        // Keep this before `show_rows`; egui reads spacing while calculating virtual row ranges.
+        ui.spacing_mut().item_spacing.y = 0.0;
         let output = ScrollArea::vertical()
             .id_salt((scroll_id, app.display_epoch))
             .vertical_scroll_offset(scroll_y)
             .scroll_bar_visibility(ScrollBarVisibility::AlwaysHidden)
             .auto_shrink([false, false])
             .show_rows(ui, MERGE_CODE_ROW_HEIGHT, display_rows, |ui, row_range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
                 ui.set_min_width(ui.available_width());
                 for result_index in row_range.clone() {
                     if result_index >= visible_rows {
@@ -2444,9 +2858,11 @@ fn merge_result_panel(
             output.content_size.y,
             output.inner_rect.height(),
         );
+        viewport_height = output.inner_rect.height();
     });
     MergeResultPanelOutput {
         scroll_y: next_scroll_y,
+        viewport_height,
         geometry,
     }
 }
@@ -2468,6 +2884,27 @@ fn merge_visible_tail_len(rows: &[CachedMergeSideDisplayRow], collapse: bool) ->
 
 fn merge_clamp_scroll_offset(offset_y: f32, content_height: f32, viewport_height: f32) -> f32 {
     offset_y.clamp(0.0, (content_height - viewport_height).max(0.0))
+}
+
+fn merge_result_content_height(app: &MergeToolApp) -> f32 {
+    let display_rows = if app.manual_result_override {
+        app.manual_result_lines.len().max(1)
+    } else {
+        let styles = merge_result_display_rows(&app.document)
+            .into_iter()
+            .map(|row| {
+                let active = row.conflict_index.is_some_and(|conflict_index| {
+                    (conflict_index == app.local_conflict_cursor
+                        || conflict_index == app.remote_conflict_cursor)
+                        && !app.document.conflict_fully_resolved(conflict_index)
+                });
+                (row.tone, active)
+            })
+            .collect::<Vec<_>>();
+        let visible_rows = merge_visible_result_len(&styles, app.collapse_unchanged);
+        visible_rows + usize::from(visible_rows < styles.len())
+    };
+    display_rows.max(1) as f32 * MERGE_CODE_ROW_HEIGHT
 }
 
 fn merge_visible_result_len(styles: &[(MergeSideLineTone, bool)], collapse: bool) -> usize {
@@ -2514,7 +2951,8 @@ fn merge_overview_target(
     overview: Rect,
     app: &MergeToolApp,
     scroll_y: f32,
-    result_geometry: &MergePanelGeometry,
+    result_viewport_height: f32,
+    result_content_height: f32,
     palette: MergePalette,
 ) -> Option<f32> {
     // The overview must mirror displayed rows, not source rows. In collapsed mode each hidden
@@ -2532,31 +2970,25 @@ fn merge_overview_target(
     // The map never grows taller than the actual code viewport.  A short document should get a
     // short map, while a long document keeps a map as tall as the visible code area.
     let result_rows = columns[1].len().max(1);
-    let content_height = result_rows as f32 * MERGE_CODE_ROW_HEIGHT;
-    let visible_height = merge_overview_visible_height(result_geometry)
-        .unwrap_or_else(|| overview.height())
-        .min(overview.height())
+    let fallback_content_height = result_rows as f32 * MERGE_CODE_ROW_HEIGHT;
+    let content_height = result_content_height
+        .max(fallback_content_height)
         .max(MERGE_CODE_ROW_HEIGHT);
-    let map_height = content_height.min(visible_height).max(8.0);
+    let viewport_height = if result_viewport_height > 0.0 {
+        result_viewport_height
+    } else {
+        overview.height()
+    }
+    .min(content_height)
+    .max(MERGE_CODE_ROW_HEIGHT);
+    // Keep the minimap track independent from the currently materialized virtual rows. Otherwise
+    // clicking a different region can alter the track itself and invalidate the pointer ratio.
+    let map_height = content_height.min(overview.height()).max(8.0);
     let track = Rect::from_min_size(
         Pos2::new(overview.left() + 1.0, overview.top()),
         Vec2::new((overview.width() - 2.0).max(1.0), map_height),
     );
-    let viewport_height = visible_height.min(content_height);
-    let max_scroll = (content_height - viewport_height).max(0.0);
-    let viewport_ratio = (viewport_height / content_height).clamp(0.04, 1.0);
-    let start_ratio = if max_scroll > 0.0 {
-        (scroll_y / max_scroll).clamp(0.0, 1.0 - viewport_ratio)
-    } else {
-        0.0
-    };
-    let viewport = Rect::from_min_size(
-        Pos2::new(
-            track.left(),
-            egui::lerp(track.top()..=track.bottom(), start_ratio),
-        ),
-        Vec2::new(track.width(), (track.height() * viewport_ratio).max(3.0)),
-    );
+    let viewport = merge_overview_viewport_rect(track, scroll_y, viewport_height, content_height);
     ui.painter().rect_filled(
         viewport.intersect(track),
         egui::CornerRadius::same(2),
@@ -2576,21 +3008,28 @@ fn merge_overview_target(
                 continue;
             };
             let left = track.left() + column_index as f32 * (MERGE_OVERVIEW_COLUMN_WIDTH + 2.0);
+            let projected_start =
+                merge_overview_result_row(app, column_index, run_start as f32, result_rows);
+            let projected_end =
+                merge_overview_result_row(app, column_index, run_end as f32, result_rows);
             let top = egui::remap(
-                run_start as f32,
-                0.0..=total_rows.max(1) as f32,
+                projected_start,
+                0.0..=result_rows as f32,
                 track.top()..=track.bottom(),
             );
             let bottom = egui::remap(
-                run_end as f32,
-                0.0..=total_rows.max(1) as f32,
+                projected_end,
+                0.0..=result_rows as f32,
                 track.top()..=track.bottom(),
-            )
-            .max(top + 1.0);
+            );
+            // A deletion maps a side span onto a zero-height result boundary. Keep it visible as
+            // a one-pixel marker without changing the shared document coordinate system.
+            let marker_top = top.min(track.bottom() - 1.0);
+            let marker_bottom = bottom.max(marker_top + 1.0).min(track.bottom());
             ui.painter().rect_filled(
                 Rect::from_min_max(
-                    Pos2::new(left, top),
-                    Pos2::new(left + MERGE_OVERVIEW_COLUMN_WIDTH, bottom),
+                    Pos2::new(left, marker_top),
+                    Pos2::new(left + MERGE_OVERVIEW_COLUMN_WIDTH, marker_bottom),
                 ),
                 0.0,
                 color,
@@ -2607,24 +3046,40 @@ fn merge_overview_target(
         return None;
     }
     let pointer = response.interact_pointer_pos()?;
-    let ratio = ((pointer.y - track.top()) / track.height()).clamp(0.0, 1.0);
-    let clicked_column = (0..columns.len())
-        .min_by(|left, right| {
-            let center = |index: usize| {
-                track.left()
-                    + index as f32 * (MERGE_OVERVIEW_COLUMN_WIDTH + 2.0)
-                    + MERGE_OVERVIEW_COLUMN_WIDTH * 0.5
-            };
-            (pointer.x - center(*left))
-                .abs()
-                .total_cmp(&(pointer.x - center(*right)).abs())
-        })
-        .unwrap_or(1);
-    let source_row = ratio * columns[clicked_column].len().max(1) as f32;
-    let result_row = if app.collapse_unchanged {
-        ratio * result_rows as f32
+    Some(merge_overview_scroll_target(
+        track,
+        pointer.y,
+        result_rows,
+        viewport_height,
+        content_height,
+    ))
+}
+
+fn merge_overview_scroll_target(
+    track: Rect,
+    pointer_y: f32,
+    result_rows: usize,
+    viewport_height: f32,
+    content_height: f32,
+) -> f32 {
+    let content_height = content_height.max(MERGE_CODE_ROW_HEIGHT);
+    let viewport_height = viewport_height.clamp(MERGE_CODE_ROW_HEIGHT, content_height);
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    let ratio = ((pointer_y - track.top()) / track.height()).clamp(0.0, 1.0);
+    let result_row = ratio * result_rows.max(1) as f32;
+    (result_row * MERGE_CODE_ROW_HEIGHT - viewport_height * 0.5).clamp(0.0, max_scroll)
+}
+
+fn merge_overview_result_row(
+    app: &MergeToolApp,
+    column_index: usize,
+    source_row: f32,
+    result_rows: usize,
+) -> f32 {
+    let projected = if app.collapse_unchanged {
+        source_row
     } else {
-        match clicked_column {
+        match column_index {
             0 => merge_mapped_scroll_row(
                 app.cached_scroll_anchors(MergeSide::Local),
                 source_row,
@@ -2638,13 +3093,33 @@ fn merge_overview_target(
             _ => source_row,
         }
     };
-    Some((result_row * MERGE_CODE_ROW_HEIGHT - viewport_height * 0.5).clamp(0.0, max_scroll))
+    projected.clamp(0.0, result_rows.max(1) as f32)
 }
 
-fn merge_overview_visible_height(geometry: &MergePanelGeometry) -> Option<f32> {
-    let first = geometry.rows.first()?.1;
-    let last = geometry.rows.last()?.1;
-    Some((last.bottom() - first.top()).max(MERGE_CODE_ROW_HEIGHT))
+fn merge_overview_viewport_rect(
+    track: Rect,
+    scroll_y: f32,
+    viewport_height: f32,
+    content_height: f32,
+) -> Rect {
+    let content_height = content_height.max(MERGE_CODE_ROW_HEIGHT);
+    let viewport_height = viewport_height.clamp(MERGE_CODE_ROW_HEIGHT, content_height);
+    let viewport_ratio = (viewport_height / content_height).clamp(0.04, 1.0);
+    let thumb_height = (track.height() * viewport_ratio)
+        .clamp(3.0, track.height().max(3.0))
+        .min(track.height());
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    let visible_center_ratio = if max_scroll > 0.0 {
+        ((scroll_y.clamp(0.0, max_scroll) + viewport_height * 0.5) / content_height).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let centered_top = track.top() + track.height() * visible_center_ratio - thumb_height * 0.5;
+    let top = centered_top.clamp(track.top(), track.bottom() - thumb_height);
+    Rect::from_min_size(
+        Pos2::new(track.left(), top),
+        Vec2::new(track.width(), thumb_height),
+    )
 }
 
 fn merge_result_overview_tones(app: &MergeToolApp) -> Vec<MergeSideLineTone> {
@@ -2762,40 +3237,60 @@ fn side_conflict_nav(
     app: &mut MergeToolApp,
     side: MergeSide,
     palette: MergePalette,
-) -> Option<usize> {
+) -> Option<MergeLineActionTarget> {
     let width = ui.available_width();
     ui.allocate_ui_with_layout(
         Vec2::new(width, MERGE_NAV_BUTTON_SIZE),
         Layout::left_to_right(Align::Center),
         |ui| {
-            let conflict_count = app.unresolved_conflict_count_for_side(side);
-            let mut cursor = match side {
+            let targets = if app.manual_result_override {
+                Vec::new()
+            } else {
+                merge_navigation_targets(&app.document, side)
+            };
+            let current_target = match side {
+                MergeSide::Local => app.local_navigation_target,
+                MergeSide::Remote => app.remote_navigation_target,
+            };
+            let conflict_cursor = match side {
                 MergeSide::Local => app.local_conflict_cursor,
                 MergeSide::Remote => app.remote_conflict_cursor,
             };
-            let enabled = conflict_count > 0;
+            let mut position = merge_navigation_position(&targets, current_target)
+                .or_else(|| {
+                    merge_navigation_position(
+                        &targets,
+                        Some(MergeLineActionTarget::Conflict(conflict_cursor)),
+                    )
+                })
+                .unwrap_or(0);
+            let enabled = !targets.is_empty();
             let mut navigation_requested = false;
             if nav_icon_button(ui, enabled, NavDirection::Previous, palette) {
                 navigation_requested = true;
-                previous_unresolved_conflict(&app.document, side, &mut cursor);
+                position = previous_navigation_position(position, targets.len());
             }
             if nav_icon_button(ui, enabled, NavDirection::Next, palette) {
                 navigation_requested = true;
-                next_unresolved_conflict(&app.document, side, &mut cursor);
+                position = next_navigation_position(position, targets.len());
             }
+            let target = targets.get(position).copied();
             match side {
-                MergeSide::Local => app.local_conflict_cursor = cursor,
-                MergeSide::Remote => app.remote_conflict_cursor = cursor,
+                MergeSide::Local => app.local_navigation_target = target,
+                MergeSide::Remote => app.remote_navigation_target = target,
             }
-            let position = if app.manual_result_override {
-                0
-            } else {
-                unresolved_position(&app.document, side, cursor)
-            };
+            if let Some(MergeLineActionTarget::Conflict(index)) = target {
+                match side {
+                    MergeSide::Local => app.local_conflict_cursor = index,
+                    MergeSide::Remote => app.remote_conflict_cursor = index,
+                }
+            }
+            let display_position = usize::from(target.is_some()) * (position + 1);
             ui.label(
-                RichText::new(format!("{} / {}", position, conflict_count)).color(palette.muted),
+                RichText::new(format!("{} / {}", display_position, targets.len()))
+                    .color(palette.muted),
             );
-            navigation_requested.then_some(cursor)
+            navigation_requested.then_some(target).flatten()
         },
     )
     .inner
@@ -4184,6 +4679,7 @@ fn merge_conflict_insertion_marker_rect(
     geometry.boundary_marker_rect(row_index, MERGE_BASE_ONLY_MARKER_HEIGHT)
 }
 
+#[cfg(test)]
 fn merge_result_scroll_y_for_conflict(
     document: &MergeDocument,
     conflict_index: usize,
@@ -4202,6 +4698,88 @@ fn merge_result_scroll_y_for_conflict(
                 .unwrap_or_else(|| merge_result_display_rows(document).len())
         });
     Some(row_index as f32 * MERGE_CODE_ROW_HEIGHT)
+}
+
+fn merge_result_scroll_y_for_conflict_in_view(
+    document: &MergeDocument,
+    conflict_index: usize,
+    viewport_height: f32,
+    content_height: f32,
+) -> Option<f32> {
+    merge_result_scroll_y_for_navigation_target_in_view(
+        document,
+        MergeLineActionTarget::Conflict(conflict_index),
+        viewport_height,
+        content_height,
+    )
+}
+
+fn merge_result_scroll_y_for_navigation_target_in_view(
+    document: &MergeDocument,
+    target: MergeLineActionTarget,
+    viewport_height: f32,
+    content_height: f32,
+) -> Option<f32> {
+    let (row_index, row_count) = match target {
+        MergeLineActionTarget::Conflict(conflict_index) => {
+            let conflict = document
+                .conflicts()
+                .iter()
+                .find(|conflict| conflict.index == conflict_index)?;
+            merge_result_row_span_for_conflict(document, conflict).unwrap_or_else(|| {
+                let boundary = conflict
+                    .line_indices
+                    .first()
+                    .map(|first_line| {
+                        merge_result_display_boundary_before_line(document, *first_line)
+                    })
+                    .unwrap_or_else(|| merge_result_display_rows(document).len());
+                (boundary, 1)
+            })
+        }
+        MergeLineActionTarget::BaseOnlyGroup(line_index) => {
+            let group = base_only_display_groups(document)
+                .into_iter()
+                .find(|group| group.line_index == line_index)?;
+            (
+                merge_result_display_row_for_line(document, group.line_index)?,
+                group.line_count,
+            )
+        }
+    };
+    let target_center = (row_index as f32 + row_count.max(1) as f32 * 0.5) * MERGE_CODE_ROW_HEIGHT;
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    Some((target_center - viewport_height * 0.5).clamp(0.0, max_scroll))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_next_shared_scroll_y(
+    document: &MergeDocument,
+    current_scroll_y: f32,
+    local_scroll_y: Option<f32>,
+    remote_scroll_y: Option<f32>,
+    navigation_target: Option<MergeLineActionTarget>,
+    viewport_height: f32,
+    content_height: f32,
+    collapse_unchanged: bool,
+) -> f32 {
+    if let Some(target) = navigation_target {
+        return merge_result_scroll_y_for_navigation_target_in_view(
+            document,
+            target,
+            viewport_height,
+            content_height,
+        )
+        .unwrap_or(current_scroll_y);
+    }
+    if collapse_unchanged {
+        return current_scroll_y;
+    }
+    // Keep remote-pane precedence from the previous renderer when both panes report a manual
+    // offset in the same frame.
+    remote_scroll_y
+        .or(local_scroll_y)
+        .unwrap_or(current_scroll_y)
 }
 
 fn merge_result_display_boundary_before_line(
@@ -4756,49 +5334,58 @@ fn conflict_action_rects(rect: Rect, side: MergeSide) -> ConflictActionRects {
     }
 }
 
-fn previous_unresolved_conflict(document: &MergeDocument, side: MergeSide, cursor: &mut usize) {
-    let unresolved = document
-        .conflicts()
-        .iter()
-        .map(|conflict| conflict.index)
-        .filter(|index| !document.conflict_side_resolved(*index, side))
-        .collect::<Vec<_>>();
-    if let Some(index) = unresolved
-        .iter()
-        .copied()
-        .rev()
-        .find(|index| *index < *cursor)
-        .or_else(|| unresolved.last().copied())
-    {
-        *cursor = index;
-    }
-}
-
-fn next_unresolved_conflict(document: &MergeDocument, side: MergeSide, cursor: &mut usize) {
-    let unresolved = document
-        .conflicts()
-        .iter()
-        .map(|conflict| conflict.index)
-        .filter(|index| !document.conflict_side_resolved(*index, side))
-        .collect::<Vec<_>>();
-    if let Some(index) = unresolved
-        .iter()
-        .copied()
-        .find(|index| *index > *cursor)
-        .or_else(|| unresolved.first().copied())
-    {
-        *cursor = index;
-    }
-}
-
-fn unresolved_position(document: &MergeDocument, side: MergeSide, cursor: usize) -> usize {
-    document
+fn merge_navigation_targets(
+    document: &MergeDocument,
+    side: MergeSide,
+) -> Vec<MergeLineActionTarget> {
+    let mut targets = document
         .conflicts()
         .iter()
         .filter(|conflict| !document.conflict_side_resolved(conflict.index, side))
-        .position(|conflict| conflict.index == cursor)
-        .map(|index| index + 1)
-        .unwrap_or(0)
+        .filter_map(|conflict| {
+            conflict
+                .line_indices
+                .first()
+                .copied()
+                .map(|line_index| (line_index, MergeLineActionTarget::Conflict(conflict.index)))
+        })
+        .collect::<Vec<_>>();
+    targets.extend(
+        base_only_display_groups(document)
+            .into_iter()
+            .filter(|group| group.missing_side == side)
+            .map(|group| {
+                (
+                    group.line_index,
+                    MergeLineActionTarget::BaseOnlyGroup(group.line_index),
+                )
+            }),
+    );
+    targets.sort_by_key(|(line_index, _)| *line_index);
+    targets.into_iter().map(|(_, target)| target).collect()
+}
+
+fn merge_navigation_position(
+    targets: &[MergeLineActionTarget],
+    current: Option<MergeLineActionTarget>,
+) -> Option<usize> {
+    current.and_then(|current| targets.iter().position(|target| *target == current))
+}
+
+fn previous_navigation_position(current: usize, target_count: usize) -> usize {
+    if target_count == 0 {
+        0
+    } else {
+        (current + target_count - 1) % target_count
+    }
+}
+
+fn next_navigation_position(current: usize, target_count: usize) -> usize {
+    if target_count == 0 {
+        0
+    } else {
+        (current + 1) % target_count
+    }
 }
 
 fn merge_panel_frame(ui: &mut Ui, palette: MergePalette, body: impl FnOnce(&mut Ui)) {
@@ -4933,6 +5520,15 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (MergeLanguage::Chinese, "cancel") => "取消",
         (MergeLanguage::Chinese, "light") => "白天",
         (MergeLanguage::Chinese, "dark") => "黑夜",
+        (MergeLanguage::Chinese, "analyzing_merge") => "正在分析合并内容...",
+        (MergeLanguage::Chinese, "analysis_stopped") => "合并分析已停止",
+        (MergeLanguage::Chinese, "loading_title") => "准备合并编辑器",
+        (MergeLanguage::Chinese, "loading_reading") => "读取三个版本",
+        (MergeLanguage::Chinese, "loading_comparing") => "比较三方差异",
+        (MergeLanguage::Chinese, "loading_preparing") => "准备编辑器",
+        (MergeLanguage::Chinese, "loading_done") => "已完成",
+        (MergeLanguage::Chinese, "loading_active") => "处理中",
+        (MergeLanguage::Chinese, "loading_waiting") => "等待",
         (MergeLanguage::Chinese, "applying") => "应用中...",
         (MergeLanguage::Chinese, "write_failed") => "写入失败",
         (MergeLanguage::Chinese, "write_stopped") => "写入已停止",
@@ -4972,6 +5568,15 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (_, "cancel") => "Cancel",
         (_, "light") => "Light",
         (_, "dark") => "Dark",
+        (_, "analyzing_merge") => "Analyzing merge content...",
+        (_, "analysis_stopped") => "Merge analysis stopped",
+        (_, "loading_title") => "Preparing merge editor",
+        (_, "loading_reading") => "Read three versions",
+        (_, "loading_comparing") => "Compare three-way changes",
+        (_, "loading_preparing") => "Prepare editor",
+        (_, "loading_done") => "Done",
+        (_, "loading_active") => "Working",
+        (_, "loading_waiting") => "Waiting",
         (_, "applying") => "Applying...",
         (_, "write_failed") => "Failed to write",
         (_, "write_stopped") => "Write stopped",
@@ -4999,6 +5604,8 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    static MERGE_LOAD_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
     fn test_merge_args() -> MergeArgs {
         MergeArgs {
             base: PathBuf::from("base.txt"),
@@ -5010,6 +5617,87 @@ mod tests {
             theme: MergeTheme::Light,
             language: MergeLanguage::Chinese,
         }
+    }
+
+    fn navigation_matrix_document() -> MergeDocument {
+        three_way_merge(
+            "header\nconflict-a = base\nstable-a\ndelete-from-local\nstable-b\nconflict-b = base\nstable-c\ndelete-from-remote\nstable-d\nconflict-c = base\nfooter\n",
+            "header\nconflict-a = local\nstable-a\nstable-b\nconflict-b = local\nstable-c\ndelete-from-remote\nstable-d\nconflict-c = local\nfooter\n",
+            "header\nconflict-a = remote\nstable-a\ndelete-from-local\nstable-b\nconflict-b = remote\nstable-c\nstable-d\nconflict-c = remote\nfooter\n",
+        )
+    }
+
+    #[test]
+    fn merge_loading_state_returns_immediately_and_releases_after_analysis() {
+        let test_id = MERGE_LOAD_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_dir = env::temp_dir().join(format!(
+            "git-agent-merge-load-{}-{test_id}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let base_path = temp_dir.join("base.txt");
+        let local_path = temp_dir.join("local.txt");
+        let remote_path = temp_dir.join("remote.txt");
+        let output_path = temp_dir.join("merged.txt");
+        fs::write(&base_path, "base\n").unwrap();
+        fs::write(&local_path, "local\n").unwrap();
+        fs::write(&remote_path, "remote\n").unwrap();
+        let args = MergeArgs {
+            base: base_path,
+            local: local_path,
+            remote: remote_path,
+            output: output_path,
+            ..test_merge_args()
+        };
+
+        let mut app = MergeToolApp::loading(args);
+        assert!(app.load_task.is_some());
+        assert!(app.sources.is_none());
+
+        let ctx = egui::Context::default();
+        for _ in 0..100 {
+            app.poll_load_task(&ctx);
+            if app.load_task.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(app.load_task.is_none());
+        assert!(app.sources.is_some());
+        assert_eq!(app.document.unresolved_conflict_count(), 1);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn large_sparse_merge_prepares_without_quadratic_diff_matrix() {
+        let base = (0..8_000)
+            .map(|index| format!("package-{index:05}: 1.0.{index}"))
+            .collect::<Vec<_>>();
+        let mut local = base.clone();
+        let mut remote = base.clone();
+        for index in [480, 3_840, 7_780] {
+            local[index] = format!("package-{index:05}: left-{index}");
+            remote[index] = format!("package-{index:05}: right-{index}");
+        }
+        let sources = MergeSourceText {
+            base: base.join("\n") + "\n",
+            local: local.join("\n") + "\n",
+            remote: remote.join("\n") + "\n",
+        };
+
+        let started_at = Instant::now();
+        let document = three_way_merge(&sources.base, &sources.local, &sources.remote);
+        let prepared = prepare_merge_document(document, sources);
+        let elapsed = started_at.elapsed();
+
+        assert_eq!(prepared.document.unresolved_conflict_count(), 3);
+        assert_eq!(prepared.local_display_rows.len(), 8_000);
+        assert_eq!(prepared.remote_display_rows.len(), 8_000);
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "large sparse merge preparation took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -5340,6 +6028,27 @@ mod tests {
 
         let result_scroll =
             merge_result_scroll_y_for_conflict(&app.document, conflict_index).unwrap();
+        let viewport_height = 30.0 * MERGE_CODE_ROW_HEIGHT;
+        let content_height =
+            merge_result_display_rows(&app.document).len() as f32 * MERGE_CODE_ROW_HEIGHT;
+        let centered_result_scroll = merge_result_scroll_y_for_conflict_in_view(
+            &app.document,
+            conflict_index,
+            viewport_height,
+            content_height,
+        )
+        .unwrap();
+        let (conflict_result_row, conflict_result_count) =
+            merge_result_row_span_for_conflict(&app.document, &app.document.conflicts()[0])
+                .unwrap();
+        let visible_start = centered_result_scroll / MERGE_CODE_ROW_HEIGHT;
+        let visible_end = visible_start + viewport_height / MERGE_CODE_ROW_HEIGHT;
+        assert!(conflict_result_row as f32 >= visible_start);
+        assert!(
+            (conflict_result_row + conflict_result_count) as f32 <= visible_end,
+            "conflict rows must remain inside the centered result viewport"
+        );
+
         for side in [MergeSide::Local, MergeSide::Remote] {
             let expected_side_row = match side {
                 MergeSide::Local => &app.local_display_rows,
@@ -5363,7 +6072,52 @@ mod tests {
                 (mapped_result_row - result_scroll / MERGE_CODE_ROW_HEIGHT).abs() < 0.01,
                 "{side:?} reverse mapping returned {mapped_result_row}"
             );
+
+            let centered_side_scroll =
+                app.cached_side_scroll_y_for_result_scroll(side, centered_result_scroll);
+            let centered_side_visible_start = centered_side_scroll / MERGE_CODE_ROW_HEIGHT;
+            let centered_side_visible_end =
+                centered_side_visible_start + viewport_height / MERGE_CODE_ROW_HEIGHT;
+            assert!(expected_side_row >= centered_side_visible_start);
+            assert!(
+                expected_side_row < centered_side_visible_end,
+                "{side:?} conflict row must remain visible after centered navigation"
+            );
         }
+    }
+
+    #[test]
+    fn conflict_navigation_wins_other_pane_scroll_sync() {
+        let document = three_way_merge(
+            "alpha\nstable\nbeta\n",
+            "alpha-local\nstable\nbeta-local\n",
+            "alpha-remote\nstable\nbeta-remote\n",
+        );
+        let conflict_index = document.conflicts()[1].index;
+        let viewport_height = 2.0 * MERGE_CODE_ROW_HEIGHT;
+        let content_height =
+            merge_result_display_rows(&document).len() as f32 * MERGE_CODE_ROW_HEIGHT;
+        let expected = merge_result_scroll_y_for_conflict_in_view(
+            &document,
+            conflict_index,
+            viewport_height,
+            content_height,
+        )
+        .unwrap();
+
+        let next = merge_next_shared_scroll_y(
+            &document,
+            0.0,
+            Some(18.0),
+            Some(999.0),
+            Some(MergeLineActionTarget::Conflict(conflict_index)),
+            viewport_height,
+            content_height,
+            false,
+        );
+
+        assert_eq!(next, expected);
+        assert_ne!(next, 999.0);
     }
 
     #[test]
@@ -5384,12 +6138,18 @@ mod tests {
             .find(|group| group.missing_side == MergeSide::Remote)
             .expect("remote deletion group");
         assert_eq!(group.line_count, 4);
+        let target = MergeLineActionTarget::BaseOnlyGroup(group.line_index);
+        assert_eq!(
+            merge_navigation_targets(&document, MergeSide::Remote),
+            vec![target]
+        );
+        assert!(merge_navigation_targets(&document, MergeSide::Local).is_empty());
 
         let result_first = merge_result_display_row_for_line(&document, group.line_index).unwrap();
         let remote_boundary =
             merge_side_display_row_for_line(&document, MergeSide::Remote, group.line_index)
                 .unwrap();
-        let app = MergeToolApp::new(test_merge_args(), document);
+        let app = MergeToolApp::new(test_merge_args(), document.clone());
         assert!(app.uses_virtual_merge_rows());
 
         for result_row in [result_first, result_first + group.line_count] {
@@ -5415,36 +6175,170 @@ mod tests {
             (result_screen_row - remote_screen_row).abs() < 0.01,
             "result deletion appears at screen row {result_screen_row}, remote gap at {remote_screen_row}"
         );
+
+        let viewport_height = 30.0 * MERGE_CODE_ROW_HEIGHT;
+        let content_height =
+            merge_result_display_rows(&document).len() as f32 * MERGE_CODE_ROW_HEIGHT;
+        let target_scroll = merge_result_scroll_y_for_navigation_target_in_view(
+            &document,
+            target,
+            viewport_height,
+            content_height,
+        )
+        .expect("deletion navigation scroll");
+        let visible_start = target_scroll / MERGE_CODE_ROW_HEIGHT;
+        let visible_end = visible_start + viewport_height / MERGE_CODE_ROW_HEIGHT;
+        assert!(result_first as f32 >= visible_start);
+        assert!((result_first + group.line_count) as f32 <= visible_end);
+    }
+
+    #[test]
+    fn minimap_viewport_thumb_keeps_size_and_reaches_both_track_ends() {
+        let track = Rect::from_min_size(Pos2::ZERO, Vec2::new(18.0, 500.0));
+        let viewport_height = 500.0;
+        let content_height = 8_000.0;
+        let max_scroll = content_height - viewport_height;
+        let top = merge_overview_viewport_rect(track, 0.0, viewport_height, content_height);
+        let middle =
+            merge_overview_viewport_rect(track, max_scroll * 0.5, viewport_height, content_height);
+        let bottom =
+            merge_overview_viewport_rect(track, max_scroll, viewport_height, content_height);
+
+        assert!((top.height() - middle.height()).abs() < 0.001);
+        assert!((middle.height() - bottom.height()).abs() < 0.001);
+        assert!((top.top() - track.top()).abs() < 0.001);
+        assert!((bottom.bottom() - track.bottom()).abs() < 0.001);
+    }
+
+    #[test]
+    fn minimap_viewport_thumb_tracks_the_true_visible_center() {
+        let track = Rect::from_min_size(Pos2::ZERO, Vec2::new(18.0, 500.0));
+        let viewport_height = 500.0;
+        let content_height = 144_000.0;
+        let max_scroll = content_height - viewport_height;
+
+        for center_ratio in [0.06_f32, 0.38, 0.48, 0.80, 0.97] {
+            let scroll_y =
+                (content_height * center_ratio - viewport_height * 0.5).clamp(0.0, max_scroll);
+            let thumb =
+                merge_overview_viewport_rect(track, scroll_y, viewport_height, content_height);
+            let expected_center = track.top() + track.height() * center_ratio;
+            assert!(
+                (thumb.center().y - expected_center).abs() < 0.01,
+                "viewport center at {center_ratio:.2} mapped to {}, expected {expected_center}",
+                thumb.center().y
+            );
+        }
+    }
+
+    #[test]
+    fn minimap_click_centers_the_viewport_on_the_pointer() {
+        let track = Rect::from_min_size(Pos2::new(7.0, 20.0), Vec2::new(18.0, 500.0));
+        let result_rows = 8_000;
+        let viewport_height = 500.0;
+        let content_height = result_rows as f32 * MERGE_CODE_ROW_HEIGHT;
+
+        for ratio in [0.06_f32, 0.38, 0.48, 0.80, 0.97] {
+            let pointer_y = track.top() + track.height() * ratio;
+            let scroll_y = merge_overview_scroll_target(
+                track,
+                pointer_y,
+                result_rows,
+                viewport_height,
+                content_height,
+            );
+            let thumb =
+                merge_overview_viewport_rect(track, scroll_y, viewport_height, content_height);
+
+            assert!(
+                (thumb.center().y - pointer_y).abs() < 0.01,
+                "click at {ratio:.2} centered viewport at {}, expected {pointer_y}",
+                thumb.center().y
+            );
+        }
+    }
+
+    #[test]
+    fn minimap_side_markers_project_to_result_rows_after_deletions() {
+        let document = navigation_matrix_document();
+        let conflict = document.conflicts().last().expect("last conflict");
+        let conflict_index = conflict.index;
+        let result_row = merge_result_row_span_for_conflict(&document, conflict)
+            .expect("result conflict span")
+            .0 as f32;
+        let app = MergeToolApp::new(test_merge_args(), document);
+        let result_rows = merge_visible_result_overview_tones(&app).len();
+
+        for (column_index, rows) in [
+            (0, app.local_display_rows.as_slice()),
+            (2, app.remote_display_rows.as_slice()),
+        ] {
+            let side_row = rows
+                .iter()
+                .position(|row| row.conflict_index == Some(conflict_index))
+                .expect("side conflict row") as f32;
+            let projected = merge_overview_result_row(&app, column_index, side_row, result_rows);
+            assert!(
+                (projected - result_row).abs() < 0.01,
+                "column {column_index} marker mapped to {projected}, expected {result_row}"
+            );
+        }
     }
 
     #[test]
     fn conflict_navigation_wraps_and_reselects_a_single_conflict() {
         let document = three_way_merge("base\n", "local\n", "remote\n");
         assert_eq!(document.unresolved_conflict_count(), 1);
-        let mut cursor = document.conflicts()[0].index;
+        let targets = merge_navigation_targets(&document, MergeSide::Local);
 
-        previous_unresolved_conflict(&document, MergeSide::Local, &mut cursor);
-        assert_eq!(cursor, document.conflicts()[0].index);
-        next_unresolved_conflict(&document, MergeSide::Local, &mut cursor);
-        assert_eq!(cursor, document.conflicts()[0].index);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(previous_navigation_position(0, targets.len()), 0);
+        assert_eq!(next_navigation_position(0, targets.len()), 0);
     }
 
     #[test]
-    fn conflict_navigation_wraps_between_multiple_conflicts() {
-        let document = three_way_merge(
-            "alpha\nstable\nbeta\n",
-            "alpha-local\nstable\nbeta-local\n",
-            "alpha-remote\nstable\nbeta-remote\n",
-        );
-        assert_eq!(document.unresolved_conflict_count(), 2);
-        let first = document.conflicts()[0].index;
-        let last = document.conflicts()[1].index;
-        let mut cursor = first;
+    fn side_navigation_counts_conflicts_and_its_missing_side_deletion() {
+        let document = navigation_matrix_document();
+        let local_targets = merge_navigation_targets(&document, MergeSide::Local);
+        let remote_targets = merge_navigation_targets(&document, MergeSide::Remote);
 
-        previous_unresolved_conflict(&document, MergeSide::Local, &mut cursor);
-        assert_eq!(cursor, last);
-        next_unresolved_conflict(&document, MergeSide::Local, &mut cursor);
-        assert_eq!(cursor, first);
+        assert_eq!(document.unresolved_conflict_count(), 3);
+        assert_eq!(local_targets.len(), 4);
+        assert_eq!(remote_targets.len(), 4);
+        assert_eq!(
+            local_targets
+                .iter()
+                .filter(|target| matches!(target, MergeLineActionTarget::Conflict(_)))
+                .count(),
+            3
+        );
+        assert_eq!(
+            remote_targets
+                .iter()
+                .filter(|target| matches!(target, MergeLineActionTarget::Conflict(_)))
+                .count(),
+            3
+        );
+        let local_deletion = local_targets
+            .iter()
+            .find(|target| matches!(target, MergeLineActionTarget::BaseOnlyGroup(_)))
+            .copied()
+            .expect("local-side deletion target");
+        let remote_deletion = remote_targets
+            .iter()
+            .find(|target| matches!(target, MergeLineActionTarget::BaseOnlyGroup(_)))
+            .copied()
+            .expect("remote-side deletion target");
+        assert_ne!(local_deletion, remote_deletion);
+
+        assert_eq!(
+            previous_navigation_position(0, local_targets.len()),
+            local_targets.len() - 1
+        );
+        assert_eq!(
+            next_navigation_position(local_targets.len() - 1, local_targets.len()),
+            0
+        );
     }
 
     #[test]
@@ -6818,6 +7712,23 @@ mod tests {
         assert!(implementation.contains("MERGE_CODE_ROW_HEIGHT"));
         assert!(!implementation.contains("let row_h = 22.0"));
         assert!(!implementation.contains("ui.add_space(30.0)"));
+
+        for panel_name in ["fn merge_side_panel(", "fn merge_result_panel("] {
+            let panel = implementation
+                .split(panel_name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing {panel_name}"));
+            let spacing = panel
+                .find("item_spacing.y = 0.0")
+                .unwrap_or_else(|| panic!("{panel_name} must set dense row spacing"));
+            let show_rows = panel
+                .find(".show_rows(")
+                .unwrap_or_else(|| panic!("{panel_name} must use virtual rows"));
+            assert!(
+                spacing < show_rows,
+                "{panel_name} must set spacing before show_rows calculates virtual offsets"
+            );
+        }
     }
 
     #[test]

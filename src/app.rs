@@ -27250,6 +27250,9 @@ fn render_unified_diff(
             DiffRenderItem::FileHeader(text) => {
                 ui.label(RichText::new(text).monospace().color(theme::info()));
             }
+            DiffRenderItem::HunkGap { omitted_lines } => {
+                diff_hunk_gap_row(ui, omitted_lines);
+            }
             DiffRenderItem::Omitted => diff_omitted_row(ui),
             DiffRenderItem::Line(line) => {
                 diff_row(ui, &line, gutter_layout, language, selected_rows);
@@ -27263,6 +27266,7 @@ fn render_unified_diff(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DiffRenderItem {
     FileHeader(String),
+    HunkGap { omitted_lines: usize },
     Omitted,
     Line(DiffLine),
 }
@@ -27303,21 +27307,23 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
     let mut old_line: Option<usize> = None;
     let mut new_line: Option<usize> = None;
     let mut hunk_index = 0usize;
+    let mut has_hunk_in_file = false;
 
     for line in text.lines().take(1_200) {
-        if line.starts_with("diff --git")
+        let starts_file = line.starts_with("diff --git")
             || line.starts_with("diff --cc ")
-            || line.starts_with("diff --combined ")
+            || line.starts_with("diff --combined ");
+        if starts_file
             || line.starts_with("index ")
             || line.starts_with("--- ")
             || line.starts_with("+++ ")
         {
             push_diff_hunk_items(&mut items, &hunk_lines, mode);
             hunk_lines.clear();
-            if line.starts_with("diff --git")
-                || line.starts_with("diff --cc ")
-                || line.starts_with("diff --combined ")
-            {
+            if starts_file {
+                has_hunk_in_file = false;
+                old_line = None;
+                new_line = None;
                 if mode == DiffDisplayMode::Full {
                     items.push(DiffRenderItem::FileHeader(clean_diff_header(line)));
                 }
@@ -27329,9 +27335,23 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
             push_diff_hunk_items(&mut items, &hunk_lines, mode);
             hunk_lines.clear();
             let (old_start, new_start) = parse_hunk_header(line);
+            if has_hunk_in_file {
+                let old_gap = old_start
+                    .zip(old_line)
+                    .map(|(next, current)| next.saturating_sub(current))
+                    .unwrap_or_default();
+                let new_gap = new_start
+                    .zip(new_line)
+                    .map(|(next, current)| next.saturating_sub(current))
+                    .unwrap_or_default();
+                items.push(DiffRenderItem::HunkGap {
+                    omitted_lines: old_gap.max(new_gap),
+                });
+            }
             hunk_index += 1;
             old_line = old_start;
             new_line = new_start;
+            has_hunk_in_file = true;
             continue;
         }
 
@@ -27777,23 +27797,30 @@ fn draw_diff_indent_guides(ui: &mut Ui, text_rect: Rect, body: &str) {
 }
 
 fn diff_omitted_row(ui: &mut Ui) {
+    diff_gap_row(ui, None);
+}
+
+fn diff_hunk_gap_row(ui: &mut Ui, omitted_lines: usize) {
+    diff_gap_row(ui, Some(omitted_lines));
+}
+
+fn diff_gap_row(ui: &mut Ui, omitted_lines: Option<usize>) {
     let width = ui.available_width().max(560.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(250, 251, 253));
-    ui.painter().line_segment(
-        [
-            Pos2::new(rect.left(), rect.center().y),
-            Pos2::new(rect.right(), rect.center().y),
-        ],
-        Stroke::new(1.0, Color32::from_rgb(225, 230, 238)),
-    );
-    ui.painter().text(
-        Pos2::new(rect.left() + 48.0, rect.center().y),
+    let height = if omitted_lines.is_some() { 16.0 } else { 14.0 };
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let visible_rect = rect.intersect(ui.clip_rect());
+    let painter = ui.painter().with_clip_rect(visible_rect);
+    painter.rect_filled(rect, CornerRadius::ZERO, theme::panel_soft());
+    let marker = omitted_lines
+        .filter(|lines| *lines > 0)
+        .map(|lines| format!("... {lines} ..."))
+        .unwrap_or_else(|| "...".to_owned());
+    painter.text(
+        visible_rect.center(),
         Align2::CENTER_CENTER,
-        "...",
-        FontId::monospace(12.0),
-        Color32::from_rgb(128, 139, 153),
+        marker,
+        FontId::monospace(11.0),
+        theme::muted(),
     );
 }
 
@@ -38654,6 +38681,7 @@ index 1111111,2222222..3333333
 
         assert!(!items.iter().any(|item| match item {
             DiffRenderItem::FileHeader(text) => text.contains("@@@"),
+            DiffRenderItem::HunkGap { .. } => false,
             DiffRenderItem::Omitted => false,
             DiffRenderItem::Line(line) => line.body.contains("@@@"),
         }));
@@ -38671,6 +38699,52 @@ index 1111111,2222222..3333333
         assert_eq!(gutter.left_width, 18.0);
         assert_eq!(gutter.right_width, 29.0);
         assert!(gutter.total_width() < 96.0);
+    }
+
+    #[test]
+    fn unified_diff_separates_disjoint_hunks_without_exposing_hunk_headers() {
+        let diff = "\
+diff --git a/example.txt b/example.txt
+index 1111111..2222222 100644
+--- a/example.txt
++++ b/example.txt
+@@ -1,2 +1,2 @@
+-before
++after
+ context
+@@ -51,2 +51,2 @@
+-old tail
++new tail
+ context tail";
+
+        for mode in [DiffDisplayMode::Full, DiffDisplayMode::Blocks] {
+            let items = collect_unified_diff_items(diff, mode);
+            let gaps = items
+                .iter()
+                .filter_map(|item| match item {
+                    DiffRenderItem::HunkGap { omitted_lines } => Some(*omitted_lines),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(gaps, vec![48]);
+            assert!(!items.iter().any(|item| match item {
+                DiffRenderItem::FileHeader(text) => text.starts_with("@@"),
+                DiffRenderItem::Line(line) => line.body.starts_with("@@"),
+                _ => false,
+            }));
+        }
+    }
+
+    #[test]
+    fn unified_diff_hunk_separator_uses_a_borderless_recessed_band() {
+        let source = include_str!("app.rs");
+        let start = source.find("fn diff_gap_row(").unwrap();
+        let end = source[start..].find("fn clean_diff_header(").unwrap();
+        let gap_source = &source[start..start + end];
+        assert!(gap_source.contains("rect_filled"));
+        assert!(gap_source.contains("theme::panel_soft()"));
+        assert!(!gap_source.contains("line_segment"));
+        assert!(!gap_source.contains("Stroke::new"));
     }
 
     #[test]
