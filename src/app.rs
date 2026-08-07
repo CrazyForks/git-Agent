@@ -34380,8 +34380,8 @@ mod ui_tests {
         let unchecked_edge_source =
             &checkbox_source[..checkbox_source.find("let check_color").unwrap()];
 
-        assert!(unchecked_edge_source.contains("let edge_stroke ="));
-        assert!(unchecked_edge_source.contains("theme::inset_shadow()"));
+        assert!(unchecked_edge_source.contains("let shadow = square.translate"));
+        assert!(unchecked_edge_source.contains("theme::accent_shadow()"));
         assert!(!unchecked_edge_source.contains("Color32::WHITE"));
         assert!(checkbox_source.contains("let check_color = Color32::WHITE;"));
     }
@@ -34417,7 +34417,7 @@ mod ui_tests {
         assert!(search_source.contains("themed_singleline_text_edit("));
         assert!(helper_source.contains(".text_color(theme::text())"));
         assert!(helper_source.contains(".frame(false)"));
-        assert!(helper_source.contains("let rect = rect.shrink(1.0);"));
+        assert!(helper_source.contains("paint_recessed_control_shadow(ui, response.rect);"));
         assert!(helper_source.contains("selection.bg_fill = theme::accent_soft()"));
         assert!(helper_source.contains("selection.stroke = Stroke::NONE"));
     }
