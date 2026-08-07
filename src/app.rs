@@ -20262,6 +20262,9 @@ fn themed_singleline_text_edit<'a>(
 ) -> ThemedSinglelineTextEdit<'a> {
     ThemedSinglelineTextEdit {
         inner: TextEdit::singleline(text)
+            // Keep text and caret clear of the recessed edge even when the
+            // control sits flush against a pane boundary.
+            .margin(egui::Margin::symmetric(8, 4))
             .hint_text(RichText::new(hint.to_owned()).color(theme::muted()))
             .text_color(theme::text())
             .frame(false),

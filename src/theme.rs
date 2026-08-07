@@ -215,11 +215,13 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
         ThemeMode::Light => 0.28,
     });
     let accent_shadow_base = match mode {
-        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.52).clamp(0.25, 0.58), 0.24),
+        // Dark surfaces need depth, not a tinted halo. Keep the hue derived
+        // from the active theme seed, but make shadows nearly neutral.
+        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.14).clamp(0.035, 0.12), 0.035),
         ThemeMode::Light => shadow_base,
     };
     let inset_shadow_base = match mode {
-        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.42).clamp(0.22, 0.38), 0.065),
+        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.10).clamp(0.025, 0.09), 0.045),
         ThemeMode::Light => shadow_base,
     };
     let accent_shadow = match mode {
@@ -227,7 +229,7 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
             accent_shadow_base.r(),
             accent_shadow_base.g(),
             accent_shadow_base.b(),
-            72,
+            92,
         ),
         ThemeMode::Light => {
             Color32::from_rgba_unmultiplied(shadow_base.r(), shadow_base.g(), shadow_base.b(), 58)
@@ -253,7 +255,7 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
                 inset_shadow_base.r(),
                 inset_shadow_base.g(),
                 inset_shadow_base.b(),
-                118,
+                104,
             ),
             info: Color32::from_rgb(120, 164, 255),
             warning: WARNING,
@@ -490,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_theme_avoids_white_inset_and_uses_colored_shadow() {
+    fn dark_theme_avoids_white_inset_and_uses_near_neutral_theme_shadow() {
         let palette = palette_for(ThemeMode::Dark, ThemeAccent::Blue);
         let shadow_hsl = rgb_to_hsl(Color32::from_rgb(
             palette.accent_shadow.r(),
@@ -506,10 +508,37 @@ mod tests {
 
         assert_eq!(palette.inset_highlight.a(), 0);
         assert!(palette.accent_shadow.a() >= 64);
-        assert!(shadow_hsl.s >= 0.25);
-        assert!(palette.inset_shadow.a() >= 108);
+        let shadow_spread = palette
+            .accent_shadow
+            .r()
+            .max(palette.accent_shadow.g())
+            .max(palette.accent_shadow.b())
+            - palette
+                .accent_shadow
+                .r()
+                .min(palette.accent_shadow.g())
+                .min(palette.accent_shadow.b());
+        let inset_spread = palette
+            .inset_shadow
+            .r()
+            .max(palette.inset_shadow.g())
+            .max(palette.inset_shadow.b())
+            - palette
+                .inset_shadow
+                .r()
+                .min(palette.inset_shadow.g())
+                .min(palette.inset_shadow.b());
+        assert!(
+            shadow_spread <= 4,
+            "dark accent shadow should stay near neutral"
+        );
+        assert!(shadow_hsl.l <= 0.06);
+        assert!(palette.inset_shadow.a() >= 96);
         assert!(inset_hsl.l <= 0.10);
-        assert!(inset_hsl.s >= 0.22);
+        assert!(
+            inset_spread <= 3,
+            "dark inset shadow should stay near neutral"
+        );
         assert!(
             recessed_hsl.s <= 0.14,
             "dark text edit background should stay near neutral, got {recessed_hsl:?}"
