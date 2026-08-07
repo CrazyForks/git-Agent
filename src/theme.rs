@@ -84,6 +84,14 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
     visuals.panel_fill = palette.bg;
     visuals.window_fill = palette.panel;
     visuals.window_stroke = Stroke::NONE;
+    let surface_shadow = eframe::epaint::Shadow {
+        offset: [3, 4],
+        blur: 12,
+        spread: 0,
+        color: palette.accent_shadow.gamma_multiply(0.92),
+    };
+    visuals.window_shadow = surface_shadow;
+    visuals.popup_shadow = surface_shadow;
     visuals.extreme_bg_color = palette.panel_recessed;
     visuals.faint_bg_color = palette.panel_soft;
     visuals.widgets.noninteractive.bg_fill = palette.panel;
@@ -108,13 +116,16 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
     visuals.widgets.active.bg_stroke = Stroke::NONE;
     visuals.widgets.active.weak_bg_fill = visuals.widgets.active.bg_fill;
     visuals.widgets.active.fg_stroke.color = Color32::WHITE;
+    visuals.widgets.open.bg_fill = palette.hover;
     visuals.widgets.open.bg_stroke = Stroke::NONE;
+    visuals.widgets.open.weak_bg_fill = palette.hover;
+    visuals.widgets.open.fg_stroke.color = palette.text;
     visuals.selection.bg_fill = if mode == ThemeMode::Dark {
         palette.accent_deep
     } else {
         palette.accent_deep
     };
-    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.selection.stroke = Stroke::NONE;
     visuals.hyperlink_color = palette.accent;
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals;

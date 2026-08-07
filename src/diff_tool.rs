@@ -461,7 +461,6 @@ struct DiffPalette {
     added_bg: Color32,
     removed_bg: Color32,
     empty_bg: Color32,
-    row_border: Color32,
 }
 
 fn diff_palette(theme: DiffTheme) -> DiffPalette {
@@ -480,7 +479,6 @@ fn diff_palette(theme: DiffTheme) -> DiffPalette {
             added_bg: Color32::from_rgb(24, 58, 40),
             removed_bg: Color32::from_rgb(70, 34, 34),
             empty_bg: Color32::from_rgb(26, 29, 33),
-            row_border: Color32::from_rgb(47, 53, 61),
         },
         DiffTheme::Light => DiffPalette {
             bg: Color32::from_rgb(239, 242, 246),
@@ -496,7 +494,6 @@ fn diff_palette(theme: DiffTheme) -> DiffPalette {
             added_bg: Color32::from_rgb(226, 246, 234),
             removed_bg: Color32::from_rgb(255, 235, 232),
             empty_bg: Color32::from_rgb(248, 250, 252),
-            row_border: Color32::from_rgb(225, 230, 236),
         },
     }
 }
@@ -632,10 +629,6 @@ fn draw_line_row(
         line.right_kind,
         palette,
     );
-    ui.painter().line_segment(
-        [rect.left_bottom(), rect.right_bottom()],
-        Stroke::new(1.0, palette.row_border),
-    );
 }
 
 fn split_columns(rect: Rect, column_width: f32, gap: f32) -> (Rect, Rect) {
@@ -737,6 +730,29 @@ fn apply_diff_theme(ctx: &egui::Context, theme: DiffTheme) {
     };
     visuals.panel_fill = palette.bg;
     visuals.window_fill = palette.panel;
+    visuals.window_stroke = Stroke::NONE;
+    let surface_shadow = match theme {
+        DiffTheme::Dark => eframe::epaint::Shadow {
+            offset: [3, 4],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+        },
+        DiffTheme::Light => eframe::epaint::Shadow {
+            offset: [3, 4],
+            blur: 12,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(44, 56, 72, 44),
+        },
+    };
+    visuals.window_shadow = surface_shadow;
+    visuals.popup_shadow = surface_shadow;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+    visuals.widgets.active.bg_stroke = Stroke::NONE;
+    visuals.widgets.open.bg_stroke = Stroke::NONE;
+    visuals.selection.stroke = Stroke::NONE;
     visuals.override_text_color = Some(palette.text);
     ctx.set_visuals(visuals);
 }

@@ -5405,10 +5405,14 @@ fn apply_merge_theme(ctx: &egui::Context, theme: MergeTheme) {
     };
     visuals.panel_fill = palette.bg;
     visuals.window_fill = palette.panel;
+    visuals.window_stroke = egui::Stroke::NONE;
+    visuals.window_shadow = palette.shadow;
+    visuals.popup_shadow = palette.shadow;
     visuals.extreme_bg_color = palette.panel_soft;
     visuals.faint_bg_color = palette.panel_soft;
     visuals.override_text_color = Some(palette.text);
     visuals.selection.bg_fill = palette.accent;
+    visuals.selection.stroke = egui::Stroke::NONE;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
     visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;

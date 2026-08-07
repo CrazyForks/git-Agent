@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
-use crate::patch::numbered_patch_paths;
+use crate::{diagnostics, patch::numbered_patch_paths};
 
 const HISTORY_COMMIT_LIMIT: usize = 50_000;
 
@@ -260,17 +260,24 @@ pub struct RepositoryUndoPosition {
 
 pub fn repository_undo_position(root: impl AsRef<Path>) -> Result<RepositoryUndoPosition> {
     let root = root.as_ref();
+    let mut position = repository_undo_position_without_status(root)?;
+    position.status = git_output(root, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    Ok(position)
+}
+
+pub fn repository_undo_position_without_status(
+    root: impl AsRef<Path>,
+) -> Result<RepositoryUndoPosition> {
+    let root = root.as_ref();
     let head = git_output(root, &["rev-parse", "HEAD"])?.trim().to_owned();
     let branch = git_output(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .ok()
         .map(|branch| branch.trim().to_owned())
         .filter(|branch| !branch.is_empty());
-    let status = git_output(root, &["status", "--porcelain=v1", "--untracked-files=all"])?;
-
     Ok(RepositoryUndoPosition {
         branch,
         head,
-        status,
+        status: String::new(),
     })
 }
 
@@ -330,11 +337,28 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
 }
 
 pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
+    let requested_path = path.as_ref().to_path_buf();
+    let _total_span = diagnostics::span(
+        "snapshot.core",
+        format!("requested={}", requested_path.display()),
+    );
+    let gate_span = diagnostics::span(
+        "snapshot.gate.wait",
+        format!("requested={}", requested_path.display()),
+    );
     let _snapshot_load_guard = REPOSITORY_SNAPSHOT_GATE
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let root = discover_root(path.as_ref())?;
+    drop(gate_span);
+    let root = {
+        let _span = diagnostics::span(
+            "snapshot.discover",
+            format!("requested={}", requested_path.display()),
+        );
+        discover_root(&requested_path)?
+    };
+    let _branch_span = diagnostics::span("snapshot.branch", format!("root={}", root.display()));
     let branch = git_output(&root, &["branch", "--show-current"])
         .unwrap_or_else(|_| "HEAD".to_owned())
         .trim()
@@ -344,15 +368,23 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
     } else {
         branch
     };
+    drop(_branch_span);
 
+    let status_span = diagnostics::span("snapshot.status", format!("root={}", root.display()));
     let status = git_output(&root, &["status", "--short", "--untracked-files=all"])
         .unwrap_or_default()
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    drop(status_span);
+    diagnostics::trace(
+        "snapshot.status.count",
+        &format!("root={} count={}", root.display(), status.len()),
+    );
     let (staged, unstaged) = parse_status_entries(&status);
     let conflicts = collect_worktree_conflicts(&staged, &unstaged);
 
+    let metadata_span = diagnostics::span("snapshot.metadata", format!("root={}", root.display()));
     let mut branches = load_branches(&root).unwrap_or_default();
     if branches.is_empty() && branch != "HEAD" {
         branches.push(Branch {
@@ -371,6 +403,7 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
     let upstream = load_upstream_status(&root).ok().flatten();
     let stashes = load_stashes(&root).unwrap_or_default();
     let tags = load_tags(&root).unwrap_or_default();
+    drop(metadata_span);
     Ok(RepositorySnapshot {
         root,
         branch,
@@ -4720,6 +4753,23 @@ mod tests {
         fs::write(root.join("tracked.txt"), "changed\n")?;
         let dirty = repository_undo_position(&root)?;
         assert!(repository_has_worktree_changes(&dirty));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn repository_undo_position_without_status_skips_worktree_contents() -> Result<()> {
+        let root = init_patch_test_repo("undo-position-fast")?;
+        fs::write(root.join("untracked.txt"), "untracked\n")?;
+
+        let position = repository_undo_position_without_status(&root)?;
+        let full_position = repository_undo_position(&root)?;
+
+        assert_eq!(position.branch, full_position.branch);
+        assert_eq!(position.head, full_position.head);
+        assert!(position.status.is_empty());
+        assert!(!full_position.status.is_empty());
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

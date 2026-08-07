@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
 
 use crate::{
-    dialog,
+    diagnostics, dialog,
     git::{
         self, Commit, CommitDetails, FileDiff, RepositoryHistory, RepositorySnapshot, ResetMode,
         StashEntry, Tag, WorktreeFile,
@@ -460,7 +460,9 @@ pub struct GitAgentApp {
     inactive_repo_refresh_seconds: u64,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
     remote_git_status_key: Option<&'static str>,
+    remote_git_root: Option<PathBuf>,
     repository_undo_task: Option<Receiver<RepositoryUndoTaskResult>>,
+    repository_undo_root: Option<PathBuf>,
     undo_entries: HashMap<String, RepositoryUndoEntry>,
     redo_entries: HashMap<String, RepositoryUndoEntry>,
     create_patch_task: Option<Receiver<CreatePatchTaskResult>>,
@@ -474,8 +476,10 @@ pub struct GitAgentApp {
     ssh_load_key_prompt_open: bool,
     ssh_agent_status: Option<SshAgentStatus>,
     credential_login_task: Option<Receiver<anyhow::Result<()>>>,
+    credential_login_root: Option<PathBuf>,
     credential_retry_in_progress: bool,
     branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
+    branch_checkout_root: Option<PathBuf>,
     merge_tool_task: Option<Receiver<MergeToolTaskResult>>,
     repo_source_task: Option<Receiver<anyhow::Result<PathBuf>>>,
     details_task: Option<Receiver<anyhow::Result<CommitDetails>>>,
@@ -504,6 +508,7 @@ pub struct GitAgentApp {
     loading_details_hash: Option<String>,
     loading_diff_key: Option<String>,
     toolbar_background_status: Option<(String, Instant)>,
+    toolbar_background_status_root: Option<PathBuf>,
     pending_branch_checkout: Option<String>,
     pending_commit_action: Option<CommitActionDialog>,
     last_notice: Option<String>,
@@ -2530,7 +2535,9 @@ impl GitAgentApp {
             inactive_repo_refresh_seconds,
             remote_git_task: None,
             remote_git_status_key: None,
+            remote_git_root: None,
             repository_undo_task: None,
+            repository_undo_root: None,
             undo_entries: HashMap::new(),
             redo_entries: HashMap::new(),
             create_patch_task: None,
@@ -2544,8 +2551,10 @@ impl GitAgentApp {
             ssh_load_key_prompt_open: false,
             ssh_agent_status: None,
             credential_login_task: None,
+            credential_login_root: None,
             credential_retry_in_progress: false,
             branch_checkout_task: None,
+            branch_checkout_root: None,
             merge_tool_task: None,
             repo_source_task: None,
             details_task: None,
@@ -2574,6 +2583,7 @@ impl GitAgentApp {
             loading_details_hash: None,
             loading_diff_key: None,
             toolbar_background_status: None,
+            toolbar_background_status_root: None,
             pending_branch_checkout: None,
             pending_commit_action: None,
             last_notice: None,
@@ -2733,9 +2743,18 @@ impl GitAgentApp {
 
     fn spawn_repository_snapshot_load(&mut self, path: PathBuf, repo_task_key: String) {
         let (sender, receiver) = mpsc::channel();
+        let worker_key = repo_task_key.clone();
         self.repo_tasks.insert(repo_task_key, receiver);
 
+        diagnostics::trace(
+            "snapshot.worker.spawn",
+            &format!("root={} key={worker_key}", path.display()),
+        );
         thread::spawn(move || {
+            let _span = diagnostics::span(
+                "snapshot.worker",
+                format!("root={} key={worker_key}", path.display()),
+            );
             let requested_root = path.clone();
             let _ = sender.send((requested_root, git::open_repository_core(path)));
         });
@@ -2808,6 +2827,17 @@ impl GitAgentApp {
         foreground: bool,
     ) {
         let repo_task_key = repo_state_key(&path);
+        diagnostics::trace(
+            "snapshot.request",
+            &format!(
+                "root={} key={} restart={} foreground={} running={}",
+                path.display(),
+                repo_task_key,
+                restart,
+                foreground,
+                self.repo_tasks.contains_key(&repo_task_key)
+            ),
+        );
         if restart || foreground {
             self.deferred_repo_reloads.remove(&repo_task_key);
             self.repo_snapshot_retry_attempts.remove(&repo_task_key);
@@ -2819,6 +2849,10 @@ impl GitAgentApp {
         }
         if self.repo_tasks.contains_key(&repo_task_key) {
             if restart {
+                diagnostics::trace(
+                    "snapshot.queue",
+                    &format!("root={} key={repo_task_key}", path.display()),
+                );
                 self.queued_repo_reloads.insert(repo_task_key, path);
             }
             return;
@@ -3224,6 +3258,12 @@ impl GitAgentApp {
 
         if !self.active_repo_root_matches(root) {
             return;
+        }
+        if self.repository_undo_task.take().is_some() {
+            diagnostics::trace(
+                "undo.cancelled",
+                &format!("root={} reason=branch_transition", root.display()),
+            );
         }
         self.details_task = None;
         self.diff_task = None;
@@ -4381,6 +4421,30 @@ impl GitAgentApp {
         self.branch_checkout_task.is_some() || self.pending_branch_checkout.is_some()
     }
 
+    fn task_root_matches_active_repo(&self, root: Option<&Path>) -> bool {
+        root.is_some_and(|root| self.active_repo_root_matches(root))
+    }
+
+    fn active_branch_checkout_busy(&self) -> bool {
+        self.branch_checkout_busy()
+            && self.task_root_matches_active_repo(self.branch_checkout_root.as_deref())
+    }
+
+    fn active_remote_git_busy(&self) -> bool {
+        self.remote_git_busy()
+            && self.task_root_matches_active_repo(self.remote_git_root.as_deref())
+    }
+
+    fn active_repository_undo_busy(&self) -> bool {
+        self.repository_undo_busy()
+            && self.task_root_matches_active_repo(self.repository_undo_root.as_deref())
+    }
+
+    fn active_credential_login_busy(&self) -> bool {
+        self.credential_login_task.is_some()
+            && self.task_root_matches_active_repo(self.credential_login_root.as_deref())
+    }
+
     fn merge_tool_busy(&self) -> bool {
         self.merge_tool_task.is_some()
     }
@@ -4457,20 +4521,20 @@ impl GitAgentApp {
     }
 
     fn repo_toolbar_loading_busy(&self) -> bool {
-        self.branch_checkout_busy()
+        self.active_branch_checkout_busy()
             || self.merge_tool_busy()
             || self.repo_source_task.is_some()
-            || (self.loading_repo && !self.remote_git_busy())
+            || self.active_repo_has_pending_load()
     }
 
     fn repo_toolbar_loading_label(&self) -> &str {
-        if self.branch_checkout_busy() {
+        if self.active_branch_checkout_busy() {
             return self.tr("status.switching_branch");
         }
-        if self.credential_login_task.is_some() {
+        if self.active_credential_login_busy() {
             return self.tr("status.authenticating");
         }
-        if self.remote_git_task.is_some() {
+        if self.active_remote_git_busy() {
             return self
                 .remote_git_status_key
                 .map(|key| self.tr(key))
@@ -4497,10 +4561,10 @@ impl GitAgentApp {
             return None;
         }
 
-        if self.credential_login_task.is_some() {
+        if self.active_credential_login_busy() {
             return Some(self.tr("status.authenticating"));
         }
-        if self.remote_git_task.is_some() {
+        if self.active_remote_git_busy() {
             return Some(
                 self.remote_git_status_key
                     .map(|key| self.tr(key))
@@ -4513,7 +4577,7 @@ impl GitAgentApp {
         if self.repository_benchmark_task.is_some() {
             return Some(self.tr("status.benchmarking_repository"));
         }
-        if self.repository_undo_task.is_some() {
+        if self.active_repository_undo_busy() {
             return Some(self.tr("status.restoring_repository_state"));
         }
         if self.loading_diff_key.is_some() {
@@ -4536,25 +4600,27 @@ impl GitAgentApp {
         {
             return Some(self.tr("status.background_worktree"));
         }
-        if !self.repo_tasks.is_empty() {
-            return Some(self.tr("status.background_refresh"));
-        }
-        if !self.repo_history_tasks.is_empty() {
-            return Some(self.tr("status.background_history"));
-        }
         None
     }
 
     fn displayed_repo_toolbar_background_status(&mut self, ctx: &egui::Context) -> Option<String> {
         if self.repo_toolbar_loading_busy() {
             self.toolbar_background_status = None;
+            self.toolbar_background_status_root = None;
             return None;
         }
 
         if let Some(label) = self.repo_toolbar_background_status_label() {
             let label = label.to_owned();
             self.toolbar_background_status = Some((label.clone(), Instant::now()));
+            self.toolbar_background_status_root = self.active_repo_root();
             return Some(label);
+        }
+
+        if !self.task_root_matches_active_repo(self.toolbar_background_status_root.as_deref()) {
+            self.toolbar_background_status = None;
+            self.toolbar_background_status_root = None;
+            return None;
         }
 
         let Some((label, last_active_at)) = self.toolbar_background_status.as_ref() else {
@@ -4566,6 +4632,7 @@ impl GitAgentApp {
             return Some(label.clone());
         }
         self.toolbar_background_status = None;
+        self.toolbar_background_status_root = None;
         None
     }
 
@@ -4902,13 +4969,32 @@ impl GitAgentApp {
 
         let has_local_changes = !snapshot.status.is_empty();
         let root = snapshot.root.clone();
+        diagnostics::begin_branch_switch(&format!(
+            "root={} from={} to={} strategy={strategy:?} status_count={}",
+            root.display(),
+            snapshot.branch,
+            name,
+            snapshot.status.len()
+        ));
+        diagnostics::trace(
+            "branch.invalidate.start",
+            &format!("root={}", root.display()),
+        );
         self.invalidate_branch_sensitive_tasks(&root);
+        diagnostics::trace("branch.invalidate.end", &format!("root={}", root.display()));
+        self.branch_checkout_root = Some(root.clone());
         if strategy == BranchCheckoutStrategy::PreserveLocalChanges && !has_local_changes {
             let checkout_name = name.clone();
-            self.start_undoable_git_action(
+            self.start_undoable_git_action_without_post_status(
                 menu_label(self.language, "repo_checkout").to_owned(),
                 RepositoryUndoKind::Position,
-                move |root| git::checkout_branch(root, &checkout_name),
+                move |root| {
+                    let _span = diagnostics::span(
+                        "checkout.git",
+                        format!("root={} target={checkout_name}", root.display()),
+                    );
+                    git::checkout_branch(root, &checkout_name)
+                },
             );
             self.pending_branch_checkout = Some(name);
             return;
@@ -4922,6 +5008,14 @@ impl GitAgentApp {
         self.last_notice = None;
 
         thread::spawn(move || {
+            let _span = diagnostics::span(
+                "checkout.worker",
+                format!(
+                    "root={} target={} strategy={strategy:?}",
+                    root.display(),
+                    name
+                ),
+            );
             let result = (|| match strategy {
                 BranchCheckoutStrategy::PreserveLocalChanges => git::checkout_branch(&root, &name),
                 BranchCheckoutStrategy::StashLocalChanges => {
@@ -4979,6 +5073,25 @@ impl GitAgentApp {
         kind: RepositoryUndoKind,
         action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
     ) {
+        self.start_undoable_git_action_inner(label, kind, true, action);
+    }
+
+    fn start_undoable_git_action_without_post_status(
+        &mut self,
+        label: String,
+        kind: RepositoryUndoKind,
+        action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
+    ) {
+        self.start_undoable_git_action_inner(label, kind, false, action);
+    }
+
+    fn start_undoable_git_action_inner(
+        &mut self,
+        label: String,
+        kind: RepositoryUndoKind,
+        inspect_after_status: bool,
+        action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
+    ) {
         if self.branch_actions_busy() {
             return;
         }
@@ -4988,13 +5101,22 @@ impl GitAgentApp {
 
         let (sender, receiver) = mpsc::channel();
         self.repository_undo_task = Some(receiver);
+        self.repository_undo_root = Some(root.clone());
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
 
         thread::spawn(move || {
+            let _worker_span = diagnostics::span(
+                "undo.worker",
+                format!("root={} label={label}", root.display()),
+            );
             let result = (|| {
-                let before = git::repository_undo_position(&root)?;
+                let before = {
+                    let _span =
+                        diagnostics::span("undo.before", format!("root={}", root.display()));
+                    git::repository_undo_position(&root)?
+                };
                 let staged_diff = match &kind {
                     RepositoryUndoKind::Position => {
                         if !before.status.trim().is_empty() {
@@ -5010,9 +5132,20 @@ impl GitAgentApp {
                     }
                 };
 
-                action(&root)?;
-                let after = git::repository_undo_position(&root)?;
-                if !after.status.trim().is_empty() {
+                {
+                    let _span =
+                        diagnostics::span("undo.action", format!("root={}", root.display()));
+                    action(&root)?;
+                }
+                let after = {
+                    let _span = diagnostics::span("undo.after", format!("root={}", root.display()));
+                    if inspect_after_status {
+                        git::repository_undo_position(&root)?
+                    } else {
+                        git::repository_undo_position_without_status(&root)?
+                    }
+                };
+                if inspect_after_status && !after.status.trim().is_empty() {
                     anyhow::bail!("action left uncommitted changes; it cannot be safely undone")
                 }
 
@@ -5052,6 +5185,7 @@ impl GitAgentApp {
         let root = entry.root.clone();
         let (sender, receiver) = mpsc::channel();
         self.repository_undo_task = Some(receiver);
+        self.repository_undo_root = Some(root.clone());
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
@@ -5112,8 +5246,13 @@ impl GitAgentApp {
             return;
         }
 
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+
         let (sender, receiver) = mpsc::channel();
         self.credential_login_task = Some(receiver);
+        self.credential_login_root = Some(root);
         self.loading_repo = true;
         self.last_notice = None;
 
@@ -5287,6 +5426,7 @@ impl GitAgentApp {
         let (sender, receiver) = mpsc::channel();
         self.remote_git_task = Some(receiver);
         self.remote_git_status_key = Some(status_key);
+        self.remote_git_root = Some(root.clone());
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
@@ -5608,12 +5748,23 @@ impl GitAgentApp {
         if self.open_rebase_control_if_needed(snapshot) {
             return;
         }
-        if current_named_local_branch(snapshot).is_none() {
+        let Some(current_branch) = current_named_local_branch(snapshot) else {
             self.error = Some(self.tr("push.detached_error").to_owned());
             return;
-        }
-        self.pending_push_recovery_candidate = self.quick_push_after_pull_plan();
-        self.start_remote_git_action_with_status("status.pushing", |root| git::push(root));
+        };
+        let branch = current_branch.name.clone();
+        let has_upstream = current_branch.upstream.is_some() || snapshot.upstream.is_some();
+        let remote = self.default_remote_name();
+        self.pending_push_recovery_candidate = has_upstream
+            .then(|| self.quick_push_after_pull_plan())
+            .flatten();
+        self.start_remote_git_action_with_status("status.pushing", move |root| {
+            if has_upstream {
+                git::push(root)
+            } else {
+                git::push_set_upstream(root, &remote, &branch)
+            }
+        });
     }
 
     fn open_push_dialog(&mut self, target_branch: Option<String>, target_remote: Option<String>) {
@@ -5827,28 +5978,96 @@ impl GitAgentApp {
                     && self.foreground_repo_loads.remove(&repo_task_key);
                 match result {
                     Ok(snapshot) => {
+                        diagnostics::trace(
+                            "snapshot.result",
+                            &format!(
+                                "root={} branch={} status_count={} foreground={} queued={}",
+                                requested_root.display(),
+                                snapshot.branch,
+                                snapshot.status.len(),
+                                was_foreground,
+                                queued_reload.is_some()
+                            ),
+                        );
                         self.repo_snapshot_retry_attempts.remove(&repo_task_key);
                         let active_repo = self.active_repo_root_matches(&requested_root);
+                        let belongs_to_pending_checkout = self
+                            .branch_checkout_root
+                            .as_deref()
+                            .is_some_and(|root| paths_equal(root, &requested_root))
+                            && self.pending_branch_checkout.is_some();
+                        let matches_pending_checkout = belongs_to_pending_checkout
+                            && self.pending_branch_checkout.as_deref()
+                                == Some(snapshot.branch.as_str());
+                        let stale_checkout_snapshot =
+                            belongs_to_pending_checkout && !matches_pending_checkout;
                         let unchanged_background_snapshot = active_repo
                             && !was_foreground
                             && self.active_snapshot_matches_background_core_refresh(&snapshot);
-                        self.cache_repository_snapshot(&snapshot);
-                        if active_repo {
+                        if !stale_checkout_snapshot {
+                            self.cache_repository_snapshot(&snapshot);
+                        } else {
+                            diagnostics::trace(
+                                "snapshot.skip_stale_branch",
+                                &format!(
+                                    "root={} branch={} pending={}",
+                                    requested_root.display(),
+                                    snapshot.branch,
+                                    self.pending_branch_checkout.as_deref().unwrap_or_default()
+                                ),
+                            );
+                        }
+                        if active_repo && !stale_checkout_snapshot {
+                            let applied_branch = snapshot.branch.clone();
                             if !unchanged_background_snapshot {
                                 self.apply_repository_snapshot(snapshot);
                             }
-                            self.pending_branch_checkout = None;
+                            diagnostics::trace(
+                                "snapshot.apply",
+                                &format!(
+                                    "root={} branch={} unchanged_background={}",
+                                    requested_root.display(),
+                                    applied_branch,
+                                    unchanged_background_snapshot
+                                ),
+                            );
+                            if matches_pending_checkout {
+                                diagnostics::finish_branch_switch(
+                                    "success",
+                                    &format!(
+                                        "root={} branch={applied_branch}",
+                                        requested_root.display()
+                                    ),
+                                );
+                                self.pending_branch_checkout = None;
+                                self.branch_checkout_root = None;
+                            }
                         }
                         // History and graph layout are demand-loaded. A workspace switch only
                         // needs core state; eagerly scanning history makes every open tab compete
                         // for CPU even when its History view is never opened.
                     }
                     Err(error) => {
+                        diagnostics::trace(
+                            "snapshot.error",
+                            &format!("root={} error={error:#}", requested_root.display()),
+                        );
                         if !retry_queued {
                             self.repo_snapshot_retry_attempts.remove(&repo_task_key);
                         }
                         if was_foreground && self.active_repo_root_matches(&requested_root) {
-                            self.pending_branch_checkout = None;
+                            diagnostics::finish_branch_switch(
+                                "snapshot_error",
+                                &format!("root={} error={error:#}", requested_root.display()),
+                            );
+                            if self
+                                .branch_checkout_root
+                                .as_deref()
+                                .is_some_and(|root| paths_equal(root, &requested_root))
+                            {
+                                self.pending_branch_checkout = None;
+                                self.branch_checkout_root = None;
+                            }
                             self.clear_repository_snapshot_view();
                             self.error = Some(error.to_string());
                         }
@@ -5868,7 +6087,14 @@ impl GitAgentApp {
                 }
                 let was_foreground = self.foreground_repo_loads.remove(&key);
                 if was_foreground && self.active_repo_key_matches(&key) {
-                    self.pending_branch_checkout = None;
+                    let checkout_matches = self
+                        .branch_checkout_root
+                        .as_ref()
+                        .is_some_and(|root| repo_state_key(root) == key);
+                    if checkout_matches {
+                        self.pending_branch_checkout = None;
+                        self.branch_checkout_root = None;
+                    }
                     self.clear_repository_snapshot_view();
                     self.error = Some("Repository loader stopped unexpectedly".to_owned());
                 }
@@ -5956,15 +6182,30 @@ impl GitAgentApp {
         if let Some(receiver) = self.branch_checkout_task.take() {
             match receiver.try_recv() {
                 Ok((root, name, _, Ok(()))) => {
+                    diagnostics::trace(
+                        "checkout.result",
+                        &format!("root={} target={} outcome=success", root.display(), name),
+                    );
                     self.error = None;
                     self.last_notice = None;
                     self.pending_branch_checkout = Some(name);
                     self.load_repository_uncached(root);
                     ctx.request_repaint();
                 }
-                Ok((_, name, strategy, Err(error))) => {
+                Ok((root, name, strategy, Err(error))) => {
+                    diagnostics::finish_branch_switch(
+                        "checkout_error",
+                        &format!("target={} strategy={strategy:?} error={error:#}", name),
+                    );
                     self.branch_checkout_task = None;
                     self.pending_branch_checkout = None;
+                    if self
+                        .branch_checkout_root
+                        .as_deref()
+                        .is_some_and(|owner| paths_equal(owner, &root))
+                    {
+                        self.branch_checkout_root = None;
+                    }
                     self.loading_repo = false;
                     if strategy == BranchCheckoutStrategy::PreserveLocalChanges
                         && git::checkout_error_requires_local_change_recovery(&error.to_string())
@@ -5986,7 +6227,9 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    diagnostics::finish_branch_switch("checkout_disconnected", "");
                     self.pending_branch_checkout = None;
+                    self.branch_checkout_root = None;
                     self.loading_repo = false;
                     self.error = Some("Branch checkout stopped unexpectedly".to_owned());
                     ctx.request_repaint();
@@ -5997,6 +6240,11 @@ impl GitAgentApp {
         if let Some(receiver) = self.repository_undo_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(RepositoryUndoTaskOutcome::Recorded(entry)))) => {
+                    self.repository_undo_root = None;
+                    diagnostics::trace(
+                        "undo.result",
+                        &format!("root={} outcome=recorded", root.display()),
+                    );
                     self.show_action_toast(
                         self.undo_redo_toast_message("undo.toast.ready", &entry.label),
                     );
@@ -6009,6 +6257,7 @@ impl GitAgentApp {
                     ctx.request_repaint();
                 }
                 Ok((root, Ok(RepositoryUndoTaskOutcome::Replayed { entry, direction }))) => {
+                    self.repository_undo_root = None;
                     match direction {
                         RepositoryUndoDirection::Undo => {
                             let message =
@@ -6033,6 +6282,11 @@ impl GitAgentApp {
                     ctx.request_repaint();
                 }
                 Ok((root, Err(error))) => {
+                    self.repository_undo_root = None;
+                    diagnostics::finish_branch_switch(
+                        "undo_error",
+                        &format!("root={} error={error:#}", root.display()),
+                    );
                     self.pending_branch_checkout = None;
                     if git::repository_rebase_in_progress(&root) {
                         self.dismiss_rebase_blocked_dialogs();
@@ -6063,6 +6317,8 @@ impl GitAgentApp {
                     ctx.request_repaint_after(Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.repository_undo_root = None;
+                    diagnostics::finish_branch_switch("undo_disconnected", "");
                     self.pending_rewritten_history_prompt_root = None;
                     self.pending_branch_checkout = None;
                     self.loading_repo = false;
@@ -6251,6 +6507,7 @@ impl GitAgentApp {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
                     self.remote_git_status_key = None;
+                    self.remote_git_root = None;
                     if self
                         .pending_push_after_pull
                         .as_ref()
@@ -6291,6 +6548,7 @@ impl GitAgentApp {
                 }
                 Ok((root, Err(error))) => {
                     self.remote_git_status_key = None;
+                    self.remote_git_root = None;
                     let failed_pull_request_root = self
                         .pending_pull_request_open_after_push
                         .as_ref()
@@ -6373,6 +6631,7 @@ impl GitAgentApp {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.remote_git_status_key = None;
+                    self.remote_git_root = None;
                     self.pending_rewritten_history_prompt_root = None;
                     self.pending_pull_request_open_after_push = None;
                     self.pending_non_fast_forward_push = None;
@@ -6389,6 +6648,7 @@ impl GitAgentApp {
         if let Some(receiver) = self.credential_login_task.take() {
             match receiver.try_recv() {
                 Ok(Ok(())) => {
+                    self.credential_login_root = None;
                     self.last_notice = Some(self.tr("credentials.github_login_done").to_owned());
                     self.loading_repo = false;
                     if let Some(retry) = self.pending_credential_retry.take() {
@@ -6400,6 +6660,7 @@ impl GitAgentApp {
                     ctx.request_repaint();
                 }
                 Ok(Err(error)) => {
+                    self.credential_login_root = None;
                     self.loading_repo = false;
                     self.error = Some(error.to_string());
                     self.last_notice = None;
@@ -6410,6 +6671,7 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.credential_login_root = None;
                     self.loading_repo = false;
                     self.error = Some("Credential login stopped unexpectedly".to_owned());
                     self.last_notice = None;
@@ -10453,6 +10715,10 @@ impl GitAgentApp {
                 ui.add_space(10.0);
                 let (filter_rect, _) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
+                // Keep the recessed input and its text clear of the parent clip edge.
+                // TextEdit is frameless here, so using the full allocation would crop its
+                // left inset shadow and make the hint text look flush with the panel.
+                let filter_inner_rect = filter_rect.shrink2(Vec2::new(5.0, 0.0));
                 let dropdown_width = 120.0;
                 let gap = 10.0;
                 let control_height = 28.0;
@@ -10460,13 +10726,13 @@ impl GitAgentApp {
                 let file_search_busy = self.file_search_task.is_some();
                 let is_file_search = self.search_dimension == SearchDimension::Files;
                 let dropdown_rect = Rect::from_min_size(
-                    Pos2::new(filter_rect.right() - dropdown_width, control_top),
+                    Pos2::new(filter_inner_rect.right() - dropdown_width, control_top),
                     Vec2::new(dropdown_width, control_height),
                 );
                 let search_rect = Rect::from_min_size(
-                    Pos2::new(filter_rect.left(), control_top),
+                    Pos2::new(filter_inner_rect.left(), control_top),
                     Vec2::new(
-                        (filter_rect.width() - dropdown_width - gap).max(180.0),
+                        (filter_inner_rect.width() - dropdown_width - gap).max(180.0),
                         control_height,
                     ),
                 );
@@ -10487,8 +10753,7 @@ impl GitAgentApp {
                     .add_enabled_ui(!file_search_busy, |ui| {
                         ui.put(
                             text_rect,
-                            TextEdit::singleline(&mut self.search_view_query)
-                                .hint_text(search_hint)
+                            themed_singleline_text_edit(&mut self.search_view_query, &search_hint)
                                 .desired_width(text_rect.width())
                                 .vertical_align(Align::Center),
                         )
@@ -10768,7 +11033,7 @@ impl GitAgentApp {
         );
         let response = ui.put(
             search_rect,
-            TextEdit::singleline(&mut self.search).hint_text(search_hint),
+            themed_singleline_text_edit(&mut self.search, search_hint),
         );
         if response.changed() {
             self.selected_commit = self.history_rows_cache.first_index();
@@ -10894,7 +11159,7 @@ impl GitAgentApp {
                             } else if response.clicked() {
                                 clicked_commit = Some(commit_index);
                             }
-                            response.context_menu(|ui| {
+                            borderless_context_menu(&response, |ui| {
                                 menu_action = commit_context_menu(ui, commit, self.language);
                             });
                         }
@@ -11074,7 +11339,7 @@ impl GitAgentApp {
             },
         );
 
-        ui.separator();
+        recessed_horizontal_separator(ui);
         self.history_file_table(ui, &commit);
     }
 
@@ -11139,7 +11404,7 @@ impl GitAgentApp {
             },
         );
 
-        ui.separator();
+        recessed_horizontal_separator(ui);
         self.search_file_table(ui, &commit);
     }
 
@@ -12240,6 +12505,7 @@ impl GitAgentApp {
             &response,
             egui::popup::PopupCloseBehavior::CloseOnClick,
             |ui| {
+                apply_menu_visuals(ui);
                 self.commit_history_menu(ui);
             },
         );
@@ -18349,6 +18615,20 @@ fn panel_shadow() -> egui::epaint::Shadow {
     }
 }
 
+/// Menus float above content, but must not acquire the hard contour used by
+/// larger panel islands. Keep this deliberately diffuse so it reads as depth,
+/// not as a one-pixel border.
+fn menu_popup_shadow() -> egui::epaint::Shadow {
+    egui::epaint::Shadow {
+        // Keep the edge diffuse. A too-transparent shadow disappears on the
+        // light workspace, while a small blur reads like a hard border.
+        offset: [2, 4],
+        blur: 14,
+        spread: 0,
+        color: theme::accent_shadow().gamma_multiply(0.82),
+    }
+}
+
 fn text_button_hover_shadow() -> egui::epaint::Shadow {
     egui::epaint::Shadow {
         offset: [1, 2],
@@ -19917,7 +20197,7 @@ fn repo_toolbar_background_indicator(ui: &mut Ui, ctx: &egui::Context, label: &s
 
 fn themed_text_edit_selection(ui: &mut Ui) {
     ui.visuals_mut().selection.bg_fill = theme::accent_soft();
-    ui.visuals_mut().selection.stroke = Stroke::new(1.0, theme::accent_deep());
+    ui.visuals_mut().selection.stroke = Stroke::NONE;
 }
 
 fn placeholder_for_label(language: Language, label: &str) -> String {
@@ -19928,10 +20208,65 @@ fn placeholder_for_label(language: Language, label: &str) -> String {
     }
 }
 
-fn themed_singleline_text_edit<'a>(text: &'a mut String, hint: &str) -> TextEdit<'a> {
-    TextEdit::singleline(text)
-        .hint_text(RichText::new(hint.to_owned()).color(theme::muted()))
-        .text_color(theme::text())
+struct ThemedSinglelineTextEdit<'a> {
+    inner: TextEdit<'a>,
+    inset_shadow: bool,
+}
+
+impl<'a> ThemedSinglelineTextEdit<'a> {
+    fn id(mut self, id: egui::Id) -> Self {
+        self.inner = self.inner.id(id);
+        self
+    }
+
+    fn desired_width(mut self, width: f32) -> Self {
+        self.inner = self.inner.desired_width(width);
+        self
+    }
+
+    fn font(mut self, font: FontId) -> Self {
+        self.inner = self.inner.font(font);
+        self
+    }
+
+    fn text_color(mut self, color: Color32) -> Self {
+        self.inner = self.inner.text_color(color);
+        self
+    }
+
+    fn vertical_align(mut self, align: Align) -> Self {
+        self.inner = self.inner.vertical_align(align);
+        self
+    }
+
+    fn frame(mut self, frame: bool) -> Self {
+        self.inner = self.inner.frame(frame);
+        self.inset_shadow = frame;
+        self
+    }
+}
+
+impl egui::Widget for ThemedSinglelineTextEdit<'_> {
+    fn ui(self, ui: &mut Ui) -> egui::Response {
+        let response = ui.add(self.inner);
+        if self.inset_shadow {
+            paint_recessed_control_shadow(ui, response.rect);
+        }
+        response
+    }
+}
+
+fn themed_singleline_text_edit<'a>(
+    text: &'a mut String,
+    hint: &str,
+) -> ThemedSinglelineTextEdit<'a> {
+    ThemedSinglelineTextEdit {
+        inner: TextEdit::singleline(text)
+            .hint_text(RichText::new(hint.to_owned()).color(theme::muted()))
+            .text_color(theme::text())
+            .frame(false),
+        inset_shadow: true,
+    }
 }
 
 fn commit_message_text_edit<'a>(message: &'a mut String, id: egui::Id, hint: &str) -> TextEdit<'a> {
@@ -20031,15 +20366,6 @@ fn commit_checkbox(ui: &mut Ui, value: &mut bool, label: &str) -> egui::Response
         } else {
             theme::panel()
         },
-    );
-    let edge_stroke = Stroke::new(1.0, theme::inset_shadow());
-    ui.painter().line_segment(
-        [square.left_top(), Pos2::new(square.right(), square.top())],
-        edge_stroke,
-    );
-    ui.painter().line_segment(
-        [square.left_top(), Pos2::new(square.left(), square.bottom())],
-        edge_stroke,
     );
     if *value {
         let check_color = Color32::WHITE;
@@ -20363,7 +20689,7 @@ fn top_menu_button(
         }
         apply_menu_visuals(ui);
         ui.visuals_mut().window_stroke = Stroke::NONE;
-        ui.visuals_mut().popup_shadow = panel_shadow();
+        ui.visuals_mut().popup_shadow = menu_popup_shadow();
         egui::popup::popup_below_widget(
             ui,
             popup_id,
@@ -20458,7 +20784,8 @@ fn hover_submenu_button_enabled(
                     egui::Frame::new()
                         .fill(theme::panel())
                         .corner_radius(CornerRadius::same(6))
-                        .shadow(panel_shadow())
+                        .stroke(Stroke::NONE)
+                        .shadow(menu_popup_shadow())
                         .inner_margin(egui::Margin::symmetric(6, 6))
                         .show(ui, |ui| {
                             apply_menu_visuals(ui);
@@ -20476,24 +20803,44 @@ fn hover_submenu_button_enabled(
     });
 }
 
+fn apply_menu_style(style: &mut egui::Style) {
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+    style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.hovered.bg_fill = menu_text_button_hover_fill();
+    style.visuals.widgets.hovered.weak_bg_fill = menu_text_button_hover_fill();
+    style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.open.bg_fill = menu_text_button_hover_fill();
+    style.visuals.widgets.open.weak_bg_fill = menu_text_button_hover_fill();
+    style.visuals.widgets.open.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.active.bg_fill = menu_text_button_hover_fill();
+    style.visuals.widgets.active.weak_bg_fill = menu_text_button_hover_fill();
+    style.visuals.widgets.active.bg_stroke = Stroke::NONE;
+    style.visuals.selection.stroke = Stroke::NONE;
+    style.visuals.window_stroke = Stroke::NONE;
+    style.visuals.window_shadow = menu_popup_shadow();
+    style.visuals.popup_shadow = menu_popup_shadow();
+}
+
+fn borderless_context_menu(
+    response: &egui::Response,
+    add_contents: impl FnOnce(&mut Ui),
+) -> Option<egui::InnerResponse<()>> {
+    // Context menus paint their outer frame before the contents closure runs.
+    // Keep this style installed so the following frame cannot restore egui's
+    // default one-pixel popup outline.
+    response.ctx.style_mut(apply_menu_style);
+    response.context_menu(add_contents)
+}
+
 fn apply_menu_visuals(ui: &mut Ui) {
     ui.spacing_mut().button_padding = Vec2::new(6.0, 2.0);
-    ui.visuals_mut().widgets.inactive.bg_fill = Color32::TRANSPARENT;
-    ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
-    ui.visuals_mut().widgets.hovered.bg_fill = menu_text_button_hover_fill();
-    ui.visuals_mut().widgets.hovered.weak_bg_fill = menu_text_button_hover_fill();
-    ui.visuals_mut().widgets.hovered.bg_stroke = Stroke::NONE;
-    ui.visuals_mut().widgets.open.bg_fill = menu_text_button_hover_fill();
-    ui.visuals_mut().widgets.open.weak_bg_fill = menu_text_button_hover_fill();
-    ui.visuals_mut().widgets.open.bg_stroke = Stroke::NONE;
-    ui.visuals_mut().widgets.active.bg_fill = menu_text_button_hover_fill();
-    ui.visuals_mut().widgets.active.weak_bg_fill = menu_text_button_hover_fill();
-    ui.visuals_mut().widgets.active.bg_stroke = Stroke::NONE;
-    ui.visuals_mut().selection.stroke = Stroke::NONE;
-    ui.visuals_mut().window_stroke = Stroke::NONE;
-    ui.visuals_mut().window_shadow = panel_shadow();
-    ui.visuals_mut().popup_shadow = panel_shadow();
+    apply_menu_style(ui.style_mut());
+}
+
+fn menu_group_gap(ui: &mut Ui) {
+    ui.add_space(6.0);
 }
 
 fn menu_text_button_hover_fill() -> Color32 {
@@ -21102,12 +21449,14 @@ fn history_branch_scope_dropdown(
         "history_branch_scope",
         history_branch_scope_label(language, current),
     );
+    apply_menu_visuals(ui);
     egui::popup::popup_below_widget(
         ui,
         popup_id,
         &response,
         egui::popup::PopupCloseBehavior::CloseOnClick,
         |ui| {
+            apply_menu_visuals(ui);
             ui.set_min_width(rect.width());
             let mut selected = None;
             if history_toolbar_popup_option(
@@ -21146,12 +21495,14 @@ fn history_sort_order_dropdown(
         "history_sort_order",
         history_sort_order_label(language, current),
     );
+    apply_menu_visuals(ui);
     egui::popup::popup_below_widget(
         ui,
         popup_id,
         &response,
         egui::popup::PopupCloseBehavior::CloseOnClick,
         |ui| {
+            apply_menu_visuals(ui);
             ui.set_min_width(rect.width());
             let mut selected = None;
             if history_toolbar_popup_option(
@@ -21798,7 +22149,7 @@ fn history_commit_browser(
         );
         let response = ui.put(
             search_rect,
-            TextEdit::singleline(search).hint_text(search_hint),
+            themed_singleline_text_edit(search, search_hint),
         );
         if response.changed() {
             outcome.search_changed = true;
@@ -21943,7 +22294,7 @@ fn history_commit_browser(
                         }
                     }
                     if config.show_context_menu {
-                        response.context_menu(|ui| {
+                        borderless_context_menu(&response, |ui| {
                             outcome.context_menu_action = commit_context_menu(ui, commit, language);
                         });
                     }
@@ -22421,12 +22772,14 @@ fn interactive_rebase_action_dropdown(
         Stroke::new(1.2, theme::text()),
     );
 
+    apply_menu_visuals(ui);
     egui::popup::popup_below_widget(
         ui,
         popup_id,
         &response,
         egui::popup::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
+            apply_menu_visuals(ui);
             ui.set_min_width(rect.width());
             for todo_action in [
                 InteractiveRebaseTodoAction::Pick,
@@ -22973,12 +23326,14 @@ fn search_dimension_dropdown(
     if !enabled {
         return None;
     }
+    apply_menu_visuals(ui);
     egui::popup::popup_below_widget(
         ui,
         popup_id,
         &response,
         egui::popup::PopupCloseBehavior::CloseOnClick,
         |ui| {
+            apply_menu_visuals(ui);
             ui.set_min_width(rect.width());
             let mut selected = None;
             for dimension in [
@@ -23553,11 +23908,10 @@ fn repo_tab_with_close(
         themed_text_edit_selection(ui);
         let editor_response = ui.put(
             editor_rect,
-            TextEdit::singleline(&mut rename.value)
+            themed_singleline_text_edit(&mut rename.value, "")
                 .id(tab_id.with("rename"))
                 .font(FontId::proportional(12.0))
-                .text_color(text_color)
-                .frame(false),
+                .text_color(text_color),
         );
         let requested_focus = rename.request_focus;
         if requested_focus {
@@ -23631,12 +23985,14 @@ fn repo_tab_overflow_menu(
     activate_source_tab: &mut bool,
 ) {
     let (response, popup_id) = repo_tab_overflow_button(ui, id_salt, label);
+    apply_menu_visuals(ui);
     egui::popup::popup_below_widget(
         ui,
         popup_id,
         &response,
         egui::popup::PopupCloseBehavior::CloseOnClick,
         |ui| {
+            apply_menu_visuals(ui);
             ui.set_min_width(220.0);
             for item in items {
                 match *item {
@@ -25483,11 +25839,13 @@ fn branch_context_menu(
     enabled: bool,
     action: &mut Option<BranchMenuAction>,
 ) -> egui::Response {
-    response.context_menu(|ui| {
+    borderless_context_menu(&response, |ui| {
+        apply_menu_visuals(ui);
+        ui.spacing_mut().item_spacing.y = 3.0;
         ui.set_min_width(if remote { 220.0 } else { 270.0 });
         if remote {
             ui.label(RichText::new(name).color(theme::text()));
-            ui.separator();
+            menu_group_gap(ui);
             if ui
                 .add_enabled(
                     enabled,
@@ -25549,7 +25907,7 @@ fn branch_context_menu(
                 });
                 ui.close_menu();
             }
-            ui.separator();
+            menu_group_gap(ui);
             if ui
                 .add_enabled(
                     enabled && upstream.is_some(),
@@ -25564,7 +25922,7 @@ fn branch_context_menu(
                     ui.close_menu();
                 }
             }
-            ui.separator();
+            menu_group_gap(ui);
             if ui
                 .add_enabled(
                     enabled && current && upstream.is_some(),
@@ -25656,7 +26014,7 @@ fn branch_context_menu(
                     },
                 );
             });
-            ui.separator();
+            menu_group_gap(ui);
             if ui
                 .add_enabled(
                     enabled && !current,
@@ -25669,7 +26027,7 @@ fn branch_context_menu(
                 });
                 ui.close_menu();
             }
-            ui.separator();
+            menu_group_gap(ui);
             if ui
                 .add_enabled(
                     enabled && !current,
@@ -25694,7 +26052,7 @@ fn branch_context_menu(
                 });
                 ui.close_menu();
             }
-            ui.separator();
+            menu_group_gap(ui);
             if ui
                 .add_enabled(
                     enabled && !remotes.is_empty(),
@@ -25835,10 +26193,11 @@ fn tag_context_menu(
     language: Language,
     action: &mut Option<TagMenuAction>,
 ) -> egui::Response {
-    response.context_menu(|ui| {
+    borderless_context_menu(&response, |ui| {
+        apply_menu_visuals(ui);
         ui.set_min_width(180.0);
         ui.label(RichText::new(&tag.name).color(theme::text()));
-        ui.separator();
+        menu_group_gap(ui);
         if ui.button(i18n::t(language, "tag.checkout")).clicked() {
             *action = Some(TagMenuAction::Checkout {
                 name: tag.name.clone(),
@@ -25907,14 +26266,15 @@ fn stash_context_menu(
     language: Language,
     action: &mut Option<StashMenuAction>,
 ) -> egui::Response {
-    response.context_menu(|ui| {
+    borderless_context_menu(&response, |ui| {
+        apply_menu_visuals(ui);
         ui.set_min_width(180.0);
         ui.label(
             RichText::new(&stash.selector)
                 .monospace()
                 .color(theme::text()),
         );
-        ui.separator();
+        menu_group_gap(ui);
         if ui.button(i18n::t(language, "stash.apply")).clicked() {
             *action = Some(StashMenuAction::Apply {
                 selector: stash.selector.clone(),
@@ -26451,10 +26811,11 @@ fn remote_branch_row(
         });
     }
 
-    response.context_menu(|ui| {
+    borderless_context_menu(&response, |ui| {
+        apply_menu_visuals(ui);
         ui.set_min_width(220.0);
         ui.label(RichText::new(full_name).color(theme::text()));
-        ui.separator();
+        menu_group_gap(ui);
         if ui
             .add_enabled(
                 enabled,
@@ -26553,14 +26914,15 @@ fn stash_row(
         theme::text(),
     );
 
-    response.context_menu(|ui| {
+    borderless_context_menu(&response, |ui| {
+        apply_menu_visuals(ui);
         ui.set_min_width(180.0);
         ui.label(
             RichText::new(&stash.selector)
                 .monospace()
                 .color(theme::text()),
         );
-        ui.separator();
+        menu_group_gap(ui);
         if ui.button(i18n::t(language, "stash.apply")).clicked() {
             *action = Some(StashMenuAction::Apply {
                 selector: stash.selector.clone(),
@@ -26644,10 +27006,11 @@ fn tag_row(
         );
     }
 
-    response.context_menu(|ui| {
+    borderless_context_menu(&response, |ui| {
+        apply_menu_visuals(ui);
         ui.set_min_width(180.0);
         ui.label(RichText::new(&tag.name).color(theme::text()));
-        ui.separator();
+        menu_group_gap(ui);
         if ui.button(i18n::t(language, "tag.checkout")).clicked() {
             *action = Some(TagMenuAction::Checkout {
                 name: tag.name.clone(),
@@ -26814,10 +27177,11 @@ fn worktree_directory_row(
         true,
     );
 
-    response.context_menu(|ui| {
+    borderless_context_menu(&response, |ui| {
+        apply_menu_visuals(ui);
         ui.set_min_width(180.0);
         ui.label(RichText::new(path).monospace().color(theme::text()));
-        ui.separator();
+        menu_group_gap(ui);
         if ui
             .button(i18n::t(language, "worktree.add_gitignore"))
             .clicked()
@@ -26878,14 +27242,15 @@ fn worktree_file_row(
         depth,
     );
 
-    response.context_menu(|ui| {
+    borderless_context_menu(&response, |ui| {
+        apply_menu_visuals(ui);
         ui.set_min_width(180.0);
         ui.label(
             RichText::new(&file.display_path)
                 .monospace()
                 .color(theme::text()),
         );
-        ui.separator();
+        menu_group_gap(ui);
         if file.is_conflicted()
             && ui
                 .button(i18n::t(language, "worktree.resolve_conflict"))
@@ -26984,6 +27349,8 @@ fn commit_context_menu(
     language: Language,
 ) -> Option<CommitMenuAction> {
     let mut action = None;
+    apply_menu_visuals(ui);
+    ui.spacing_mut().item_spacing.y = 3.0;
     ui.set_min_width(220.0);
     ui.label(RichText::new(&commit.subject).strong().color(theme::text()));
     ui.label(
@@ -27657,7 +28024,8 @@ fn diff_row(
         painter.rect_filled(rect, CornerRadius::ZERO, fill);
     }
 
-    response.context_menu(|ui| {
+    borderless_context_menu(&response, |ui| {
+        apply_menu_visuals(ui);
         if ui.button(i18n::t(language, "menu.copy")).clicked() {
             ui.ctx().copy_text(selected_diff_rows_text(selected_rows));
             ui.close_menu();
@@ -30127,70 +30495,78 @@ fn searchable_branch_dropdown(
     let mut changed = false;
     let mut selected_option = false;
 
-    let combo_response = egui::ComboBox::from_id_salt(id)
-        .width(width)
-        .selected_text(selected_text)
-        .close_behavior(egui::popup::PopupCloseBehavior::CloseOnClickOutside)
-        .show_ui(ui, |ui| {
-            let mut filter = ui
-                .ctx()
-                .data(|data| data.get_temp::<String>(filter_id).unwrap_or_default());
-            let search_frame = egui::Frame::new()
-                .fill(theme::panel_recessed())
-                .stroke(Stroke::NONE)
-                .corner_radius(CornerRadius::same(4))
-                .inner_margin(egui::Margin::symmetric(4, 2))
-                .show(ui, |ui| {
-                    themed_text_edit_selection(ui);
-                    ui.add_sized(
-                        [ui.available_width(), 20.0],
-                        themed_singleline_text_edit(&mut filter, search_placeholder)
-                            .id(filter_input_id)
-                            .frame(false),
-                    )
-                });
-            paint_branch_dropdown_search_inset_shadow(ui, search_frame.response.rect);
-            let filter_response = search_frame.inner;
-            if filter_response.changed() {
-                ui.ctx()
-                    .data_mut(|data| data.insert_temp(filter_id, filter.clone()));
-            }
-            let filter = filter.trim().to_lowercase();
-            ui.add_space(4.0);
+    let combo_response = ui
+        .scope(|ui| {
+            apply_searchable_dropdown_visuals(ui);
+            egui::ComboBox::from_id_salt(id)
+                .width(width)
+                .selected_text(selected_text)
+                .close_behavior(egui::popup::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(ui, |ui| {
+                    apply_searchable_dropdown_visuals(ui);
+                    let mut filter = ui
+                        .ctx()
+                        .data(|data| data.get_temp::<String>(filter_id).unwrap_or_default());
+                    let search_frame = egui::Frame::new()
+                        .fill(theme::panel_recessed())
+                        .stroke(Stroke::NONE)
+                        .corner_radius(CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(4, 2))
+                        .show(ui, |ui| {
+                            themed_text_edit_selection(ui);
+                            ui.add_sized(
+                                [ui.available_width(), 20.0],
+                                themed_singleline_text_edit(&mut filter, search_placeholder)
+                                    .id(filter_input_id)
+                                    .frame(false),
+                            )
+                        });
+                    paint_recessed_control_shadow(ui, search_frame.response.rect);
+                    let filter_response = search_frame.inner;
+                    if filter_response.changed() {
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(filter_id, filter.clone()));
+                    }
+                    let filter = filter.trim().to_lowercase();
+                    ui.add_space(4.0);
 
-            ScrollArea::vertical()
-                .id_salt(filter_id.with("choices"))
-                .max_height(216.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mut has_match = false;
-                    for (value, label) in choices {
-                        let matches_filter = filter.is_empty()
-                            || value.to_lowercase().contains(&filter)
-                            || label.to_lowercase().contains(&filter);
-                        if !matches_filter {
-                            continue;
-                        }
-                        has_match = true;
-                        if ui
-                            .selectable_value(selected, value.clone(), label)
-                            .clicked()
-                        {
-                            changed = true;
-                            selected_option = true;
-                            ui.ctx()
-                                .data_mut(|data| data.insert_temp(filter_id, String::new()));
-                        }
-                    }
-                    if !has_match {
-                        ui.label(
-                            RichText::new(search_placeholder)
-                                .small()
-                                .color(theme::muted()),
-                        );
-                    }
-                });
-        });
+                    ScrollArea::vertical()
+                        .id_salt(filter_id.with("choices"))
+                        .max_height(216.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut has_match = false;
+                            for (value, label) in choices {
+                                let matches_filter = filter.is_empty()
+                                    || value.to_lowercase().contains(&filter)
+                                    || label.to_lowercase().contains(&filter);
+                                if !matches_filter {
+                                    continue;
+                                }
+                                has_match = true;
+                                if ui
+                                    .selectable_value(selected, value.clone(), label)
+                                    .clicked()
+                                {
+                                    changed = true;
+                                    selected_option = true;
+                                    ui.ctx().data_mut(|data| {
+                                        data.insert_temp(filter_id, String::new())
+                                    });
+                                }
+                            }
+                            if !has_match {
+                                ui.label(
+                                    RichText::new(search_placeholder)
+                                        .small()
+                                        .color(theme::muted()),
+                                );
+                            }
+                        });
+                })
+        })
+        .inner;
+    paint_recessed_control_shadow(ui, combo_response.response.rect);
     if combo_response.response.clicked() && !popup_was_open {
         ui.ctx()
             .data_mut(|data| data.insert_temp(filter_id, String::new()));
@@ -30202,39 +30578,64 @@ fn searchable_branch_dropdown(
     changed
 }
 
-fn paint_branch_dropdown_search_inset_shadow(ui: &Ui, rect: Rect) {
-    let rect = rect.shrink(0.5);
+fn apply_searchable_dropdown_visuals(ui: &mut Ui) {
+    let visuals = ui.visuals_mut();
+    visuals.window_stroke = Stroke::NONE;
+    visuals.window_shadow = menu_popup_shadow();
+    visuals.popup_shadow = menu_popup_shadow();
+    visuals.selection.stroke = Stroke::NONE;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+    visuals.widgets.active.bg_stroke = Stroke::NONE;
+    visuals.widgets.open.bg_stroke = Stroke::NONE;
+}
+
+fn paint_recessed_control_shadow(ui: &Ui, rect: Rect) {
+    // Keep every shadow pixel inside the widget clip rect. Controls placed
+    // flush against a panel edge otherwise lose their left rounded corner.
+    let rect = rect.shrink(1.0);
     let dark = theme::inset_shadow().gamma_multiply(0.3);
     let light = theme::inset_highlight().gamma_multiply(0.22);
     let radius = 4.0;
-    ui.painter().line_segment(
-        [
-            Pos2::new(rect.left() + radius, rect.top()),
+    let corner_step = radius * 0.293;
+
+    ui.painter().add(egui::Shape::line(
+        vec![
             Pos2::new(rect.right() - radius, rect.top()),
-        ],
-        Stroke::new(1.0, dark),
-    );
-    ui.painter().line_segment(
-        [
+            Pos2::new(rect.left() + radius, rect.top()),
+            Pos2::new(rect.left() + corner_step, rect.top() + corner_step),
             Pos2::new(rect.left(), rect.top() + radius),
             Pos2::new(rect.left(), rect.bottom() - radius),
         ],
         Stroke::new(1.0, dark),
-    );
-    ui.painter().line_segment(
-        [
+    ));
+    ui.painter().add(egui::Shape::line(
+        vec![
             Pos2::new(rect.left() + radius, rect.bottom()),
             Pos2::new(rect.right() - radius, rect.bottom()),
-        ],
-        Stroke::new(1.0, light),
-    );
-    ui.painter().line_segment(
-        [
-            Pos2::new(rect.right(), rect.top() + radius),
+            Pos2::new(rect.right() - corner_step, rect.bottom() - corner_step),
             Pos2::new(rect.right(), rect.bottom() - radius),
+            Pos2::new(rect.right(), rect.top() + radius),
         ],
         Stroke::new(1.0, light),
+    ));
+}
+
+fn recessed_horizontal_separator(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
+    let dark = theme::inset_shadow().gamma_multiply(0.28);
+    let light = theme::inset_highlight().gamma_multiply(0.2);
+    let shadow = Rect::from_min_max(
+        Pos2::new(rect.left(), rect.center().y - 1.0),
+        Pos2::new(rect.right(), rect.center().y + 1.0),
     );
+    let highlight = Rect::from_min_max(
+        Pos2::new(rect.left(), shadow.bottom()),
+        Pos2::new(rect.right(), shadow.bottom() + 1.0),
+    );
+    ui.painter().rect_filled(shadow, 0.0, dark);
+    ui.painter().rect_filled(highlight, 0.0, light);
 }
 
 fn git_flow_start_point_row(
@@ -33916,17 +34317,13 @@ mod ui_tests {
         assert!(editor_source.contains(".text_color(theme::text())"));
         assert!(editor_ui_source.contains("themed_text_edit_selection(ui);"));
         assert!(helper_source.contains("selection.bg_fill = theme::accent_soft()"));
-        assert!(
-            helper_source.contains("selection.stroke = Stroke::new(1.0, theme::accent_deep())")
-        );
+        assert!(helper_source.contains("selection.stroke = Stroke::NONE"));
         assert!(submit_source.contains("theme::accent_deep()"));
         assert!(submit_source.contains("Color32::WHITE"));
         assert!(submit_source.contains("Sense::click()"));
         assert!(submit_source.contains("Sense::hover()"));
         assert!(theme_source.contains("visuals.selection.stroke"));
-        assert!(
-            theme_source.contains("visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE)")
-        );
+        assert!(theme_source.contains("visuals.selection.stroke = Stroke::NONE"));
     }
 
     #[test]
@@ -34019,10 +34416,10 @@ mod ui_tests {
         assert!(search_source.contains("themed_text_edit_selection(ui);"));
         assert!(search_source.contains("themed_singleline_text_edit("));
         assert!(helper_source.contains(".text_color(theme::text())"));
+        assert!(helper_source.contains(".frame(false)"));
+        assert!(helper_source.contains("let rect = rect.shrink(1.0);"));
         assert!(helper_source.contains("selection.bg_fill = theme::accent_soft()"));
-        assert!(
-            helper_source.contains("selection.stroke = Stroke::new(1.0, theme::accent_deep())")
-        );
+        assert!(helper_source.contains("selection.stroke = Stroke::NONE"));
     }
 
     #[test]
@@ -35685,7 +36082,7 @@ mod ui_tests {
         assert!(source.contains("fn top_menu_button("));
         assert!(source.contains("fn hover_submenu_button("));
         assert!(top_menu_button_source.contains("popup_below_widget("));
-        assert!(top_menu_button_source.contains("ui.visuals_mut().window_stroke = Stroke::NONE"));
+        assert!(top_menu_button_source.contains("apply_menu_visuals(ui)"));
         assert!(!top_menu_button_source.contains("ui.menu_button("));
         assert!(source.contains("fn menu_text_button("));
         assert!(source.contains("fn menu_text_button_hover_fill("));
@@ -35703,15 +36100,15 @@ mod ui_tests {
         assert!(!menu_button_source.contains("popup_below_widget("));
         assert!(!menu_button_source.contains("\\u{25b6}"));
         assert!(!menu_button_source.contains("ui.menu_button("));
-        assert!(menu_button_source.contains("ui.visuals_mut().window_stroke = Stroke::NONE"));
-        assert!(menu_button_source.contains("ui.visuals_mut().window_shadow = panel_shadow()"));
-        assert!(menu_button_source.contains("ui.visuals_mut().popup_shadow = panel_shadow()"));
+        assert!(menu_button_source.contains("apply_menu_visuals(ui)"));
+        assert!(menu_button_source.contains("menu_popup_shadow()"));
+        assert!(!menu_button_source.contains("panel_shadow()"));
         assert!(menu_button_source.contains("widgets.hovered.bg_stroke = Stroke::NONE"));
         assert!(menu_button_source.contains("widgets.open.bg_stroke = Stroke::NONE"));
         assert!(menu_button_source.contains("widgets.active.bg_stroke = Stroke::NONE"));
         assert!(menu_button_source.contains("selection.stroke = Stroke::NONE"));
         assert!(menu_button_source.contains("paint_text_button_hover_shadow_for_response"));
-        assert!(menu_visuals_source.contains("menu_text_button_hover_fill()"));
+        assert!(menu_visuals_source.contains("apply_menu_style(ui.style_mut())"));
         assert!(shortcut_source.contains("menu_text_button_with_text("));
         assert!(text_button_source.contains(".stroke(Stroke::NONE)"));
         assert!(!text_button_source.contains(".fill(Color32::TRANSPARENT)"));
@@ -38006,6 +38403,24 @@ mod ui_tests {
         assert!(
             summary_source.contains("details_height = ui.available_height().clamp(96.0, 132.0)")
         );
+        assert!(summary_source.contains("recessed_horizontal_separator(ui);"));
+        assert!(!summary_source.contains("ui.separator();"));
+
+        let search_start = source.find("fn search_commit_summary(").unwrap();
+        let search_end = source[search_start..]
+            .find("fn history_file_table(")
+            .unwrap();
+        let search_summary_source = &source[search_start..search_start + search_end];
+        assert!(search_summary_source.contains("recessed_horizontal_separator(ui);"));
+        assert!(!search_summary_source.contains("ui.separator();"));
+
+        let separator_start = source.find("fn recessed_horizontal_separator(").unwrap();
+        let separator_end = source[separator_start..]
+            .find("fn git_flow_start_point_row(")
+            .unwrap();
+        let separator_source = &source[separator_start..separator_start + separator_end];
+        assert!(separator_source.contains("theme::inset_shadow()"));
+        assert!(separator_source.contains("theme::inset_highlight()"));
     }
 
     #[test]
@@ -39444,6 +39859,9 @@ diff --git a/file.txt b/file.txt
             &implementation_source[quick_push_start..quick_push_start + quick_push_end];
         assert!(quick_push_source.contains("current_named_local_branch(snapshot)"));
         assert!(quick_push_source.contains("push.detached_error"));
+        assert!(quick_push_source.contains("current_branch.upstream.is_some()"));
+        assert!(quick_push_source.contains("snapshot.upstream.is_some()"));
+        assert!(quick_push_source.contains("git::push_set_upstream(root, &remote, &branch)"));
 
         let open_push_start = implementation_source.find("fn open_push_dialog(").unwrap();
         let open_push_end = implementation_source[open_push_start..]
@@ -39739,7 +40157,9 @@ diff --git a/file.txt b/file.txt
                 .contains("branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>")
         );
         assert!(implementation_source.contains("pending_branch_checkout: Option<String>"));
+        assert!(implementation_source.contains("branch_checkout_root: Option<PathBuf>"));
         assert!(implementation_source.contains("fn branch_checkout_busy(&self) -> bool"));
+        assert!(implementation_source.contains("fn active_branch_checkout_busy(&self) -> bool"));
         assert!(
             implementation_source.contains("fn request_branch_checkout(&mut self, name: String)")
         );
@@ -39760,7 +40180,16 @@ diff --git a/file.txt b/file.txt
         let branch_task_source =
             &implementation_source[branch_task_start..branch_task_start + branch_task_end];
         assert!(branch_task_source.contains("self.pending_branch_checkout = None"));
+        assert!(branch_task_source.contains("self.branch_checkout_root = None"));
         assert!(branch_task_source.contains("self.load_repository_uncached(root)"));
+
+        assert!(implementation_source.contains("snapshot.skip_stale_branch"));
+        assert!(
+            implementation_source
+                .contains("belongs_to_pending_checkout && !matches_pending_checkout")
+        );
+        assert!(implementation_source.contains("if !stale_checkout_snapshot"));
+        assert!(implementation_source.contains("if active_repo && !stale_checkout_snapshot"));
     }
 
     #[test]
@@ -39897,7 +40326,7 @@ diff --git a/file.txt b/file.txt
         assert!(picker_source.contains("history_branch_scope_dropdown("));
         assert!(picker_source.contains("history_toolbar_checkbox_at("));
         assert!(picker_source.contains("history_sort_order_dropdown("));
-        assert!(picker_source.contains("TextEdit::singleline(search)"));
+        assert!(picker_source.contains("themed_singleline_text_edit(search, search_hint)"));
         assert!(picker_source.contains("history_table_header("));
         assert!(picker_source.contains("cache.refresh(commits, search);"));
         assert!(picker_source.contains("let layout = &cache.layout;"));
@@ -40006,10 +40435,15 @@ diff --git a/file.txt b/file.txt
             "PopupCloseBehavior::CloseOnClickOutside",
             "memory.request_focus(filter_input_id)",
             "memory.close_popup()",
-            "paint_branch_dropdown_search_inset_shadow",
+            "paint_recessed_control_shadow",
+            "apply_searchable_dropdown_visuals(ui)",
+            "paint_recessed_control_shadow(ui, combo_response.response.rect)",
         ] {
             assert!(dropdown_source.contains(required), "{required}");
         }
+        assert!(dropdown_source.contains("visuals.window_stroke = Stroke::NONE"));
+        assert!(dropdown_source.contains("visuals.popup_shadow = menu_popup_shadow()"));
+        assert!(dropdown_source.contains("visuals.widgets.open.bg_stroke = Stroke::NONE"));
     }
 
     #[test]
@@ -40157,6 +40591,9 @@ diff --git a/file.txt b/file.txt
         assert!(menu_source.contains("branch_rename_menu_label(language, name)"));
         assert!(menu_source.contains("branch_delete_menu_label(language, name)"));
         assert!(menu_source.contains("hover_submenu_button_enabled("));
+        assert!(menu_source.contains("apply_menu_visuals(ui);"));
+        assert!(menu_source.matches("menu_group_gap(ui);").count() >= 6);
+        assert!(!menu_source.contains("ui.separator();"));
         assert!(!menu_source.contains("ui.menu_button("));
     }
 
@@ -40298,6 +40735,7 @@ diff --git a/file.txt b/file.txt
         for required in [
             "self.repo_history_tasks.remove(&key)",
             "self.queued_repo_history_loads.remove(&key)",
+            "self.repository_undo_task.take()",
             "self.details_task = None",
             "self.diff_task = None",
             "self.file_search_task = None",
@@ -40723,7 +41161,7 @@ diff --git a/file.txt b/file.txt
         let tab_source = &implementation_source[tab_start..tab_start + tab_end];
 
         assert!(tab_source.contains("response.double_clicked()"));
-        assert!(tab_source.contains("TextEdit::singleline(&mut rename.value)"));
+        assert!(tab_source.contains("themed_singleline_text_edit(&mut rename.value, \"\")"));
         assert!(tab_source.contains("egui::Key::Enter"));
         assert!(tab_source.contains("egui::Key::Escape"));
         assert!(tab_source.contains("editor_response.lost_focus()"));
