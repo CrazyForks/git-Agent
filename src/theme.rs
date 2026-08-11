@@ -1,8 +1,17 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        OnceLock,
+    },
+};
 
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals,
 };
+use serde::Deserialize;
 
 static THEME_MODE: AtomicU8 = AtomicU8::new(1);
 static THEME_ACCENT: AtomicU8 = AtomicU8::new(1);
@@ -41,6 +50,178 @@ pub struct Palette {
     pub inset_shadow: Color32,
     pub info: Color32,
     pub warning: Color32,
+}
+
+const EMBEDDED_THEME_JSON: &str = include_str!("../theme.json");
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ThemePool {
+    #[serde(default)]
+    hues: HashMap<String, String>,
+    #[serde(default)]
+    themes: HashMap<String, HashMap<String, String>>,
+}
+
+impl ThemePool {
+    fn overlay(&mut self, overlay: Self) {
+        self.hues.extend(overlay.hues);
+        for (theme, colors) in overlay.themes {
+            self.themes.entry(theme).or_default().extend(colors);
+        }
+    }
+}
+
+static THEME_POOL: OnceLock<ThemePool> = OnceLock::new();
+
+fn theme_pool() -> &'static ThemePool {
+    THEME_POOL.get_or_init(|| load_theme_pool(&theme_pool_paths()))
+}
+
+fn load_theme_pool(paths: &[PathBuf]) -> ThemePool {
+    let mut pool: ThemePool = serde_json::from_str(EMBEDDED_THEME_JSON).unwrap_or_default();
+
+    for path in paths {
+        let Ok(source) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(base) = serde_json::from_str::<ThemePool>(&source) else {
+            continue;
+        };
+
+        pool.overlay(base);
+        if let Ok(source) = fs::read_to_string(local_theme_path(path)) {
+            if let Ok(local) = serde_json::from_str::<ThemePool>(&source) {
+                pool.overlay(local);
+            }
+        }
+        break;
+    }
+
+    pool
+}
+
+fn local_theme_path(path: &Path) -> PathBuf {
+    path.with_file_name("theme.local.json")
+}
+
+fn theme_pool_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = std::env::var_os("GIT_AGENT_THEME") {
+        paths.push(PathBuf::from(path));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            paths.push(directory.join("theme.json"));
+        }
+    }
+    paths.push(PathBuf::from("theme.json"));
+    paths
+}
+
+fn mode_key(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::Dark => "dark",
+        ThemeMode::Light => "light",
+    }
+}
+
+fn accent_key(accent: ThemeAccent) -> &'static str {
+    match accent {
+        ThemeAccent::Green => "green",
+        ThemeAccent::Blue => "blue",
+        ThemeAccent::Purple => "purple",
+        ThemeAccent::Rose => "rose",
+        ThemeAccent::Orange => "orange",
+    }
+}
+
+fn configured_color(mode: ThemeMode, accent: ThemeAccent, token: &str) -> Option<Color32> {
+    let pool = theme_pool();
+    let hue = pool.hues.get(accent_key(accent))?;
+    let template = pool.themes.get(mode_key(mode))?.get(token)?;
+    parse_hsl_color(&template.replace("${c}", hue))
+}
+
+fn parse_hsl_color(value: &str) -> Option<Color32> {
+    let body = value.trim().strip_prefix("hsl(")?.strip_suffix(')')?;
+    let (main, alpha) = body
+        .split_once('/')
+        .map_or((body, None), |(main, alpha)| (main, Some(alpha)));
+    let mut parts = main.split_whitespace();
+    let hue = parts
+        .next()?
+        .trim_end_matches("deg")
+        .parse::<f32>()
+        .ok()?
+        .rem_euclid(360.0)
+        / 360.0;
+    let saturation = parts
+        .next()?
+        .strip_suffix('%')?
+        .parse::<f32>()
+        .ok()?
+        .clamp(0.0, 100.0)
+        / 100.0;
+    let lightness = parts
+        .next()?
+        .strip_suffix('%')?
+        .parse::<f32>()
+        .ok()?
+        .clamp(0.0, 100.0)
+        / 100.0;
+    if parts.next().is_some() {
+        return None;
+    }
+    let color = hsl_to_rgb(hue, saturation, lightness);
+    let alpha = alpha
+        .and_then(|alpha| {
+            let alpha = alpha.trim();
+            alpha
+                .strip_suffix('%')
+                .and_then(|percent| percent.parse::<f32>().ok().map(|value| value * 2.55))
+                .or_else(|| {
+                    alpha
+                        .parse::<f32>()
+                        .ok()
+                        .map(|value| if value <= 1.0 { value * 255.0 } else { value })
+                })
+        })
+        .unwrap_or(255.0)
+        .clamp(0.0, 255.0)
+        .round() as u8;
+    Some(Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        alpha,
+    ))
+}
+
+fn apply_theme_pool(palette: &mut Palette, mode: ThemeMode, accent: ThemeAccent) {
+    macro_rules! set {
+        ($field:ident, $token:literal) => {
+            if let Some(color) = configured_color(mode, accent, $token) {
+                palette.$field = color;
+            }
+        };
+    }
+    set!(bg, "--bg");
+    set!(chrome_bg, "--chrome-bg");
+    set!(panel, "--panel");
+    set!(panel_soft, "--panel-soft");
+    set!(panel_recessed, "--panel-recessed");
+    set!(text, "--text");
+    set!(muted, "--muted");
+    set!(accent, "--accent");
+    set!(accent_deep, "--accent-deep");
+    set!(accent_soft, "--accent-soft");
+    set!(accent_shadow, "--accent-shadow");
+    set!(hover, "--hover");
+    set!(scroll_track, "--scroll-track");
+    set!(inset_highlight, "--inset-highlight");
+    set!(inset_shadow, "--inset-shadow");
+    set!(info, "--info");
+    set!(warning, "--warning");
 }
 
 pub const BG: Color32 = Color32::from_rgb(16, 18, 24);
@@ -235,7 +416,7 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
             Color32::from_rgba_unmultiplied(shadow_base.r(), shadow_base.g(), shadow_base.b(), 58)
         }
     };
-    match mode {
+    let mut palette = match mode {
         ThemeMode::Dark => Palette {
             bg: neutral(0.085),
             chrome_bg: neutral(0.055),
@@ -284,7 +465,9 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
             info: Color32::from_rgb(59, 107, 185),
             warning: Color32::from_rgb(181, 98, 28),
         },
-    }
+    };
+    apply_theme_pool(&mut palette, mode, accent);
+    palette
 }
 
 pub fn bg() -> Color32 {
@@ -362,7 +545,7 @@ pub fn all_accents() -> [ThemeAccent; 5] {
 }
 
 pub fn accent_color(accent: ThemeAccent) -> Color32 {
-    accent_seed(accent)
+    configured_color(current_mode(), accent, "--accent").unwrap_or_else(|| accent_seed(accent))
 }
 
 fn accent_index(accent: ThemeAccent) -> u8 {
@@ -469,8 +652,59 @@ fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
 }
 
 #[cfg(test)]
+mod theme_pool_tests {
+    use super::*;
+
+    #[test]
+    fn local_theme_overrides_only_declared_values() {
+        let mut pool: ThemePool = serde_json::from_str(EMBEDDED_THEME_JSON).unwrap();
+        let original_green = pool.hues["green"].clone();
+        let original_light_bg = pool.themes["light"]["--bg"].clone();
+        let local: ThemePool = serde_json::from_str(
+            r#"{
+                "hues": {"blue": "211deg"},
+                "themes": {"dark": {"--panel": "hsl(${c} 9% 12%)"}}
+            }"#,
+        )
+        .unwrap();
+
+        pool.overlay(local);
+
+        assert_eq!(pool.hues["blue"], "211deg");
+        assert_eq!(pool.hues["green"], original_green);
+        assert_eq!(pool.themes["dark"]["--panel"], "hsl(${c} 9% 12%)");
+        assert_eq!(pool.themes["light"]["--bg"], original_light_bg);
+    }
+
+    #[test]
+    fn local_theme_is_sibling_of_selected_theme() {
+        assert_eq!(
+            local_theme_path(Path::new("x/custom-theme.json")),
+            PathBuf::from("x/theme.local.json")
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_theme_pool_resolves_hsl_templates() {
+        let pool: ThemePool = serde_json::from_str(EMBEDDED_THEME_JSON)
+            .expect("embedded theme pool should be valid JSON");
+        let hue = pool.hues.get("blue").expect("blue hue should exist");
+        let template = pool
+            .themes
+            .get("dark")
+            .and_then(|theme| theme.get("--primary-test-color"))
+            .expect("dark primary test color should exist");
+        let color = parse_hsl_color(&template.replace("${c}", hue))
+            .expect("HSL template should resolve to a color");
+
+        assert_eq!(color.a(), 153);
+        assert!(color.b() > color.r());
+    }
 
     #[test]
     fn neutral_surfaces_are_derived_from_theme_accent_hsl() {

@@ -1,0 +1,51 @@
+{
+  "hues": {
+    "green": "158deg",
+    "blue": "207deg",
+    "purple": "270deg",
+    "rose": "340deg",
+    "orange": "28deg"
+  },
+  "themes": {
+    "light": {
+      "--bg": "hsl(${c} 6% 94.8%)",
+      "--chrome-bg": "hsl(${c} 6% 91%)",
+      "--panel": "hsl(${c} 5% 98.2%)",
+      "--panel-soft": "hsl(${c} 7% 91%)",
+      "--panel-recessed": "hsl(${c} 8% 98.5%)",
+      "--text": "hsl(${c} 12% 16%)",
+      "--muted": "hsl(${c} 12% 46%)",
+      "--accent": "hsl(${c} 64% 54%)",
+      "--accent-deep": "hsl(${c} 50% 34%)",
+      "--accent-soft": "hsl(${c} 19% 91%)",
+      "--accent-shadow": "hsl(${c} 10% 28% / 23%)",
+      "--hover": "hsl(${c} 18% 88%)",
+      "--scroll-track": "hsl(${c} 14% 84%)",
+      "--inset-highlight": "hsl(${c} 0% 100% / 74.5%)",
+      "--inset-shadow": "hsl(${c} 10% 28% / 33.7%)",
+      "--info": "hsl(214deg 52% 48%)",
+      "--warning": "hsl(29deg 73% 41%)",
+      "--primary-test-color": "hsl(${c} 89.74% 54% / 60%)"
+    },
+    "dark": {
+      "--bg": "hsl(${c} 8% 8.5%)",
+      "--chrome-bg": "hsl(${c} 8% 5.5%)",
+      "--panel": "hsl(${c} 8% 11.5%)",
+      "--panel-soft": "hsl(${c} 8% 15.5%)",
+      "--panel-recessed": "hsl(${c} 8% 12.5%)",
+      "--text": "hsl(${c} 12% 94%)",
+      "--muted": "hsl(${c} 12% 62%)",
+      "--accent": "hsl(${c} 64% 54%)",
+      "--accent-deep": "hsl(${c} 46% 28%)",
+      "--accent-soft": "hsl(${c} 27% 16%)",
+      "--accent-shadow": "hsl(${c} 8% 3.5% / 36%)",
+      "--hover": "hsl(${c} 23% 22%)",
+      "--scroll-track": "hsl(${c} 31% 11%)",
+      "--inset-highlight": "hsl(${c} 0% 0% / 0%)",
+      "--inset-shadow": "hsl(${c} 8% 4.5% / 41%)",
+      "--info": "hsl(219deg 100% 74%)",
+      "--warning": "hsl(40deg 76% 53%)",
+      "--primary-test-color": "hsl(${c} 89.74% 54% / 60%)"
+    }
+  }
+}

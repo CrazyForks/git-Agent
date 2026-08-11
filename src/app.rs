@@ -11734,19 +11734,28 @@ impl GitAgentApp {
                     }
                 },
             );
-            tag_table_header(ui, self.language);
-            ScrollArea::vertical()
-                .id_salt("tags_table_scroll")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if tags.is_empty() {
-                        empty_list_panel(ui, self.tr("tag.none"));
-                    } else {
-                        for tag in &tags {
-                            tag_table_row(ui, tag, self.language, &mut action);
+            let table_width = ui.available_width();
+            let columns = tag_table_columns(table_width);
+            tag_table_header(ui, self.language, columns);
+            if tags.is_empty() {
+                empty_list_panel(ui, self.tr("tag.none"));
+            } else {
+                ScrollArea::vertical()
+                    .id_salt("tags_table_scroll")
+                    .auto_shrink([false, false])
+                    .show_rows(ui, RESOURCE_ROW_HEIGHT, tags.len(), |ui, row_range| {
+                        // Header and virtualized rows must share one column grid. Scroll
+                        // areas can otherwise report a content-driven width on first paint.
+                        ui.set_min_width(table_width);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for row_index in row_range {
+                            let Some(tag) = tags.get(row_index) else {
+                                continue;
+                            };
+                            tag_table_row(ui, tag, self.language, columns, &mut action);
                         }
-                    }
-                });
+                    });
+            }
         });
 
         if let Some(action) = action {
@@ -21205,8 +21214,7 @@ fn branch_table_header(ui: &mut Ui, language: Language) {
     ui.add_space(6.0);
 }
 
-fn tag_table_header(ui: &mut Ui, language: Language) {
-    let columns = tag_table_columns(ui.available_width());
+fn tag_table_header(ui: &mut Ui, language: Language, columns: TagTableColumns) {
     ui.horizontal(|ui| {
         table_header_cell(ui, resource_label(language, "name"), columns.name);
         table_header_cell(ui, resource_label(language, "target"), columns.target);
@@ -22383,7 +22391,7 @@ fn history_commit_table_row(
     let selection_width = if select_for_cherry_pick { 30.0 } else { 0.0 };
     let painter = ui.painter();
     let row_bg = if selected && !disabled {
-        Color32::from_rgb(42, 137, 232)
+        theme::accent_deep()
     } else if cherry_pick_selected && !disabled {
         history_batch_selected_row_fill()
     } else if response.hovered() && !disabled {
@@ -23216,7 +23224,7 @@ fn history_file_table_row(ui: &mut Ui, status: &str, path: &str, selected: bool)
             rect,
             CornerRadius::ZERO,
             if selected {
-                Color32::from_rgb(42, 137, 232)
+                theme::accent_deep()
             } else {
                 theme::accent_soft()
             },
@@ -26131,11 +26139,11 @@ fn tag_table_row(
     ui: &mut Ui,
     tag: &Tag,
     language: Language,
+    columns: TagTableColumns,
     action: &mut Option<TagMenuAction>,
 ) -> egui::Response {
     let (rect, response) = resource_row_response(ui);
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-        let columns = tag_table_columns(ui.available_width());
         ui.horizontal(|ui| {
             tag_table_cell(
                 ui,
@@ -39420,8 +39428,21 @@ diff --git a/file.txt b/file.txt
         let row_source = &implementation_source[row_start..row_start + row_end];
 
         assert!(implementation_source.contains("fn tag_table_columns("));
-        assert!(header_source.contains("let columns = tag_table_columns(ui.available_width())"));
-        assert!(row_source.contains("let columns = tag_table_columns(ui.available_width())"));
+        assert!(implementation_source.contains("let columns = tag_table_columns(table_width)"));
+        assert!(implementation_source.contains("tag_table_header(ui, self.language, columns)"));
+        assert!(implementation_source.contains("ui.set_min_width(table_width)"));
+        assert!(
+            implementation_source
+                .contains(".show_rows(ui, RESOURCE_ROW_HEIGHT, tags.len(), |ui, row_range|")
+        );
+        assert!(implementation_source.contains("for row_index in row_range"));
+        assert!(implementation_source.contains("tags.get(row_index)"));
+        assert!(
+            implementation_source
+                .contains("tag_table_row(ui, tag, self.language, columns, &mut action)")
+        );
+        assert!(!header_source.contains("tag_table_columns(ui.available_width())"));
+        assert!(!row_source.contains("tag_table_columns(ui.available_width())"));
         assert!(header_source.contains("resource_label(language, \"action\")"));
         assert!(row_source.contains("tag.delete"));
         assert!(row_source.contains("TagMenuAction::Delete"));

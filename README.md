@@ -18,6 +18,12 @@ Start the local watcher and desktop app from the repository root:
 powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
 ```
 
+## Theme Palette
+
+`theme.json` is the default color pool for the desktop UI. Theme tokens use HSL templates; `${c}` is replaced with the selected accent hue. The app loads a sibling `theme.json` beside the executable first, then falls back to the embedded default.
+
+Create `theme.local.json` beside the selected `theme.json` to customize the palette without editing the default file. Only keys declared in `theme.local.json` are replaced; all other hues and theme tokens remain inherited from `theme.json`. The local file is ignored by Git. Set `GIT_AGENT_THEME` to select another base palette file; its sibling `theme.local.json` remains the local override.
+
 ## GitHub Actions
 
 Pushing a `v*` tag runs the `Build` workflow for Linux, macOS, and Windows. Each job runs tests, builds release binaries, and uploads one installer package for that platform.
