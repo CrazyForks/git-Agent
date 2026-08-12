@@ -21,6 +21,10 @@ static WINDOW_DRAG_PROBE_FLUSHED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static WINDOW_DRAG_PROBE_X_BITS: AtomicU64 = AtomicU64::new(0);
 static WINDOW_DRAG_PROBE_Y_BITS: AtomicU64 = AtomicU64::new(0);
 static WINDOW_DRAG_PROBE_AREA: AtomicU64 = AtomicU64::new(0);
+static WINDOW_SIZE_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WINDOW_SIZE_PROBE_FLUSHED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WINDOW_SIZE_PROBE_WIDTH_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_SIZE_PROBE_HEIGHT_BITS: AtomicU64 = AtomicU64::new(0);
 
 pub struct TraceSpan {
     event: &'static str,
@@ -49,10 +53,11 @@ pub fn begin_branch_switch(fields: &str) -> u64 {
     ACTIVE_EXPIRES_MS.store(now.saturating_add(TRACE_WINDOW_MS), Ordering::Release);
 
     let _guard = write_lock();
-    if let Some(parent) = branch_switch_log_path().parent() {
+    let path = branch_switch_log_path();
+    if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(branch_switch_log_path(), []);
+    let _ = fs::write(path, []);
     append_line(trace_id, now, "branch.request", fields);
     trace_id
 }
@@ -89,13 +94,7 @@ pub fn finish_branch_switch(outcome: &str, fields: &str) {
 }
 
 pub fn branch_switch_log_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(PathBuf::from))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("data")
-        .join("branch-switch.log")
+    daily_log_path("branch-switch")
 }
 
 /// Temporary drag diagnostics. The press path writes only atomics after dispatching the native
@@ -120,6 +119,14 @@ pub fn flush_window_drag_probe() {
     let area = match WINDOW_DRAG_PROBE_AREA.load(Ordering::Acquire) {
         1 => "title-layer",
         2 => "source-gap",
+        3 => "resize-north",
+        4 => "resize-south",
+        5 => "resize-east",
+        6 => "resize-west",
+        7 => "resize-north-east",
+        8 => "resize-south-east",
+        9 => "resize-north-west",
+        10 => "resize-south-west",
         _ => "title-other",
     };
     let line = format!(
@@ -138,14 +145,85 @@ pub fn flush_window_drag_probe() {
     }
 }
 
+/// Records the most recent client-area size without performing file I/O in the
+/// resize path. The value is written after the mouse is released together with
+/// the drag probe, making failed native resize hit tests distinguishable from a
+/// resize that is clamped by the configured minimum size.
+pub fn record_window_size_probe(width: f32, height: f32) {
+    let width_bits = width.to_bits() as u64;
+    let height_bits = height.to_bits() as u64;
+    let previous_width = WINDOW_SIZE_PROBE_WIDTH_BITS.swap(width_bits, Ordering::Relaxed);
+    let previous_height = WINDOW_SIZE_PROBE_HEIGHT_BITS.swap(height_bits, Ordering::Relaxed);
+    if previous_width != width_bits || previous_height != height_bits {
+        WINDOW_SIZE_PROBE_SEQUENCE.fetch_add(1, Ordering::Release);
+    }
+}
+
+pub fn flush_window_size_probe() {
+    let sequence = WINDOW_SIZE_PROBE_SEQUENCE.load(Ordering::Acquire);
+    let flushed = WINDOW_SIZE_PROBE_FLUSHED_SEQUENCE.load(Ordering::Acquire);
+    if sequence == flushed {
+        return;
+    }
+    WINDOW_SIZE_PROBE_FLUSHED_SEQUENCE.store(sequence, Ordering::Release);
+
+    let width = f32::from_bits(WINDOW_SIZE_PROBE_WIDTH_BITS.load(Ordering::Acquire) as u32);
+    let height = f32::from_bits(WINDOW_SIZE_PROBE_HEIGHT_BITS.load(Ordering::Acquire) as u32);
+    append_window_drag_line(format!(
+        "epoch_ms={} pid={} sequence={} event=window_resize.observed width={width:.1} height={height:.1}\n",
+        epoch_ms(),
+        std::process::id(),
+        sequence,
+    ));
+}
+
 pub fn window_drag_log_path() -> PathBuf {
+    daily_log_path("window-drag")
+}
+
+pub fn daily_log_path(stem: &str) -> PathBuf {
+    log_directory().join(format!("{stem}-{}.log", utc_date_stamp(SystemTime::now())))
+}
+
+fn append_window_drag_line(line: String) {
+    let _guard = write_lock();
+    let path = window_drag_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn log_directory() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from))
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
         .join("data")
-        .join("window-drag.log")
+}
+
+fn utc_date_stamp(now: SystemTime) -> String {
+    let elapsed = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    let days = (elapsed.as_secs() / 86_400) as i64;
+    let (year, month, day) = civil_date_from_unix_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    (year + i64::from(month <= 2), month as u32, day as u32)
 }
 
 fn append_line(trace_id: u64, now: u64, event: &str, fields: &str) {
@@ -189,4 +267,16 @@ fn epoch_ms() -> u64 {
         .unwrap_or(Duration::ZERO)
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::civil_date_from_unix_days;
+
+    #[test]
+    fn unix_day_conversion_generates_stable_daily_log_dates() {
+        assert_eq!(civil_date_from_unix_days(0), (1970, 1, 1));
+        assert_eq!(civil_date_from_unix_days(20_312), (2025, 8, 12));
+        assert_eq!(civil_date_from_unix_days(20_677), (2026, 8, 12));
+    }
 }

@@ -5,7 +5,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
@@ -42,8 +42,9 @@ use crate::{
 const TITLE_BAR_HEIGHT: f32 = 32.0;
 // English menu labels need more room than the former Chinese-only estimate. Keep the native
 // drag rect entirely to their right so a late drag-region hit target never competes with a menu.
+const WINDOW_RESIZE_BORDER: f32 = 8.0;
 const TITLE_MENU_RESERVED_WIDTH: f32 = 500.0;
-const TITLE_DRAG_TOP_INSET: f32 = 4.0;
+const TITLE_DRAG_TOP_INSET: f32 = WINDOW_RESIZE_BORDER + 1.0;
 const WINDOW_CORNER_RADIUS: u8 = 6;
 const INTERACTIVE_REBASE_TABLE_CONTROL_WIDTH: f32 = 220.0;
 const HISTORY_BRANCH_SCOPE_CONTROL_WIDTH: f32 = 132.0;
@@ -415,6 +416,55 @@ fn custom_title_drag_rect(rect: Rect, controls_width: f32) -> Rect {
     )
 }
 
+fn window_resize_direction(
+    rect: Rect,
+    pointer_pos: Pos2,
+) -> Option<egui::viewport::ResizeDirection> {
+    if !rect.contains(pointer_pos) {
+        return None;
+    }
+    let north = pointer_pos.y <= rect.top() + WINDOW_RESIZE_BORDER;
+    let south = pointer_pos.y >= rect.bottom() - WINDOW_RESIZE_BORDER;
+    let west = pointer_pos.x <= rect.left() + WINDOW_RESIZE_BORDER;
+    let east = pointer_pos.x >= rect.right() - WINDOW_RESIZE_BORDER;
+    use egui::viewport::ResizeDirection;
+    match (north, south, west, east) {
+        (true, _, true, _) => Some(ResizeDirection::NorthWest),
+        (true, _, _, true) => Some(ResizeDirection::NorthEast),
+        (_, true, true, _) => Some(ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(ResizeDirection::North),
+        (_, true, _, _) => Some(ResizeDirection::South),
+        (_, _, true, _) => Some(ResizeDirection::West),
+        (_, _, _, true) => Some(ResizeDirection::East),
+        _ => None,
+    }
+}
+
+fn resize_cursor_icon(direction: egui::viewport::ResizeDirection) -> egui::CursorIcon {
+    use egui::{CursorIcon, viewport::ResizeDirection};
+    match direction {
+        ResizeDirection::North | ResizeDirection::South => CursorIcon::ResizeVertical,
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::ResizeHorizontal,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::ResizeNeSw,
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::ResizeNwSe,
+    }
+}
+
+fn resize_probe_area(direction: egui::viewport::ResizeDirection) -> u8 {
+    use egui::viewport::ResizeDirection;
+    match direction {
+        ResizeDirection::North => 3,
+        ResizeDirection::South => 4,
+        ResizeDirection::East => 5,
+        ResizeDirection::West => 6,
+        ResizeDirection::NorthEast => 7,
+        ResizeDirection::SouthEast => 8,
+        ResizeDirection::NorthWest => 9,
+        ResizeDirection::SouthWest => 10,
+    }
+}
+
 fn layout_debug_enabled() -> bool {
     env::var("GIT_AGENT_LAYOUT_DEBUG")
         .map(|value| {
@@ -496,6 +546,9 @@ pub struct GitAgentApp {
     clone_url_last_edited: Option<Instant>,
     clone_url_task: Option<Receiver<(String, anyhow::Result<()>)>>,
     search_dimension: SearchDimension,
+    repository_refresh_scheduler: RepositoryRefreshScheduler,
+    last_repository_refresh_schedule: Option<RepositoryRefreshSchedule>,
+    automatic_repository_refresh_results: Receiver<RepoTaskResult>,
     repo_tasks: HashMap<String, Receiver<RepoTaskResult>>,
     repo_history_tasks: HashMap<String, Receiver<RepoHistoryTaskResult>>,
     queued_repo_history_loads: HashMap<String, HistoryLoadRequest>,
@@ -504,8 +557,6 @@ pub struct GitAgentApp {
     repo_snapshot_retry_attempts: HashMap<String, u8>,
     foreground_repo_loads: HashSet<String>,
     foreground_repo_history_loads: HashSet<String>,
-    next_active_repo_refresh_at: Instant,
-    next_inactive_repo_refresh_at: Instant,
     active_repo_refresh_seconds: u64,
     inactive_repo_refresh_seconds: u64,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
@@ -685,6 +736,327 @@ type RepoHistoryTaskResult = (
 );
 type RepositoryBenchmarkTaskResult = RepositoryBenchmarkTaskMessage;
 type RepositoryUndoTaskResult = (PathBuf, anyhow::Result<RepositoryUndoTaskOutcome>);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RepositoryRefreshPriority {
+    Background,
+    Foreground,
+}
+
+struct RepositoryRefreshRequest {
+    path: PathBuf,
+    key: String,
+    priority: RepositoryRefreshPriority,
+    result_sender: Sender<RepoTaskResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScheduledRepositoryRefresh {
+    path: PathBuf,
+    key: String,
+    active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepositoryRefreshSchedule {
+    repositories: Vec<ScheduledRepositoryRefresh>,
+    active_interval: Duration,
+    inactive_interval: Duration,
+    blocked_keys: HashSet<String>,
+}
+
+enum RepositoryRefreshSchedulerCommand {
+    UpdateSchedule {
+        repositories: Vec<ScheduledRepositoryRefresh>,
+        active_interval: Duration,
+        inactive_interval: Duration,
+        blocked_keys: HashSet<String>,
+    },
+    Request(RepositoryRefreshRequest),
+    AcquireExclusive {
+        key: String,
+        granted_sender: Sender<()>,
+    },
+    ReleaseExclusive {
+        key: String,
+    },
+}
+
+#[derive(Clone)]
+struct RepositoryRefreshScheduler {
+    sender: Sender<RepositoryRefreshSchedulerCommand>,
+}
+
+impl RepositoryRefreshScheduler {
+    fn new(ctx: egui::Context) -> (Self, Receiver<RepoTaskResult>) {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            repository_refresh_scheduler_loop(command_receiver, result_sender, ctx)
+        });
+        (
+            Self {
+                sender: command_sender,
+            },
+            result_receiver,
+        )
+    }
+
+    fn update_schedule(&self, schedule: RepositoryRefreshSchedule) {
+        let _ = self
+            .sender
+            .send(RepositoryRefreshSchedulerCommand::UpdateSchedule {
+                repositories: schedule.repositories,
+                active_interval: schedule.active_interval,
+                inactive_interval: schedule.inactive_interval,
+                blocked_keys: schedule.blocked_keys,
+            });
+    }
+
+    fn request(&self, request: RepositoryRefreshRequest) {
+        let _ = self
+            .sender
+            .send(RepositoryRefreshSchedulerCommand::Request(request));
+    }
+
+    /// Waits until the scheduler has finished any snapshot read, then reserves
+    /// this repository for a Git mutation such as checkout, pull, or push.
+    fn acquire_exclusive(&self, key: String) -> Receiver<()> {
+        let (granted_sender, granted_receiver) = mpsc::channel();
+        let _ = self
+            .sender
+            .send(RepositoryRefreshSchedulerCommand::AcquireExclusive {
+                key,
+                granted_sender,
+            });
+        granted_receiver
+    }
+
+    fn release_exclusive(&self, key: String) {
+        let _ = self
+            .sender
+            .send(RepositoryRefreshSchedulerCommand::ReleaseExclusive { key });
+    }
+}
+
+#[derive(Clone)]
+struct RepositoryRefreshScheduleState {
+    repository: ScheduledRepositoryRefresh,
+    next_refresh_at: Instant,
+}
+
+struct RepositoryExclusiveRequest {
+    key: String,
+    granted_sender: Sender<()>,
+}
+
+fn repository_refresh_scheduler_loop(
+    command_receiver: Receiver<RepositoryRefreshSchedulerCommand>,
+    automatic_result_sender: Sender<RepoTaskResult>,
+    ctx: egui::Context,
+) {
+    let mut scheduled = HashMap::<String, RepositoryRefreshScheduleState>::new();
+    let mut pending = Vec::<RepositoryRefreshRequest>::new();
+    let mut pending_exclusive = Vec::<RepositoryExclusiveRequest>::new();
+    let mut exclusive_keys = HashSet::<String>::new();
+    let mut blocked_keys = HashSet::<String>::new();
+    let mut active_interval = repo_refresh_duration(DEFAULT_ACTIVE_REPO_REFRESH_SECONDS);
+    let mut inactive_interval = repo_refresh_duration(DEFAULT_INACTIVE_REPO_REFRESH_SECONDS);
+
+    loop {
+        let now = Instant::now();
+        let next_due = scheduled
+            .values()
+            .map(|state| state.next_refresh_at)
+            .min()
+            .unwrap_or(now + Duration::from_secs(1));
+        let timeout = next_due
+            .saturating_duration_since(now)
+            .min(Duration::from_secs(1));
+        match command_receiver.recv_timeout(timeout) {
+            Ok(command) => {
+                apply_repository_refresh_scheduler_command(
+                    command,
+                    &mut scheduled,
+                    &mut pending,
+                    &mut pending_exclusive,
+                    &mut exclusive_keys,
+                    &mut blocked_keys,
+                    &mut active_interval,
+                    &mut inactive_interval,
+                );
+                while let Ok(command) = command_receiver.try_recv() {
+                    apply_repository_refresh_scheduler_command(
+                        command,
+                        &mut scheduled,
+                        &mut pending,
+                        &mut pending_exclusive,
+                        &mut exclusive_keys,
+                        &mut blocked_keys,
+                        &mut active_interval,
+                        &mut inactive_interval,
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+
+        enqueue_due_repository_refreshes(
+            &mut scheduled,
+            &mut pending,
+            &blocked_keys,
+            active_interval,
+            inactive_interval,
+            &automatic_result_sender,
+        );
+        if let Some(index) =
+            next_repository_exclusive_request_index(&pending_exclusive, &exclusive_keys)
+        {
+            let request = pending_exclusive.swap_remove(index);
+            exclusive_keys.insert(request.key);
+            let _ = request.granted_sender.send(());
+            ctx.request_repaint();
+            continue;
+        }
+        let mut unavailable_keys = blocked_keys.clone();
+        unavailable_keys.extend(exclusive_keys.iter().cloned());
+        if let Some(index) = next_repository_refresh_request_index(&pending, &unavailable_keys) {
+            let request = pending.swap_remove(index);
+            let result = git::open_repository_core(request.path.clone());
+            let _ = request.result_sender.send((request.path, result));
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn apply_repository_refresh_scheduler_command(
+    command: RepositoryRefreshSchedulerCommand,
+    scheduled: &mut HashMap<String, RepositoryRefreshScheduleState>,
+    pending: &mut Vec<RepositoryRefreshRequest>,
+    pending_exclusive: &mut Vec<RepositoryExclusiveRequest>,
+    exclusive_keys: &mut HashSet<String>,
+    blocked_keys: &mut HashSet<String>,
+    active_interval: &mut Duration,
+    inactive_interval: &mut Duration,
+) {
+    match command {
+        RepositoryRefreshSchedulerCommand::UpdateSchedule {
+            repositories,
+            active_interval: next_active_interval,
+            inactive_interval: next_inactive_interval,
+            blocked_keys: next_blocked_keys,
+        } => {
+            *active_interval = next_active_interval;
+            *inactive_interval = next_inactive_interval;
+            *blocked_keys = next_blocked_keys;
+            let repository_keys = repositories
+                .iter()
+                .map(|repository| repository.key.clone())
+                .collect::<HashSet<_>>();
+            scheduled.retain(|key, _| repository_keys.contains(key));
+            let now = Instant::now();
+            for repository in repositories {
+                let interval = if repository.active {
+                    *active_interval
+                } else {
+                    *inactive_interval
+                };
+                scheduled
+                    .entry(repository.key.clone())
+                    .and_modify(|state| {
+                        state.repository = repository.clone();
+                        state.next_refresh_at = state.next_refresh_at.min(now + interval);
+                    })
+                    .or_insert(RepositoryRefreshScheduleState {
+                        repository,
+                        next_refresh_at: now + interval,
+                    });
+            }
+        }
+        RepositoryRefreshSchedulerCommand::Request(request) => {
+            enqueue_repository_refresh(pending, request);
+        }
+        RepositoryRefreshSchedulerCommand::AcquireExclusive {
+            key,
+            granted_sender,
+        } => pending_exclusive.push(RepositoryExclusiveRequest {
+            key,
+            granted_sender,
+        }),
+        RepositoryRefreshSchedulerCommand::ReleaseExclusive { key } => {
+            exclusive_keys.remove(&key);
+        }
+    }
+}
+
+fn enqueue_due_repository_refreshes(
+    scheduled: &mut HashMap<String, RepositoryRefreshScheduleState>,
+    pending: &mut Vec<RepositoryRefreshRequest>,
+    blocked_keys: &HashSet<String>,
+    active_interval: Duration,
+    inactive_interval: Duration,
+    automatic_result_sender: &Sender<RepoTaskResult>,
+) {
+    let now = Instant::now();
+    for state in scheduled.values_mut() {
+        if now < state.next_refresh_at {
+            continue;
+        }
+        state.next_refresh_at = now
+            + if state.repository.active {
+                active_interval
+            } else {
+                inactive_interval
+            };
+        if blocked_keys.contains(&state.repository.key) {
+            continue;
+        }
+        enqueue_repository_refresh(
+            pending,
+            RepositoryRefreshRequest {
+                path: state.repository.path.clone(),
+                key: state.repository.key.clone(),
+                priority: RepositoryRefreshPriority::Background,
+                result_sender: automatic_result_sender.clone(),
+            },
+        );
+    }
+}
+
+fn enqueue_repository_refresh(
+    pending: &mut Vec<RepositoryRefreshRequest>,
+    request: RepositoryRefreshRequest,
+) {
+    if let Some(existing) = pending.iter_mut().find(|queued| queued.key == request.key) {
+        if request.priority >= existing.priority {
+            *existing = request;
+        }
+        return;
+    }
+    pending.push(request);
+}
+
+fn next_repository_refresh_request_index(
+    pending: &[RepositoryRefreshRequest],
+    blocked_keys: &HashSet<String>,
+) -> Option<usize> {
+    pending
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| !blocked_keys.contains(&request.key))
+        .max_by_key(|(_, request)| request.priority)
+        .map(|(index, _)| index)
+}
+
+fn next_repository_exclusive_request_index(
+    pending: &[RepositoryExclusiveRequest],
+    exclusive_keys: &HashSet<String>,
+) -> Option<usize> {
+    pending
+        .iter()
+        .position(|request| !exclusive_keys.contains(&request.key))
+}
 
 #[derive(Clone, Debug)]
 struct DeferredRepositorySnapshotReload {
@@ -2539,6 +2911,8 @@ impl GitAgentApp {
             sanitize_repo_refresh_seconds(app_settings.active_repo_refresh_seconds);
         let inactive_repo_refresh_seconds =
             sanitize_repo_refresh_seconds(app_settings.inactive_repo_refresh_seconds);
+        let (repository_refresh_scheduler, automatic_repository_refresh_results) =
+            RepositoryRefreshScheduler::new(cc.egui_ctx.clone());
         let tabs_state = RepoTabsState::load();
         let has_saved_tabs = tabs_state.source_tab_open || !tabs_state.tabs.is_empty();
         let repo_tabs = tabs_state.repo_tabs();
@@ -2586,6 +2960,9 @@ impl GitAgentApp {
             clone_url_last_edited: None,
             clone_url_task: None,
             search_dimension: SearchDimension::Message,
+            repository_refresh_scheduler,
+            last_repository_refresh_schedule: None,
+            automatic_repository_refresh_results,
             repo_tasks: HashMap::new(),
             repo_history_tasks: HashMap::new(),
             queued_repo_history_loads: HashMap::new(),
@@ -2594,10 +2971,6 @@ impl GitAgentApp {
             repo_snapshot_retry_attempts: HashMap::new(),
             foreground_repo_loads: HashSet::new(),
             foreground_repo_history_loads: HashSet::new(),
-            next_active_repo_refresh_at: Instant::now()
-                + repo_refresh_duration(active_repo_refresh_seconds),
-            next_inactive_repo_refresh_at: Instant::now()
-                + repo_refresh_duration(inactive_repo_refresh_seconds),
             active_repo_refresh_seconds,
             inactive_repo_refresh_seconds,
             remote_git_task: None,
@@ -2809,23 +3182,21 @@ impl GitAgentApp {
         self.error = None;
     }
 
-    fn spawn_repository_snapshot_load(&mut self, path: PathBuf, repo_task_key: String) {
+    fn spawn_repository_snapshot_load(
+        &mut self,
+        path: PathBuf,
+        repo_task_key: String,
+        priority: RepositoryRefreshPriority,
+    ) {
         let (sender, receiver) = mpsc::channel();
-        let worker_key = repo_task_key.clone();
-        self.repo_tasks.insert(repo_task_key, receiver);
-
-        diagnostics::trace(
-            "snapshot.worker.spawn",
-            &format!("root={} key={worker_key}", path.display()),
-        );
-        thread::spawn(move || {
-            let _span = diagnostics::span(
-                "snapshot.worker",
-                format!("root={} key={worker_key}", path.display()),
-            );
-            let requested_root = path.clone();
-            let _ = sender.send((requested_root, git::open_repository_core(path)));
-        });
+        self.repo_tasks.insert(repo_task_key.clone(), receiver);
+        self.repository_refresh_scheduler
+            .request(RepositoryRefreshRequest {
+                path,
+                key: repo_task_key,
+                priority,
+                result_sender: sender,
+            });
     }
 
     fn spawn_repository_history_load(
@@ -2925,7 +3296,15 @@ impl GitAgentApp {
             }
             return;
         }
-        self.spawn_repository_snapshot_load(path, repo_task_key);
+        self.spawn_repository_snapshot_load(
+            path,
+            repo_task_key,
+            if foreground || restart {
+                RepositoryRefreshPriority::Foreground
+            } else {
+                RepositoryRefreshPriority::Background
+            },
+        );
     }
 
     fn defer_repository_snapshot_retry(&mut self, path: PathBuf) -> bool {
@@ -2969,60 +3348,55 @@ impl GitAgentApp {
         }
 
         self.deferred_repo_reloads.remove(&repo_task_key);
-        self.spawn_repository_snapshot_load(reload.path, repo_task_key);
+        self.spawn_repository_snapshot_load(
+            reload.path,
+            repo_task_key,
+            RepositoryRefreshPriority::Foreground,
+        );
         ctx.request_repaint();
         true
     }
 
-    fn maybe_refresh_repositories(&mut self, ctx: &egui::Context) {
-        let now = Instant::now();
+    fn sync_repository_refresh_scheduler(&mut self, ctx: &egui::Context) {
+        // Retryable foreground loads stay in the same dispatcher as manual and scheduled work.
+        // This short retry only matters while the UI is already awake to surface the error.
+        let _ = self.maybe_start_deferred_repository_snapshot_reload(ctx);
 
-        // A full snapshot starts many short-lived Git commands. Keep automatic refresh
-        // work to one snapshot so background tabs never build a queue ahead of the user.
-        if !self.repo_tasks.is_empty() || !self.repo_history_tasks.is_empty() {
-            ctx.request_repaint_after(REPOSITORY_TASK_POLL_INTERVAL);
-            return;
+        let repositories = self
+            .repo_tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| ScheduledRepositoryRefresh {
+                path: tab.root.clone(),
+                key: repo_state_key(&tab.root),
+                active: self.active_repo_tab == Some(index),
+            })
+            .collect();
+        let mut blocked_keys = self
+            .repo_history_tasks
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        for root in [
+            self.remote_git_root.as_deref(),
+            self.branch_checkout_root.as_deref(),
+            self.repository_undo_root.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            blocked_keys.insert(repo_state_key(root));
         }
-
-        if self.maybe_start_deferred_repository_snapshot_reload(ctx) {
-            return;
-        }
-
-        if now >= self.next_active_repo_refresh_at {
-            self.next_active_repo_refresh_at = now + self.active_repo_refresh_duration();
-            if let Some(tab) = self
-                .repo_tabs
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| self.active_repo_tab == Some(*index))
-                .map(|(_, tab)| tab.clone())
-                .next()
-            {
-                self.start_repository_snapshot_load(tab.root.clone());
-                return;
-            }
-        }
-
-        if now >= self.next_inactive_repo_refresh_at {
-            self.next_inactive_repo_refresh_at = now + self.inactive_repo_refresh_duration();
-            if let Some(tab) = self
-                .repo_tabs
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| self.active_repo_tab != Some(*index))
-                .map(|(_, tab)| tab.clone())
-                .next()
-            {
-                self.start_repository_snapshot_load(tab.root.clone());
-                return;
-            }
-        }
-
-        let next_refresh_at = self
-            .next_active_repo_refresh_at
-            .min(self.next_inactive_repo_refresh_at);
-        if now < next_refresh_at {
-            ctx.request_repaint_after(next_refresh_at - now);
+        let schedule = RepositoryRefreshSchedule {
+            repositories,
+            active_interval: self.active_repo_refresh_duration(),
+            inactive_interval: self.inactive_repo_refresh_duration(),
+            blocked_keys,
+        };
+        if self.last_repository_refresh_schedule.as_ref() != Some(&schedule) {
+            self.repository_refresh_scheduler
+                .update_schedule(schedule.clone());
+            self.last_repository_refresh_schedule = Some(schedule);
         }
     }
 
@@ -3501,7 +3875,9 @@ impl GitAgentApp {
 
     fn refresh(&mut self) {
         if let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) {
-            self.load_repository(root);
+            // A user-triggered refresh must outrank scheduled background work and must not
+            // reuse a possibly stale cache after a long inactive period.
+            self.load_repository_uncached(root);
         }
     }
 
@@ -5095,6 +5471,9 @@ impl GitAgentApp {
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
+        let scheduler = self.repository_refresh_scheduler.clone();
+        let scheduler_key = repo_state_key(&root);
+        let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
 
         thread::spawn(move || {
             let _span = diagnostics::span(
@@ -5105,27 +5484,35 @@ impl GitAgentApp {
                     name
                 ),
             );
-            let result = (|| match strategy {
-                BranchCheckoutStrategy::PreserveLocalChanges => git::checkout_branch(&root, &name),
-                BranchCheckoutStrategy::StashLocalChanges => {
-                    git::stash_push(
-                        &root,
-                        &format!("git-agent: before switching to {name}"),
-                        git::StashOptions {
-                            include_untracked: true,
-                            ..git::StashOptions::default()
-                        },
-                    )?;
-                    git::checkout_branch(&root, &name)
-                }
-                BranchCheckoutStrategy::MergeLocalChanges => {
-                    git::checkout_branch_with_merge(&root, &name)
-                }
-                BranchCheckoutStrategy::DiscardLocalChanges => {
-                    git::discard_all_changes(&root)?;
-                    git::checkout_branch(&root, &name)
+            let result = (|| {
+                exclusive_access.recv().map_err(|_| {
+                    anyhow::anyhow!("Repository refresh scheduler stopped before checkout began")
+                })?;
+                match strategy {
+                    BranchCheckoutStrategy::PreserveLocalChanges => {
+                        git::checkout_branch(&root, &name)
+                    }
+                    BranchCheckoutStrategy::StashLocalChanges => {
+                        git::stash_push(
+                            &root,
+                            &format!("git-agent: before switching to {name}"),
+                            git::StashOptions {
+                                include_untracked: true,
+                                ..git::StashOptions::default()
+                            },
+                        )?;
+                        git::checkout_branch(&root, &name)
+                    }
+                    BranchCheckoutStrategy::MergeLocalChanges => {
+                        git::checkout_branch_with_merge(&root, &name)
+                    }
+                    BranchCheckoutStrategy::DiscardLocalChanges => {
+                        git::discard_all_changes(&root)?;
+                        git::checkout_branch(&root, &name)
+                    }
                 }
             })();
+            scheduler.release_exclusive(scheduler_key);
             let _ = sender.send((root, name, strategy, result));
         });
     }
@@ -5194,6 +5581,9 @@ impl GitAgentApp {
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
+        let scheduler = self.repository_refresh_scheduler.clone();
+        let scheduler_key = repo_state_key(&root);
+        let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
 
         thread::spawn(move || {
             let _worker_span = diagnostics::span(
@@ -5201,6 +5591,9 @@ impl GitAgentApp {
                 format!("root={} label={label}", root.display()),
             );
             let result = (|| {
+                exclusive_access.recv().map_err(|_| {
+                    anyhow::anyhow!("Repository refresh scheduler stopped before Git action began")
+                })?;
                 let before = {
                     let _span =
                         diagnostics::span("undo.before", format!("root={}", root.display()));
@@ -5252,6 +5645,7 @@ impl GitAgentApp {
                     kind,
                 }))
             })();
+            scheduler.release_exclusive(scheduler_key);
             let _ = sender.send((root, result));
         });
     }
@@ -5278,9 +5672,15 @@ impl GitAgentApp {
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
+        let scheduler = self.repository_refresh_scheduler.clone();
+        let scheduler_key = repo_state_key(&root);
+        let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
 
         thread::spawn(move || {
             let result = (|| {
+                exclusive_access.recv().map_err(|_| {
+                    anyhow::anyhow!("Repository refresh scheduler stopped before Git action began")
+                })?;
                 let current = git::repository_undo_position(&root)?;
                 match (&entry.kind, direction) {
                     (RepositoryUndoKind::Position, RepositoryUndoDirection::Undo) => {
@@ -5314,6 +5714,7 @@ impl GitAgentApp {
                 }
                 Ok(RepositoryUndoTaskOutcome::Replayed { entry, direction })
             })();
+            scheduler.release_exclusive(scheduler_key);
             let _ = sender.send((root, result));
         });
     }
@@ -5519,9 +5920,20 @@ impl GitAgentApp {
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
+        let scheduler = self.repository_refresh_scheduler.clone();
+        let scheduler_key = repo_state_key(&root);
+        let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
 
         thread::spawn(move || {
-            let result = action(&root);
+            let result = exclusive_access
+                .recv()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Repository refresh scheduler stopped before remote Git action began"
+                    )
+                })
+                .and_then(|()| action(&root));
+            scheduler.release_exclusive(scheduler_key);
             let _ = sender.send((root, result));
         });
     }
@@ -6032,9 +6444,12 @@ impl GitAgentApp {
 
     fn poll_tasks(&mut self, ctx: &egui::Context) {
         let mut repository_load_activity = false;
-        if !self.repo_tasks.is_empty() {
+        let mut repo_results = Vec::new();
+        while let Ok(result) = self.automatic_repository_refresh_results.try_recv() {
+            repo_results.push(result);
+        }
+        if !self.repo_tasks.is_empty() || !repo_results.is_empty() {
             repository_load_activity = true;
-            let mut repo_results = Vec::new();
             let mut disconnected_repo_keys = Vec::new();
             let mut waiting_for_repo = false;
             self.repo_tasks
@@ -6163,14 +6578,22 @@ impl GitAgentApp {
                     }
                 }
                 if let Some(path) = queued_reload {
-                    self.spawn_repository_snapshot_load(path, repo_task_key);
+                    self.spawn_repository_snapshot_load(
+                        path,
+                        repo_task_key,
+                        RepositoryRefreshPriority::Foreground,
+                    );
                 }
                 ctx.request_repaint();
             }
 
             for key in disconnected_repo_keys {
                 if let Some(path) = self.queued_repo_reloads.remove(&key) {
-                    self.spawn_repository_snapshot_load(path, key);
+                    self.spawn_repository_snapshot_load(
+                        path,
+                        key,
+                        RepositoryRefreshPriority::Foreground,
+                    );
                     ctx.request_repaint();
                     continue;
                 }
@@ -7372,7 +7795,6 @@ impl GitAgentApp {
         let seconds = sanitize_repo_refresh_seconds(seconds);
         if self.active_repo_refresh_seconds != seconds {
             self.active_repo_refresh_seconds = seconds;
-            self.next_active_repo_refresh_at = Instant::now() + self.active_repo_refresh_duration();
             self.save_app_settings();
         }
     }
@@ -7381,8 +7803,6 @@ impl GitAgentApp {
         let seconds = sanitize_repo_refresh_seconds(seconds);
         if self.inactive_repo_refresh_seconds != seconds {
             self.inactive_repo_refresh_seconds = seconds;
-            self.next_inactive_repo_refresh_at =
-                Instant::now() + self.inactive_repo_refresh_duration();
             self.save_app_settings();
         }
     }
@@ -7669,10 +8089,17 @@ impl App for GitAgentApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !ctx.input(|input| input.pointer.primary_down()) {
+        let primary_down = ctx.input(|input| input.pointer.primary_down());
+        let screen_size = ctx.screen_rect().size();
+        diagnostics::record_window_size_probe(screen_size.x, screen_size.y);
+        if !primary_down {
             diagnostics::flush_window_drag_probe();
+            diagnostics::flush_window_size_probe();
         }
-        self.request_native_title_drag_on_pointer_down(ctx);
+        if !self.request_native_window_resize_on_pointer_down(ctx) {
+            self.request_native_title_drag_on_pointer_down(ctx);
+        }
+        self.update_window_resize_cursor(ctx);
         theme::apply_if_needed(ctx, self.theme_mode, self.theme_accent);
         self.poll_tasks(ctx);
         if self.exit_after_update_launch {
@@ -7680,7 +8107,7 @@ impl App for GitAgentApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        self.maybe_refresh_repositories(ctx);
+        self.sync_repository_refresh_scheduler(ctx);
         self.maybe_start_clone_url_validation(ctx);
         self.handle_global_shortcuts(ctx);
         self.flush_pending_toolbar_single_click(ctx);
@@ -8528,6 +8955,63 @@ impl GitAgentApp {
         id_salt: &'static str,
     ) -> egui::Response {
         ui.interact(rect, ui.id().with(id_salt), Sense::click_and_drag())
+    }
+
+    fn request_native_window_resize_on_pointer_down(&self, ctx: &egui::Context) -> bool {
+        let pointer_pos = ctx.input(|input| {
+            input
+                .pointer
+                .primary_pressed()
+                .then(|| {
+                    input
+                        .pointer
+                        .press_origin()
+                        .or(input.pointer.interact_pos())
+                })
+                .flatten()
+        });
+        let Some(pointer_pos) = pointer_pos else {
+            return false;
+        };
+        if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
+            return false;
+        }
+        let screen = ctx.screen_rect();
+        let Some(direction) = window_resize_direction(screen, pointer_pos) else {
+            return false;
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        diagnostics::record_window_drag_probe(
+            pointer_pos.x,
+            pointer_pos.y,
+            resize_probe_area(direction),
+        );
+        true
+    }
+
+    fn update_window_resize_cursor(&self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let pointer_pos = ctx.input(|input| input.pointer.hover_pos());
+        let Some(pointer_pos) = pointer_pos else {
+            return;
+        };
+        if let Some(direction) = window_resize_direction(ctx.screen_rect(), pointer_pos) {
+            ctx.set_cursor_icon(resize_cursor_icon(direction));
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let title_row = Rect::from_min_max(
+            screen.left_top(),
+            Pos2::new(screen.right(), screen.top() + TITLE_BAR_HEIGHT),
+        );
+        let drag_rect = self
+            .title_drag_layer
+            .unwrap_or_else(|| custom_title_drag_rect(title_row, 128.0));
+        if drag_rect.contains(pointer_pos) {
+            ctx.set_cursor_icon(egui::CursorIcon::Grab);
+        }
     }
 
     fn request_native_title_drag_on_pointer_down(&self, ctx: &egui::Context) {
@@ -34837,7 +35321,7 @@ mod ui_tests {
         let drag = custom_title_drag_rect(title_bar, 128.0);
 
         assert_eq!(TITLE_MENU_RESERVED_WIDTH, 500.0);
-        assert_eq!(TITLE_DRAG_TOP_INSET, 4.0);
+        assert_eq!(TITLE_DRAG_TOP_INSET, WINDOW_RESIZE_BORDER + 1.0);
         assert_eq!(drag.left(), title_bar.left() + TITLE_MENU_RESERVED_WIDTH);
         assert_eq!(drag.right(), title_bar.right() - 128.0);
         assert_eq!(drag.bottom(), title_bar.bottom());
@@ -34958,6 +35442,44 @@ mod ui_tests {
         assert!(implementation_source.contains("diagnostics::record_window_drag_probe("));
         assert!(implementation_source.contains("diagnostics::flush_window_drag_probe();"));
         assert!(update_source.contains("egui::CentralPanel::default()"));
+    }
+
+    #[test]
+    fn frameless_window_edges_dispatch_native_resize_before_title_drag() {
+        use egui::viewport::ResizeDirection;
+
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_360.0, 860.0));
+        assert_eq!(
+            window_resize_direction(rect, Pos2::new(1_357.0, 857.0)),
+            Some(ResizeDirection::SouthEast)
+        );
+        assert_eq!(
+            window_resize_direction(rect, Pos2::new(2.0, 400.0)),
+            Some(ResizeDirection::West)
+        );
+        assert_eq!(window_resize_direction(rect, Pos2::new(680.0, 400.0)), None);
+
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(implementation_source.contains("ViewportCommand::BeginResize(direction)"));
+        assert!(
+            implementation_source.contains("ctx.set_cursor_icon(resize_cursor_icon(direction))")
+        );
+        let update_start = implementation_source
+            .find("impl App for GitAgentApp")
+            .unwrap();
+        let update_end = implementation_source[update_start..]
+            .find("impl GitAgentApp")
+            .unwrap();
+        let update_source = &implementation_source[update_start..update_start + update_end];
+        assert!(
+            update_source
+                .find("self.request_native_window_resize_on_pointer_down(ctx)")
+                .unwrap()
+                < update_source
+                    .find("self.request_native_title_drag_on_pointer_down(ctx)")
+                    .unwrap()
+        );
     }
 
     #[test]
@@ -41975,10 +42497,11 @@ diff --git a/file.txt b/file.txt
         assert!(load_source.contains("self.clear_repository_snapshot_view()"));
         assert!(load_source.contains("self.start_repository_snapshot_load(path)"));
         assert!(load_source.contains("self.restart_repository_snapshot_load(path)"));
-        assert!(load_source.contains("self.repo_tasks.insert(repo_task_key, receiver)"));
-        assert!(load_source.contains("let requested_root = path.clone();"));
+        assert!(implementation_source.contains("fn repository_refresh_scheduler_loop("));
+        assert!(implementation_source.contains("git::open_repository_core(request.path.clone())"));
         assert!(
-            load_source.contains("sender.send((requested_root, git::open_repository_core(path)))")
+            implementation_source
+                .contains("self.repository_refresh_scheduler\n            .request(")
         );
         assert!(
             implementation_source
@@ -42072,7 +42595,7 @@ diff --git a/file.txt b/file.txt
             .find("fn start_repository_snapshot_load_with_priority(")
             .unwrap();
         let end = implementation_source[start..]
-            .find("fn maybe_refresh_repositories(")
+            .find("fn sync_repository_refresh_scheduler(")
             .unwrap();
         let load_source = &implementation_source[start..start + end];
 
@@ -42082,7 +42605,7 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
-    fn repo_tabs_refresh_in_background_with_configured_intervals() {
+    fn repository_refresh_scheduler_runs_outside_ui_frame_timers() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let fields_start = implementation_source
@@ -42092,8 +42615,15 @@ diff --git a/file.txt b/file.txt
             .find("struct RepoTab")
             .unwrap();
         let fields_source = &implementation_source[fields_start..fields_start + fields_end];
-        assert!(fields_source.contains("next_active_repo_refresh_at: Instant"));
-        assert!(fields_source.contains("next_inactive_repo_refresh_at: Instant"));
+        assert!(fields_source.contains("repository_refresh_scheduler: RepositoryRefreshScheduler"));
+        assert!(
+            fields_source
+                .contains("last_repository_refresh_schedule: Option<RepositoryRefreshSchedule>")
+        );
+        assert!(
+            fields_source
+                .contains("automatic_repository_refresh_results: Receiver<RepoTaskResult>")
+        );
         assert!(fields_source.contains("active_repo_refresh_seconds: u64"));
         assert!(fields_source.contains("inactive_repo_refresh_seconds: u64"));
         assert!(
@@ -42101,7 +42631,10 @@ diff --git a/file.txt b/file.txt
         );
         assert!(implementation_source.contains("DEFAULT_ACTIVE_REPO_REFRESH_SECONDS: u64 = 20"));
         assert!(implementation_source.contains("DEFAULT_INACTIVE_REPO_REFRESH_SECONDS: u64 = 60"));
-        assert!(implementation_source.contains("fn maybe_refresh_repositories("));
+        assert!(implementation_source.contains("fn repository_refresh_scheduler_loop("));
+        assert!(implementation_source.contains("fn sync_repository_refresh_scheduler("));
+        assert!(implementation_source.contains("command_receiver.recv_timeout(timeout)"));
+        assert!(implementation_source.contains("ctx.request_repaint();"));
 
         let update_start = implementation_source
             .find("fn update(&mut self, ctx: &egui::Context")
@@ -42110,34 +42643,27 @@ diff --git a/file.txt b/file.txt
             .find("fn error_modal(")
             .unwrap();
         let update_source = &implementation_source[update_start..update_start + update_end];
-        assert!(update_source.contains("self.maybe_refresh_repositories(ctx)"));
+        assert!(update_source.contains("self.sync_repository_refresh_scheduler(ctx)"));
 
         let refresh_start = implementation_source
-            .find("fn maybe_refresh_repositories(")
+            .find("fn sync_repository_refresh_scheduler(")
             .unwrap();
         let refresh_end = implementation_source[refresh_start..]
             .find("fn open_repository_source_tab")
             .unwrap();
         let refresh_source = &implementation_source[refresh_start..refresh_start + refresh_end];
-        assert!(refresh_source.contains("Instant::now()"));
-        assert!(refresh_source.contains("self.next_active_repo_refresh_at"));
-        assert!(refresh_source.contains("self.next_inactive_repo_refresh_at"));
         assert!(refresh_source.contains("self.active_repo_refresh_duration()"));
         assert!(refresh_source.contains("self.inactive_repo_refresh_duration()"));
-        assert!(refresh_source.contains("self.active_repo_tab == Some(*index)"));
-        assert!(refresh_source.contains("self.active_repo_tab != Some(*index)"));
-        assert!(refresh_source.contains(".next()"));
-        assert_eq!(
+        assert!(refresh_source.contains("ScheduledRepositoryRefresh"));
+        assert!(refresh_source.contains("blocked_keys.insert(repo_state_key(root))"));
+        assert!(refresh_source.contains("self.repository_refresh_scheduler.update_schedule("));
+        assert!(
             refresh_source
-                .matches("self.start_repository_snapshot_load(tab.root.clone())")
-                .count(),
-            2,
-            "active and inactive refresh paths each start at most one snapshot"
+                .contains("self.last_repository_refresh_schedule.as_ref() != Some(&schedule)")
         );
-        assert!(refresh_source.contains("self.start_repository_snapshot_load(tab.root.clone())"));
         assert!(!refresh_source.contains("self.ensure_repo_tab"));
         assert!(!refresh_source.contains("self.clear_repository_snapshot_view"));
-        assert!(!refresh_source.contains("self.loading_repo = true"));
+        assert!(!refresh_source.contains("self.start_foreground_repository_snapshot_load"));
     }
 
     #[test]
@@ -42919,7 +43445,7 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
-    fn active_and_inactive_auto_refresh_use_background_loads_without_loading_gate() {
+    fn automatic_refresh_uses_shared_queue_and_pauses_during_git_mutations() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let fields_start = implementation_source
@@ -42930,32 +43456,112 @@ diff --git a/file.txt b/file.txt
             .unwrap();
         let fields_source = &implementation_source[fields_start..fields_start + fields_end];
         let refresh_start = implementation_source
-            .find("fn maybe_refresh_repositories(")
+            .find("fn sync_repository_refresh_scheduler(")
             .unwrap();
         let refresh_end = implementation_source[refresh_start..]
             .find("fn open_repository_source_tab")
             .unwrap();
         let refresh_source = &implementation_source[refresh_start..refresh_start + refresh_end];
 
-        assert!(fields_source.contains("next_active_repo_refresh_at: Instant"));
-        assert!(fields_source.contains("next_inactive_repo_refresh_at: Instant"));
+        assert!(fields_source.contains("repository_refresh_scheduler: RepositoryRefreshScheduler"));
         assert!(fields_source.contains("active_repo_refresh_seconds: u64"));
         assert!(fields_source.contains("inactive_repo_refresh_seconds: u64"));
         assert!(refresh_source.contains("self.active_repo_refresh_duration()"));
         assert!(refresh_source.contains("self.inactive_repo_refresh_duration()"));
-        assert!(refresh_source.contains("self.active_repo_tab == Some(*index)"));
-        assert!(refresh_source.contains("self.active_repo_tab != Some(*index)"));
-        assert!(refresh_source.contains("self.start_repository_snapshot_load(tab.root.clone())"));
-        assert!(refresh_source.contains("if !self.repo_tasks.is_empty()"));
-        assert!(
-            refresh_source.contains("ctx.request_repaint_after(REPOSITORY_TASK_POLL_INTERVAL)")
-        );
+        assert!(implementation_source.contains("RepositoryRefreshPriority::Background"));
+        assert!(implementation_source.contains("RepositoryRefreshPriority::Foreground"));
+        assert!(implementation_source.contains("next_repository_refresh_request_index"));
+        assert!(refresh_source.contains("self.remote_git_root.as_deref()"));
+        assert!(refresh_source.contains("self.branch_checkout_root.as_deref()"));
         assert!(!refresh_source.contains("self.start_foreground_repository_snapshot_load"));
         assert!(!refresh_source.contains("self.restart_repository_snapshot_load"));
         assert!(!refresh_source.contains("self.loading_repo = true"));
         assert!(!refresh_source.contains("self.clear_repository_snapshot_view"));
-        assert!(implementation_source.contains("self.maybe_refresh_repositories(ctx)"));
-        assert!(!implementation_source.contains("self.maybe_refresh_inactive_repositories(ctx)"));
+        assert!(implementation_source.contains("self.sync_repository_refresh_scheduler(ctx)"));
+        assert!(!implementation_source.contains("maybe_refresh_repositories"));
+    }
+
+    #[test]
+    fn repository_refresh_queue_prioritizes_user_requests_and_deduplicates_background_work() {
+        let (result_sender, _result_receiver) = mpsc::channel::<RepoTaskResult>();
+        let mut pending = Vec::new();
+        enqueue_repository_refresh(
+            &mut pending,
+            RepositoryRefreshRequest {
+                path: PathBuf::from("background-repository"),
+                key: "background-repository".to_owned(),
+                priority: RepositoryRefreshPriority::Background,
+                result_sender: result_sender.clone(),
+            },
+        );
+        enqueue_repository_refresh(
+            &mut pending,
+            RepositoryRefreshRequest {
+                path: PathBuf::from("foreground-repository"),
+                key: "foreground-repository".to_owned(),
+                priority: RepositoryRefreshPriority::Foreground,
+                result_sender: result_sender.clone(),
+            },
+        );
+        enqueue_repository_refresh(
+            &mut pending,
+            RepositoryRefreshRequest {
+                path: PathBuf::from("background-repository"),
+                key: "background-repository".to_owned(),
+                priority: RepositoryRefreshPriority::Foreground,
+                result_sender,
+            },
+        );
+
+        assert_eq!(pending.len(), 2);
+        let blocked = HashSet::new();
+        let selected = next_repository_refresh_request_index(&pending, &blocked).unwrap();
+        assert_eq!(
+            pending[selected].priority,
+            RepositoryRefreshPriority::Foreground
+        );
+        assert_eq!(pending[0].priority, RepositoryRefreshPriority::Foreground);
+    }
+
+    #[test]
+    fn repository_mutations_acquire_the_same_scheduler_exclusive_permit() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let mut pending = Vec::<RepositoryExclusiveRequest>::new();
+        let (first_sender, _first_receiver) = mpsc::channel();
+        let (second_sender, _second_receiver) = mpsc::channel();
+        pending.push(RepositoryExclusiveRequest {
+            key: "repository-a".to_owned(),
+            granted_sender: first_sender,
+        });
+        pending.push(RepositoryExclusiveRequest {
+            key: "repository-b".to_owned(),
+            granted_sender: second_sender,
+        });
+        let mut held = HashSet::from(["repository-a".to_owned()]);
+        assert_eq!(
+            next_repository_exclusive_request_index(&pending, &held),
+            Some(1)
+        );
+        held.insert("repository-b".to_owned());
+        assert_eq!(
+            next_repository_exclusive_request_index(&pending, &held),
+            None
+        );
+
+        for required in [
+            "AcquireExclusive",
+            "ReleaseExclusive",
+            "next_repository_exclusive_request_index",
+            "self.repository_refresh_scheduler.clone()",
+            "scheduler.acquire_exclusive(scheduler_key.clone())",
+            "scheduler.release_exclusive(scheduler_key)",
+        ] {
+            assert!(
+                implementation_source.contains(required),
+                "missing {required}"
+            );
+        }
     }
 
     #[test]

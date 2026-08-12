@@ -1,5 +1,10 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+const MAIN_WINDOW_INITIAL_WIDTH: f32 = 1360.0;
+const MAIN_WINDOW_INITIAL_HEIGHT: f32 = 860.0;
+const MAIN_WINDOW_MIN_WIDTH: f32 = MAIN_WINDOW_INITIAL_WIDTH - 200.0;
+const MAIN_WINDOW_MIN_HEIGHT: f32 = MAIN_WINDOW_MIN_WIDTH * 9.0 / 16.0;
+
 fn main() -> eframe::Result<()> {
     install_panic_logger();
     append_app_log(format!(
@@ -19,8 +24,9 @@ fn main() -> eframe::Result<()> {
             .with_icon(app_icon_data())
             .with_decorations(false)
             .with_transparent(true)
-            .with_inner_size([1360.0, 860.0])
-            .with_min_inner_size([980.0, 640.0]),
+            .with_resizable(true)
+            .with_inner_size([MAIN_WINDOW_INITIAL_WIDTH, MAIN_WINDOW_INITIAL_HEIGHT])
+            .with_min_inner_size([MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT]),
         ..Default::default()
     };
 
@@ -97,11 +103,7 @@ fn append_app_log(message: impl AsRef<str>) {
 }
 
 fn app_log_path() -> Option<std::path::PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(std::path::PathBuf::from))
-        .or_else(|| std::env::current_dir().ok())
-        .map(|base| base.join("data").join("app.log"))
+    Some(git_agent::diagnostics::daily_log_path("app"))
 }
 
 fn app_icon_data() -> eframe::egui::IconData {
@@ -279,10 +281,23 @@ mod tests {
         let source = include_str!("main.rs");
 
         assert!(source.contains("fn app_log_path()"));
-        assert!(source.contains("\"app.log\""));
+        assert!(source.contains("daily_log_path(\"app\")"));
         assert!(source.contains("std::panic::set_hook"));
         assert!(source.contains("process start"));
         assert!(source.contains("panic:"));
         assert!(source.contains("run_native returned"));
+    }
+
+    #[test]
+    fn main_window_minimum_size_uses_width_minus_two_hundred_and_sixteen_by_nine_height() {
+        assert_eq!(MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_INITIAL_WIDTH - 200.0);
+        assert_eq!(MAIN_WINDOW_MIN_HEIGHT, MAIN_WINDOW_MIN_WIDTH * 9.0 / 16.0);
+        assert_eq!(MAIN_WINDOW_MIN_WIDTH, 1160.0);
+        assert_eq!(MAIN_WINDOW_MIN_HEIGHT, 652.5);
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains("with_min_inner_size([MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT])")
+        );
+        assert!(source.contains("with_resizable(true)"));
     }
 }
