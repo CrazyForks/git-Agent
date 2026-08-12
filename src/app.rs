@@ -40,15 +40,21 @@ use crate::{
 };
 
 const TITLE_BAR_HEIGHT: f32 = 32.0;
+// English menu labels need more room than the former Chinese-only estimate. Keep the native
+// drag rect entirely to their right so a late drag-region hit target never competes with a menu.
+const TITLE_MENU_RESERVED_WIDTH: f32 = 500.0;
+const TITLE_DRAG_TOP_INSET: f32 = 4.0;
 const WINDOW_CORNER_RADIUS: u8 = 6;
 const INTERACTIVE_REBASE_TABLE_CONTROL_WIDTH: f32 = 220.0;
-const TITLE_MENU_RESERVED_WIDTH: f32 = 420.0;
+const HISTORY_BRANCH_SCOPE_CONTROL_WIDTH: f32 = 132.0;
+const HISTORY_BRANCH_SCOPE_POPUP_MIN_WIDTH: f32 = 148.0;
 const TOP_BAR_TAB_TOOL_JOIN_OVERLAP: f32 = 6.0;
 const TOP_BAR_HEIGHT: f32 =
     TITLE_BAR_HEIGHT + TOP_BAR_ROW_HEIGHT * 2.0 - TOP_BAR_TAB_TOOL_JOIN_OVERLAP;
 const TOP_BAR_ROW_HEIGHT: f32 = 40.0;
-const TOP_BAR_GLOBAL_WIDTH: f32 = 480.0;
 const TOP_BAR_GLOBAL_ACTION_Y_OFFSET: f32 = -1.0;
+const TOP_BAR_GLOBAL_ACTION_EDGE_PADDING: f32 = 8.0;
+const TOP_BAR_GLOBAL_ACTION_SAFETY_PADDING: f32 = 12.0;
 
 const DEFAULT_ACTIVE_REPO_REFRESH_SECONDS: u64 = 20;
 const DEFAULT_INACTIVE_REPO_REFRESH_SECONDS: u64 = 60;
@@ -342,6 +348,46 @@ fn repo_tab_strip_rect(tab_row: Rect, source_active: bool) -> Rect {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobalActionPresentation {
+    Full,
+    Compact,
+}
+
+fn global_action_presentation(full_width: f32, available_width: f32) -> GlobalActionPresentation {
+    if full_width <= available_width {
+        GlobalActionPresentation::Full
+    } else {
+        // The enclosing rect clips exceptionally narrow windows so controls never paint over
+        // repository tabs.
+        GlobalActionPresentation::Compact
+    }
+}
+
+fn global_action_row_width(
+    ui: &Ui,
+    labels: &[&str],
+    presentation: GlobalActionPresentation,
+) -> f32 {
+    let button_widths = labels.iter().map(|label| match presentation {
+        GlobalActionPresentation::Full => inline_button_width(
+            ui,
+            label,
+            TOOLBAR_BUTTON_TEXT,
+            TOOLBAR_BUTTON_MIN_WIDTH,
+            TOOLBAR_BUTTON_MAX_WIDTH,
+            TOOLBAR_BUTTON_X_PADDING,
+        ),
+        GlobalActionPresentation::Compact => TOOLBAR_BUTTON_HEIGHT,
+    });
+    let buttons_width = button_widths.sum::<f32>();
+    let gaps_width = labels.len().saturating_sub(1) as f32 * ui.spacing().item_spacing.x;
+    TOP_BAR_GLOBAL_ACTION_EDGE_PADDING
+        + buttons_width
+        + gaps_width
+        + TOP_BAR_GLOBAL_ACTION_SAFETY_PADDING
+}
+
 fn top_island_rect(full: Rect, title_row: Rect, tool_row: Rect, source_active: bool) -> Rect {
     let bottom = if source_active {
         tool_row.bottom()
@@ -361,7 +407,10 @@ fn custom_title_drag_rect(rect: Rect, controls_width: f32) -> Rect {
     let drag_left =
         (rect.left() + TITLE_MENU_RESERVED_WIDTH).min(rect.right() - controls_width - 24.0);
     Rect::from_min_max(
-        Pos2::new(drag_left, rect.top()),
+        Pos2::new(
+            drag_left,
+            (rect.top() + TITLE_DRAG_TOP_INSET).min(rect.bottom()),
+        ),
         Pos2::new(rect.right() - controls_width, rect.bottom()),
     )
 }
@@ -424,6 +473,7 @@ pub struct GitAgentApp {
     repository_transition_focus_clear_pending: bool,
     snapshot_cache: HashMap<String, RepositorySnapshot>,
     layout: GraphLayout,
+    title_drag_layer: Option<Rect>,
     selected_commit: Option<usize>,
     error: Option<String>,
     search: String,
@@ -532,6 +582,7 @@ pub struct GitAgentApp {
     pending_archive_action: Option<ArchiveActionDialog>,
     pending_merge_action: Option<MergeActionDialog>,
     pending_interactive_rebase_action: Option<InteractiveRebaseActionDialog>,
+    pending_interactive_rebase_open_after_history: Option<PathBuf>,
     pending_rebase_control_action: Option<RebaseControlDialog>,
     pending_submodule_action: Option<SubmoduleActionDialog>,
     pending_subtree_action: Option<SubtreeActionDialog>,
@@ -608,6 +659,18 @@ struct KnownRepository {
     root: PathBuf,
     name: String,
     workspace_index: Option<usize>,
+}
+
+fn workspace_repository_display_order(
+    left: &KnownRepository,
+    left_has_unstaged: bool,
+    right: &KnownRepository,
+    right_has_unstaged: bool,
+) -> std::cmp::Ordering {
+    right_has_unstaged
+        .cmp(&left_has_unstaged)
+        .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        .then_with(|| left.root.cmp(&right.root))
 }
 
 type RemoteGitTaskResult = (PathBuf, anyhow::Result<()>);
@@ -1178,12 +1241,6 @@ impl InteractiveRebaseTodoAction {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InteractiveRebaseScope {
-    LocalUnpushed,
-    ChildrenOfCommit,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct InteractiveRebaseAuthor {
     name: String,
@@ -1192,7 +1249,7 @@ struct InteractiveRebaseAuthor {
 
 #[derive(Clone, Debug)]
 struct InteractiveRebaseActionDialog {
-    scope: InteractiveRebaseScope,
+    commits: Vec<Commit>,
     base_hash: String,
     base_short_hash: String,
     rewrites_published_history: bool,
@@ -1805,6 +1862,9 @@ enum SettingsThemeAccent {
     Purple,
     Rose,
     Orange,
+    SunRed,
+    DeepSeaBlue,
+    ForestGreen,
 }
 
 impl Default for SettingsThemeAccent {
@@ -2011,6 +2071,9 @@ impl From<SettingsThemeAccent> for theme::ThemeAccent {
             SettingsThemeAccent::Purple => Self::Purple,
             SettingsThemeAccent::Rose => Self::Rose,
             SettingsThemeAccent::Orange => Self::Orange,
+            SettingsThemeAccent::SunRed => Self::SunRed,
+            SettingsThemeAccent::DeepSeaBlue => Self::DeepSeaBlue,
+            SettingsThemeAccent::ForestGreen => Self::ForestGreen,
         }
     }
 }
@@ -2023,6 +2086,9 @@ impl From<theme::ThemeAccent> for SettingsThemeAccent {
             theme::ThemeAccent::Purple => Self::Purple,
             theme::ThemeAccent::Rose => Self::Rose,
             theme::ThemeAccent::Orange => Self::Orange,
+            theme::ThemeAccent::SunRed => Self::SunRed,
+            theme::ThemeAccent::DeepSeaBlue => Self::DeepSeaBlue,
+            theme::ThemeAccent::ForestGreen => Self::ForestGreen,
         }
     }
 }
@@ -2497,6 +2563,7 @@ impl GitAgentApp {
             repository_transition_focus_clear_pending: false,
             snapshot_cache: HashMap::new(),
             layout: GraphLayout::default(),
+            title_drag_layer: None,
             selected_commit: None,
             error: None,
             search: String::new(),
@@ -2607,6 +2674,7 @@ impl GitAgentApp {
             pending_archive_action: None,
             pending_merge_action: None,
             pending_interactive_rebase_action: None,
+            pending_interactive_rebase_open_after_history: None,
             pending_rebase_control_action: None,
             pending_submodule_action: None,
             pending_subtree_action: None,
@@ -3255,6 +3323,13 @@ impl GitAgentApp {
         self.repo_history_tasks.remove(&key);
         self.queued_repo_history_loads.remove(&key);
         self.foreground_repo_history_loads.remove(&key);
+        if self
+            .pending_interactive_rebase_open_after_history
+            .as_ref()
+            .is_some_and(|pending_root| paths_equal(pending_root, root))
+        {
+            self.pending_interactive_rebase_open_after_history = None;
+        }
 
         if !self.active_repo_root_matches(root) {
             return;
@@ -3353,6 +3428,10 @@ impl GitAgentApp {
             return;
         }
 
+        let open_interactive_rebase = self
+            .pending_interactive_rebase_open_after_history
+            .as_ref()
+            .is_some_and(|pending_root| paths_equal(pending_root, root));
         snapshot.apply_history(history);
         self.apply_history_sort_order_to_snapshot(&mut snapshot);
         self.layout = layout;
@@ -3369,6 +3448,10 @@ impl GitAgentApp {
         self.history_rows_cache.clear();
         self.snapshot = Some(snapshot);
         self.request_selected_details();
+        if open_interactive_rebase {
+            self.pending_interactive_rebase_open_after_history = None;
+            self.open_interactive_rebase_dialog();
+        }
     }
 
     fn active_snapshot_matches_background_core_refresh(
@@ -4777,9 +4860,15 @@ impl GitAgentApp {
     }
 
     fn open_interactive_rebase_dialog(&mut self) {
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            if !snapshot.history_loaded {
+                self.pending_interactive_rebase_open_after_history = Some(snapshot.root.clone());
+            }
+        }
         let Some(snapshot) = self.prepare_interactive_rebase_snapshot() else {
             return;
         };
+        self.pending_interactive_rebase_open_after_history = None;
         let commits = interactive_rebase_dialog_commits(&snapshot, self.history_sort_order);
         let Some(commit) = self
             .selected_commit
@@ -4810,7 +4899,7 @@ impl GitAgentApp {
         let ordered_hashes = autosquash_plan.ordered_hashes;
 
         self.pending_interactive_rebase_action = Some(InteractiveRebaseActionDialog {
-            scope: InteractiveRebaseScope::LocalUnpushed,
+            commits,
             base_hash,
             base_short_hash,
             rewrites_published_history: false,
@@ -4869,7 +4958,7 @@ impl GitAgentApp {
             interactive_rebase_rewrites_published_history(&snapshot, &commits);
 
         self.pending_interactive_rebase_action = Some(InteractiveRebaseActionDialog {
-            scope: InteractiveRebaseScope::ChildrenOfCommit,
+            commits,
             base_hash,
             base_short_hash,
             rewrites_published_history,
@@ -6139,6 +6228,13 @@ impl GitAgentApp {
                         }
                     }
                     Err(error) => {
+                        if self
+                            .pending_interactive_rebase_open_after_history
+                            .as_ref()
+                            .is_some_and(|pending_root| paths_equal(pending_root, &requested_root))
+                        {
+                            self.pending_interactive_rebase_open_after_history = None;
+                        }
                         if was_foreground && self.active_repo_root_matches(&requested_root) {
                             self.error = Some(error.to_string());
                         }
@@ -6166,6 +6262,13 @@ impl GitAgentApp {
                 }
                 if was_foreground && self.active_repo_key_matches(&key) {
                     self.error = Some("Repository history loader stopped unexpectedly".to_owned());
+                }
+                if self
+                    .pending_interactive_rebase_open_after_history
+                    .as_ref()
+                    .is_some_and(|pending_root| repo_state_key(pending_root) == key)
+                {
+                    self.pending_interactive_rebase_open_after_history = None;
                 }
                 ctx.request_repaint();
             }
@@ -7566,6 +7669,10 @@ impl App for GitAgentApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !ctx.input(|input| input.pointer.primary_down()) {
+            diagnostics::flush_window_drag_probe();
+        }
+        self.request_native_title_drag_on_pointer_down(ctx);
         theme::apply_if_needed(ctx, self.theme_mode, self.theme_accent);
         self.poll_tasks(ctx);
         if self.exit_after_update_launch {
@@ -8415,17 +8522,65 @@ impl GitAgentApp {
     }
 
     fn top_bar_drag_region(
-        &mut self,
-        ctx: &egui::Context,
+        &self,
         ui: &mut Ui,
         rect: Rect,
         id_salt: &'static str,
     ) -> egui::Response {
-        let response = ui.interact(rect, ui.id().with(id_salt), Sense::click_and_drag());
-        if response.drag_started() {
+        ui.interact(rect, ui.id().with(id_salt), Sense::click_and_drag())
+    }
+
+    fn request_native_title_drag_on_pointer_down(&self, ctx: &egui::Context) {
+        let pointer_pos = ctx.input(|input| {
+            input
+                .pointer
+                .primary_pressed()
+                .then(|| {
+                    input
+                        .pointer
+                        .press_origin()
+                        .or(input.pointer.interact_pos())
+                })
+                .flatten()
+        });
+        let Some(pointer_pos) = pointer_pos else {
+            return;
+        };
+
+        let screen = ctx.screen_rect();
+        let title_row = Rect::from_min_max(
+            screen.left_top(),
+            Pos2::new(screen.right(), screen.top() + TITLE_BAR_HEIGHT),
+        );
+        let drag_rect = self
+            .title_drag_layer
+            .unwrap_or_else(|| custom_title_drag_rect(title_row, 128.0));
+        if drag_rect.contains(pointer_pos) {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            diagnostics::record_window_drag_probe(pointer_pos.x, pointer_pos.y, 1);
+            return;
         }
-        response
+
+        if self.repository_source_active() {
+            let tab_row = Rect::from_min_max(
+                Pos2::new(screen.left(), title_row.bottom()),
+                Pos2::new(screen.right(), title_row.bottom() + TOP_BAR_ROW_HEIGHT),
+            );
+            let tab_strip_row = repo_tab_strip_rect(tab_row, true);
+            let title_gap_drag_rect = Rect::from_min_max(
+                title_row.left_bottom(),
+                Pos2::new(screen.right(), tab_strip_row.top()),
+            );
+            if title_gap_drag_rect.contains(pointer_pos) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                diagnostics::record_window_drag_probe(pointer_pos.x, pointer_pos.y, 2);
+                return;
+            }
+        }
+
+        if title_row.contains(pointer_pos) {
+            diagnostics::record_window_drag_probe(pointer_pos.x, pointer_pos.y, 0);
+        }
     }
 
     fn custom_title_bar(
@@ -8440,14 +8595,6 @@ impl GitAgentApp {
             .rect_filled(rect, window_top_corner_radius(ctx), theme::panel());
 
         let controls_width = 128.0;
-        let drag_rect = custom_title_drag_rect(rect, controls_width);
-        let drag_response =
-            self.top_bar_drag_region(ctx, ui, drag_rect, "custom_title_drag_region");
-        if drag_response.double_clicked() {
-            let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-        }
-
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.horizontal_centered(|ui| {
                 ui.add_space(8.0);
@@ -8474,6 +8621,19 @@ impl GitAgentApp {
                 });
             });
         });
+
+        // Register the blank title-space interaction after its child controls. Egui resolves
+        // overlapping hit targets by paint order; this keeps the empty space reliably draggable
+        // while the larger menu reservation prevents it from covering menu buttons.
+        let drag_rect = custom_title_drag_rect(rect, controls_width);
+        if self.title_drag_layer != Some(drag_rect) {
+            self.title_drag_layer = Some(drag_rect);
+        }
+        let drag_response = self.top_bar_drag_region(ui, drag_rect, "custom_title_drag_region");
+        if drag_response.double_clicked() {
+            let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
     }
 
     fn desktop_menu_bar(&mut self, ui: &mut Ui, has_repo: bool, has_remote: bool) {
@@ -9374,14 +9534,30 @@ impl GitAgentApp {
                 Pos2::new(full.left(), title_row.bottom()),
                 Pos2::new(full.right(), tab_strip_row.top()),
             );
-            self.top_bar_drag_region(ctx, ui, title_gap_drag_rect, "source_title_gap_drag_region");
+            self.top_bar_drag_region(ui, title_gap_drag_rect, "source_title_gap_drag_region");
         }
+
+        let global_action_labels = [
+            self.tr("repo.settings"),
+            self.tr("repo.resource_manager"),
+            self.tr("repo.command_mode"),
+            self.tr("repo.remote"),
+            self.tr("repo.git_flow"),
+        ];
+        let minimum_tabs_width = TOP_BAR_MIN_TABS_WIDTH.min(tab_strip_row.width());
+        let maximum_global_width = (tab_strip_row.width() - minimum_tabs_width).max(0.0);
+        let full_global_actions_width =
+            global_action_row_width(ui, &global_action_labels, GlobalActionPresentation::Full);
+        let global_action_presentation =
+            global_action_presentation(full_global_actions_width, maximum_global_width);
+        let global_actions_width =
+            global_action_row_width(ui, &global_action_labels, global_action_presentation)
+                .min(maximum_global_width);
 
         let tab_left = Rect::from_min_max(
             tab_strip_row.left_top(),
             Pos2::new(
-                (tab_strip_row.right() - TOP_BAR_GLOBAL_WIDTH)
-                    .max(tab_strip_row.left() + TOP_BAR_MIN_TABS_WIDTH),
+                tab_strip_row.right() - global_actions_width,
                 tab_strip_row.bottom(),
             ),
         );
@@ -9389,10 +9565,6 @@ impl GitAgentApp {
             Pos2::new(tab_left.right(), tab_strip_row.top()),
             tab_strip_row.right_bottom(),
         );
-        self.top_bar_drag_region(ctx, ui, tab_right, "tab_right_drag_region");
-        if source_active {
-            self.top_bar_drag_region(ctx, ui, tab_left, "source_tab_left_drag_region");
-        }
         let repo_tab_names = self
             .repo_tabs
             .iter()
@@ -9535,30 +9707,63 @@ impl GitAgentApp {
 
         let global_action_row = tab_right.translate(Vec2::new(0.0, TOP_BAR_GLOBAL_ACTION_Y_OFFSET));
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(global_action_row), |ui| {
+            ui.set_clip_rect(global_action_row);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(8.0);
-                if toolbar_button(ui, "settings", self.tr("repo.settings"), has_repo).clicked() {
+                ui.add_space(TOP_BAR_GLOBAL_ACTION_EDGE_PADDING);
+                if responsive_global_action_button(
+                    ui,
+                    "settings",
+                    global_action_labels[0],
+                    has_repo,
+                    global_action_presentation,
+                )
+                .clicked()
+                {
                     self.repo_settings_tab = SettingsTab::RepoRemotes;
                     self.repo_settings_open = true;
                 }
-                if toolbar_button(
+                if responsive_global_action_button(
                     ui,
                     "resource-manager",
-                    self.tr("repo.resource_manager"),
+                    global_action_labels[1],
                     has_repo,
+                    global_action_presentation,
                 )
                 .clicked()
                 {
                     self.open_resource_manager();
                 }
-                if toolbar_button(ui, "terminal", self.tr("repo.command_mode"), has_repo).clicked()
+                if responsive_global_action_button(
+                    ui,
+                    "terminal",
+                    global_action_labels[2],
+                    has_repo,
+                    global_action_presentation,
+                )
+                .clicked()
                 {
                     self.open_command_mode();
                 }
-                if toolbar_button(ui, "remote", self.tr("repo.remote"), has_repo).clicked() {
+                if responsive_global_action_button(
+                    ui,
+                    "remote",
+                    global_action_labels[3],
+                    has_repo,
+                    global_action_presentation,
+                )
+                .clicked()
+                {
                     self.open_remote_url();
                 }
-                if toolbar_button(ui, "git-flow", self.tr("repo.git_flow"), has_repo).clicked() {
+                if responsive_global_action_button(
+                    ui,
+                    "git-flow",
+                    global_action_labels[4],
+                    has_repo,
+                    global_action_presentation,
+                )
+                .clicked()
+                {
                     self.open_git_workflow();
                 }
             });
@@ -9936,7 +10141,8 @@ impl GitAgentApp {
         workspace_index: usize,
     ) -> Vec<KnownRepository> {
         let query = self.workspace_repository_search.trim().to_lowercase();
-        self.known_repositories
+        let mut repositories = self
+            .known_repositories
             .iter()
             .filter(|repository| {
                 repository.workspace_index == Some(workspace_index)
@@ -9947,7 +10153,16 @@ impl GitAgentApp {
                             .contains(&query))
             })
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        repositories.sort_by(|left, right| {
+            workspace_repository_display_order(
+                left,
+                self.workspace_repository_has_unstaged(&left.root),
+                right,
+                self.workspace_repository_has_unstaged(&right.root),
+            )
+        });
+        repositories
     }
 
     fn workspace_repository_snapshot_for(&self, root: &Path) -> Option<&RepositorySnapshot> {
@@ -9961,6 +10176,11 @@ impl GitAgentApp {
                 .values()
                 .find(|snapshot| paths_equal(&snapshot.root, root))
         })
+    }
+
+    fn workspace_repository_has_unstaged(&self, root: &Path) -> bool {
+        self.workspace_repository_snapshot_for(root)
+            .is_some_and(|snapshot| !snapshot.unstaged.is_empty())
     }
 
     fn maybe_start_workspace_repository_status_load(
@@ -10921,7 +11141,7 @@ impl GitAgentApp {
         let mut control_left = toolbar_rect.left();
         let branch_rect = Rect::from_min_size(
             Pos2::new(control_left, control_top),
-            Vec2::new(102.0, control_height),
+            Vec2::new(HISTORY_BRANCH_SCOPE_CONTROL_WIDTH, control_height),
         );
         if let Some(scope) =
             history_branch_scope_dropdown(ui, branch_rect, self.language, self.history_branch_scope)
@@ -11284,62 +11504,8 @@ impl GitAgentApp {
             return;
         };
 
-        let details_height = ui.available_height().clamp(96.0, 132.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), details_height),
-            Layout::top_down(Align::Min),
-            |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                source_tree_meta_line(
-                    ui,
-                    if self.language == Language::Chinese {
-                        "\u{63d0}\u{4ea4}"
-                    } else {
-                        "Commit"
-                    },
-                    &format!("{} [{}]", commit.hash, commit.short_hash),
-                );
-                if !commit.parents.is_empty() {
-                    let parents = commit
-                        .parents
-                        .iter()
-                        .map(|parent| parent.chars().take(8).collect::<String>())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    source_tree_meta_line(
-                        ui,
-                        if self.language == Language::Chinese {
-                            "\u{7236}\u{63d0}\u{4ea4}"
-                        } else {
-                            "Parent"
-                        },
-                        &parents,
-                    );
-                }
-                source_tree_meta_line(ui, self.tr("commit.author"), &commit.author);
-                let when = if commit.date.is_empty() {
-                    commit.relative_time.as_str()
-                } else {
-                    commit.date.as_str()
-                };
-                source_tree_meta_line(ui, self.tr("commit.when"), when);
-                source_tree_meta_line(
-                    ui,
-                    if self.language == Language::Chinese {
-                        "\u{63d0}\u{4ea4}\u{8005}"
-                    } else {
-                        "Committer"
-                    },
-                    &commit.author,
-                );
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(RichText::new(&commit.subject).color(theme::text())).wrap(),
-                );
-            },
-        );
-
-        recessed_horizontal_separator(ui);
+        let details = self.details_cache.get(&commit.hash);
+        commit_summary_card(ui, self.language, &commit, details);
         self.history_file_table(ui, &commit);
     }
 
@@ -11349,62 +11515,8 @@ impl GitAgentApp {
             return;
         };
 
-        let details_height = ui.available_height().clamp(96.0, 132.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), details_height),
-            Layout::top_down(Align::Min),
-            |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                source_tree_meta_line(
-                    ui,
-                    if self.language == Language::Chinese {
-                        "\u{63d0}\u{4ea4}"
-                    } else {
-                        "Commit"
-                    },
-                    &format!("{} [{}]", commit.hash, commit.short_hash),
-                );
-                if !commit.parents.is_empty() {
-                    let parents = commit
-                        .parents
-                        .iter()
-                        .map(|parent| parent.chars().take(8).collect::<String>())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    source_tree_meta_line(
-                        ui,
-                        if self.language == Language::Chinese {
-                            "\u{7236}\u{63d0}\u{4ea4}"
-                        } else {
-                            "Parent"
-                        },
-                        &parents,
-                    );
-                }
-                source_tree_meta_line(ui, self.tr("commit.author"), &commit.author);
-                let when = if commit.date.is_empty() {
-                    commit.relative_time.as_str()
-                } else {
-                    commit.date.as_str()
-                };
-                source_tree_meta_line(ui, self.tr("commit.when"), when);
-                source_tree_meta_line(
-                    ui,
-                    if self.language == Language::Chinese {
-                        "\u{63d0}\u{4ea4}\u{8005}"
-                    } else {
-                        "Committer"
-                    },
-                    &commit.author,
-                );
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(RichText::new(&commit.subject).color(theme::text())).wrap(),
-                );
-            },
-        );
-
-        recessed_horizontal_separator(ui);
+        let details = self.details_cache.get(&commit.hash);
+        commit_summary_card(ui, self.language, &commit, details);
         self.search_file_table(ui, &commit);
     }
 
@@ -14596,21 +14708,10 @@ impl GitAgentApp {
             None;
         let mut hash_copied = false;
         let actions_enabled = !self.branch_actions_busy();
-        let commits = self
-            .snapshot
-            .as_ref()
-            .map(|snapshot| {
-                interactive_rebase_commits_for_scope(
-                    snapshot,
-                    dialog.scope,
-                    &dialog.base_hash,
-                    dialog.sort_order,
-                )
-            })
-            .unwrap_or_default();
-        dialog.rewrites_published_history = self.snapshot.as_ref().is_some_and(|snapshot| {
-            interactive_rebase_rewrites_published_history(snapshot, &commits)
-        });
+        // The plan is prepared when this dialog opens. Rebuilding it from the complete
+        // repository history every repaint made large repositories appear frozen before the
+        // dialog could be used.
+        let commits = dialog.commits.clone();
         let disabled_hashes = interactive_rebase_disabled_hashes(&commits);
         let plan_editing = dialog.editing_reword_hash.is_some();
         let mut table_disabled_hashes = disabled_hashes.clone();
@@ -17593,18 +17694,20 @@ impl GitAgentApp {
         });
         ui.add_space(8.0);
         settings_field(ui, settings_theme_accent_title(language), |ui| {
-            for accent in theme::all_accents() {
-                if settings_accent_button(
-                    ui,
-                    self.theme_accent == accent,
-                    theme_accent_label(self.language, accent),
-                    theme::accent_color(accent),
-                )
-                .clicked()
-                {
-                    self.set_theme_accent(accent);
+            ui.horizontal_wrapped(|ui| {
+                for accent in theme::all_accents() {
+                    if settings_accent_button(
+                        ui,
+                        self.theme_accent == accent,
+                        theme_accent_label(self.language, accent),
+                        theme::accent_color(accent),
+                    )
+                    .clicked()
+                    {
+                        self.set_theme_accent(accent);
+                    }
                 }
-            }
+            });
         });
         ui.add_space(8.0);
         settings_field(ui, i18n::t(language, "settings.language"), |ui| {
@@ -18684,6 +18787,9 @@ fn workspace_card_shadow_light() -> Color32 {
 
 const WORKSPACE_INSET_DARK_ALPHAS: [f32; 7] = [0.16, 0.12, 0.085, 0.058, 0.038, 0.024, 0.014];
 const WORKSPACE_INSET_LIGHT_ALPHAS: [f32; 5] = [0.42, 0.27, 0.16, 0.09, 0.045];
+const WORKSPACE_INSET_DARK_MODE_DARK_ALPHAS: [f32; 7] =
+    [0.34, 0.24, 0.16, 0.10, 0.065, 0.040, 0.024];
+const WORKSPACE_INSET_DARK_MODE_LIGHT_ALPHAS: [f32; 5] = [0.34, 0.21, 0.12, 0.068, 0.034];
 const WORKSPACE_INSET_LAYER_STEP: f32 = 0.78;
 
 #[derive(Clone, Copy)]
@@ -18823,8 +18929,18 @@ fn paint_workspace_inset_arc(
 fn paint_workspace_card_inset_shadow(ui: &Ui, rect: Rect) {
     let dark = workspace_card_shadow_dark();
     let light = workspace_card_shadow_light();
+    let dark_alphas = if theme::current_mode() == theme::ThemeMode::Dark {
+        &WORKSPACE_INSET_DARK_MODE_DARK_ALPHAS
+    } else {
+        &WORKSPACE_INSET_DARK_ALPHAS
+    };
+    let light_alphas = if theme::current_mode() == theme::ThemeMode::Dark {
+        &WORKSPACE_INSET_DARK_MODE_LIGHT_ALPHAS
+    } else {
+        &WORKSPACE_INSET_LIGHT_ALPHAS
+    };
 
-    for (layer, alpha) in WORKSPACE_INSET_DARK_ALPHAS.iter().copied().enumerate() {
+    for (layer, alpha) in dark_alphas.iter().copied().enumerate() {
         paint_workspace_inset_edge(ui, rect, WorkspaceInsetEdge::Top, layer, dark, alpha);
         paint_workspace_inset_edge(ui, rect, WorkspaceInsetEdge::Left, layer, dark, alpha);
         paint_workspace_inset_arc(ui, rect, WorkspaceInsetCorner::TopLeft, layer, dark, alpha);
@@ -18838,7 +18954,7 @@ fn paint_workspace_card_inset_shadow(ui: &Ui, rect: Rect) {
         );
     }
 
-    for (layer, alpha) in WORKSPACE_INSET_LIGHT_ALPHAS.iter().copied().enumerate() {
+    for (layer, alpha) in light_alphas.iter().copied().enumerate() {
         paint_workspace_inset_edge(ui, rect, WorkspaceInsetEdge::Bottom, layer, light, alpha);
         paint_workspace_inset_edge(ui, rect, WorkspaceInsetEdge::Right, layer, light, alpha);
         paint_workspace_inset_arc(
@@ -19409,6 +19525,9 @@ fn resize_handle_rect(rect: Rect, vertical: bool) -> Rect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiIcon {
     Commit,
+    Message,
+    Hash,
+    Source,
     Undo,
     Redo,
     Pull,
@@ -19435,6 +19554,7 @@ enum UiIcon {
     ResourceManager,
     CherryPick,
     Warning,
+    User,
     More,
     Loading,
 }
@@ -20116,6 +20236,24 @@ fn tool_row_corners() -> CornerRadius {
     }
 }
 
+fn top_bar_shadow_for_mode(mode: theme::ThemeMode) -> egui::epaint::Shadow {
+    if mode == theme::ThemeMode::Dark {
+        // On a near-black background, layered drop shadows read as square
+        // protrusions around the rounded top-bar shell instead of depth.
+        egui::epaint::Shadow::NONE
+    } else {
+        panel_shadow()
+    }
+}
+
+fn top_bar_shadow() -> egui::epaint::Shadow {
+    top_bar_shadow_for_mode(theme::current_mode())
+}
+
+fn tab_shadows_enabled() -> bool {
+    theme::current_mode() != theme::ThemeMode::Dark
+}
+
 fn inline_button_width(
     ui: &Ui,
     label: &str,
@@ -20157,6 +20295,21 @@ fn icon_button(ui: &mut Ui, icon: UiIcon, tooltip: &str, enabled: bool) -> egui:
 fn toolbar_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool) -> egui::Response {
     let icon = toolbar_icon(icon, label);
     AppButton::toolbar(icon, label, enabled).show(ui)
+}
+
+fn responsive_global_action_button(
+    ui: &mut Ui,
+    icon: &str,
+    label: &str,
+    enabled: bool,
+    presentation: GlobalActionPresentation,
+) -> egui::Response {
+    match presentation {
+        GlobalActionPresentation::Full => toolbar_button(ui, icon, label, enabled),
+        GlobalActionPresentation::Compact => {
+            icon_button(ui, toolbar_icon(icon, label), label, enabled)
+        }
+    }
 }
 
 fn repo_toolbar_loading_indicator(ui: &mut Ui, label: &str) {
@@ -20205,8 +20358,7 @@ fn repo_toolbar_background_indicator(ui: &mut Ui, ctx: &egui::Context, label: &s
 }
 
 fn themed_text_edit_selection(ui: &mut Ui) {
-    ui.visuals_mut().selection.bg_fill = theme::accent_soft();
-    ui.visuals_mut().selection.stroke = Stroke::NONE;
+    theme::apply_text_edit_selection_visuals(ui.visuals_mut());
 }
 
 fn placeholder_for_label(language: Language, label: &str) -> String {
@@ -20567,6 +20719,9 @@ fn toolbar_icon(raw: &str, _label: &str) -> UiIcon {
 fn icon_source(icon: UiIcon) -> egui::ImageSource<'static> {
     match icon {
         UiIcon::Commit => egui::include_image!("../assets/icons/commit.svg"),
+        UiIcon::Message => egui::include_image!("../assets/icons/message.svg"),
+        UiIcon::Hash => egui::include_image!("../assets/icons/hash.svg"),
+        UiIcon::Source => egui::include_image!("../assets/icons/source.svg"),
         UiIcon::Undo => egui::include_image!("../assets/icons/undo.svg"),
         UiIcon::Redo => egui::include_image!("../assets/icons/redo.svg"),
         UiIcon::Pull => egui::include_image!("../assets/icons/pull.svg"),
@@ -20593,6 +20748,7 @@ fn icon_source(icon: UiIcon) -> egui::ImageSource<'static> {
         UiIcon::ResourceManager => egui::include_image!("../assets/icons/resource-manager.svg"),
         UiIcon::CherryPick => egui::include_image!("../assets/icons/cherry-pick.svg"),
         UiIcon::Warning => egui::include_image!("../assets/icons/warning.svg"),
+        UiIcon::User => egui::include_image!("../assets/icons/user.svg"),
         UiIcon::More => egui::include_image!("../assets/icons/more.svg"),
         UiIcon::Loading => egui::include_image!("../assets/icons/loading.svg"),
     }
@@ -20763,7 +20919,7 @@ fn hover_submenu_button_enabled(
         let text_color = if enabled {
             theme::text()
         } else {
-            theme::muted()
+            theme::menu_disabled()
         };
         if submenu_open {
             paint_text_button_hover_shadow(ui, rect);
@@ -20817,19 +20973,24 @@ fn hover_submenu_button_enabled(
 
 fn apply_menu_style(style: &mut egui::Style) {
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.noninteractive.fg_stroke.color = theme::menu_disabled();
     style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
     style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.inactive.fg_stroke.color = theme::text();
     style.visuals.widgets.hovered.bg_fill = menu_text_button_hover_fill();
     style.visuals.widgets.hovered.weak_bg_fill = menu_text_button_hover_fill();
     style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.hovered.fg_stroke.color = theme::text();
     style.visuals.widgets.open.bg_fill = menu_text_button_hover_fill();
     style.visuals.widgets.open.weak_bg_fill = menu_text_button_hover_fill();
     style.visuals.widgets.open.bg_stroke = Stroke::NONE;
+    style.visuals.widgets.open.fg_stroke.color = theme::text();
     style.visuals.widgets.active.bg_fill = menu_text_button_hover_fill();
     style.visuals.widgets.active.weak_bg_fill = menu_text_button_hover_fill();
     style.visuals.widgets.active.bg_stroke = Stroke::NONE;
-    style.visuals.selection.stroke = Stroke::NONE;
+    style.visuals.widgets.active.fg_stroke.color = theme::text();
+    theme::apply_selected_item_visuals(&mut style.visuals);
     style.visuals.window_stroke = Stroke::NONE;
     style.visuals.window_shadow = menu_popup_shadow();
     style.visuals.popup_shadow = menu_popup_shadow();
@@ -21152,16 +21313,22 @@ fn settings_theme_accent_title(language: Language) -> &'static str {
 
 fn theme_accent_label(language: Language, accent: theme::ThemeAccent) -> &'static str {
     match (language, accent) {
-        (Language::Chinese, theme::ThemeAccent::Green) => "\u{7eff}\u{8272}",
-        (Language::Chinese, theme::ThemeAccent::Blue) => "\u{84dd}\u{8272}",
-        (Language::Chinese, theme::ThemeAccent::Purple) => "\u{7d2b}\u{8272}",
-        (Language::Chinese, theme::ThemeAccent::Rose) => "\u{73ab}\u{7ea2}",
-        (Language::Chinese, theme::ThemeAccent::Orange) => "\u{6a59}\u{8272}",
-        (_, theme::ThemeAccent::Green) => "Green",
-        (_, theme::ThemeAccent::Blue) => "Blue",
-        (_, theme::ThemeAccent::Purple) => "Purple",
-        (_, theme::ThemeAccent::Rose) => "Rose",
-        (_, theme::ThemeAccent::Orange) => "Orange",
+        (Language::Chinese, theme::ThemeAccent::Blue) => "\u{5929}\u{7a7a}\u{84dd}",
+        (Language::Chinese, theme::ThemeAccent::Green) => "\u{8367}\u{5149}\u{7eff}",
+        (Language::Chinese, theme::ThemeAccent::Purple) => "\u{8bf1}\u{60d1}\u{7d2b}",
+        (Language::Chinese, theme::ThemeAccent::Rose) => "\u{73ab}\u{7470}\u{7ea2}",
+        (Language::Chinese, theme::ThemeAccent::Orange) => "\u{7ef4}C\u{6a59}",
+        (Language::Chinese, theme::ThemeAccent::SunRed) => "\u{592a}\u{9633}\u{7ea2}",
+        (Language::Chinese, theme::ThemeAccent::DeepSeaBlue) => "\u{6df1}\u{6d77}\u{84dd}",
+        (Language::Chinese, theme::ThemeAccent::ForestGreen) => "\u{68ee}\u{7cfb}\u{7eff}",
+        (_, theme::ThemeAccent::Blue) => "Sky Blue",
+        (_, theme::ThemeAccent::Green) => "Neon Green",
+        (_, theme::ThemeAccent::Purple) => "Tempting Purple",
+        (_, theme::ThemeAccent::Rose) => "Rose Red",
+        (_, theme::ThemeAccent::Orange) => "Vc Orange",
+        (_, theme::ThemeAccent::SunRed) => "Sun Red",
+        (_, theme::ThemeAccent::DeepSeaBlue) => "Deep Sea Blue",
+        (_, theme::ThemeAccent::ForestGreen) => "Forest Green",
     }
 }
 
@@ -21278,7 +21445,7 @@ fn table_header_cell(ui: &mut Ui, label: &str, width: f32) {
 fn source_tree_panel_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(theme::bg())
-        .shadow(panel_shadow())
+        .shadow(top_bar_shadow())
         .inner_margin(egui::Margin::symmetric(8, 8))
 }
 
@@ -21468,7 +21635,7 @@ fn history_branch_scope_dropdown(
         egui::popup::PopupCloseBehavior::CloseOnClick,
         |ui| {
             apply_menu_visuals(ui);
-            ui.set_min_width(rect.width());
+            ui.set_min_width(rect.width().max(HISTORY_BRANCH_SCOPE_POPUP_MIN_WIDTH));
             let mut selected = None;
             if history_toolbar_popup_option(
                 ui,
@@ -21559,13 +21726,19 @@ fn history_toolbar_dropdown_button(
         theme::panel_soft()
     };
     ui.painter().rect_filled(rect, CornerRadius::same(2), fill);
-    ui.painter().text(
-        Pos2::new(rect.left() + 10.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(13.0),
-        theme::text(),
+    let label_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + 10.0, rect.top()),
+        Pos2::new(rect.right() - 24.0, rect.bottom()),
     );
+    ui.painter()
+        .with_clip_rect(label_rect.intersect(ui.clip_rect()))
+        .text(
+            label_rect.left_center(),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(13.0),
+            theme::text(),
+        );
     let arrow = Pos2::new(rect.right() - 13.0, rect.center().y + 1.0);
     ui.painter().line_segment(
         [Pos2::new(arrow.x - 4.0, arrow.y - 3.0), arrow],
@@ -22087,7 +22260,7 @@ fn history_commit_browser(
     if config.show_view_controls {
         let branch_rect = Rect::from_min_size(
             Pos2::new(control_left, control_top),
-            Vec2::new(102.0, control_height),
+            Vec2::new(HISTORY_BRANCH_SCOPE_CONTROL_WIDTH, control_height),
         );
         if let Some(scope) = history_branch_scope_dropdown(ui, branch_rect, language, *branch_scope)
         {
@@ -23037,13 +23210,24 @@ fn history_ref_badge_fill(
     selected: bool,
 ) -> Color32 {
     if selected {
-        return Color32::from_rgb(232, 245, 255);
+        return theme::accent_soft();
     }
     match label.kind {
-        HistoryRefKind::Tag => Color32::from_rgb(246, 226, 160),
+        HistoryRefKind::Tag => {
+            if theme::current_mode() == theme::ThemeMode::Dark {
+                theme::warning().gamma_multiply(0.34)
+            } else {
+                Color32::from_rgb(246, 226, 160)
+            }
+        }
         HistoryRefKind::Branch => {
             let lane = history_ref_lane_color(&label.name, row);
-            Color32::from_rgba_unmultiplied(lane.r(), lane.g(), lane.b(), 64)
+            let alpha = if theme::current_mode() == theme::ThemeMode::Dark {
+                108
+            } else {
+                64
+            };
+            Color32::from_rgba_unmultiplied(lane.r(), lane.g(), lane.b(), alpha)
         }
     }
 }
@@ -23054,19 +23238,42 @@ fn history_ref_badge_text_color(
     selected: bool,
 ) -> Color32 {
     if selected {
-        return Color32::from_rgb(26, 65, 112);
+        return theme::text();
     }
     match label.kind {
-        HistoryRefKind::Tag => Color32::from_rgb(112, 77, 8),
+        HistoryRefKind::Tag => {
+            if theme::current_mode() == theme::ThemeMode::Dark {
+                history_ref_tinted_near_white(theme::warning())
+            } else {
+                Color32::from_rgb(112, 77, 8)
+            }
+        }
         HistoryRefKind::Branch => {
             let lane = history_ref_lane_color(&label.name, row);
-            Color32::from_rgb(
-                (lane.r() as f32 * 0.72) as u8,
-                (lane.g() as f32 * 0.72) as u8,
-                (lane.b() as f32 * 0.72) as u8,
-            )
+            if theme::current_mode() == theme::ThemeMode::Dark {
+                history_ref_tinted_near_white(lane)
+            } else {
+                Color32::from_rgb(
+                    (lane.r() as f32 * 0.72) as u8,
+                    (lane.g() as f32 * 0.72) as u8,
+                    (lane.b() as f32 * 0.72) as u8,
+                )
+            }
         }
     }
+}
+
+fn history_ref_tinted_near_white(hue: Color32) -> Color32 {
+    let base = theme::text();
+    const HUE_WEIGHT: f32 = 0.28;
+    let mix = |near_white: u8, hue: u8| {
+        (near_white as f32 + (hue as f32 - near_white as f32) * HUE_WEIGHT).round() as u8
+    };
+    Color32::from_rgb(
+        mix(base.r(), hue.r()),
+        mix(base.g(), hue.g()),
+        mix(base.b(), hue.b()),
+    )
 }
 
 fn history_ref_lane_color(name: &str, row: Option<&graph::GraphRow>) -> Color32 {
@@ -23162,6 +23369,109 @@ fn draw_clipped_cell(
             FontId::proportional(12.0)
         },
         color,
+    );
+}
+
+fn commit_summary_card(
+    ui: &mut Ui,
+    _language: Language,
+    commit: &Commit,
+    details: Option<&CommitDetails>,
+) {
+    let parent_text = commit
+        .parents
+        .iter()
+        .map(|parent| parent.chars().take(8).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fallback_branches = commit_refs_for_display(commit, true, true, false)
+        .into_iter()
+        .map(|reference| reference.name)
+        .collect::<Vec<_>>();
+    let branches = details
+        .map(|details| details.branches.as_slice())
+        .filter(|branches| !branches.is_empty())
+        .map(|branches| branches.join(", "))
+        .or_else(|| (!fallback_branches.is_empty()).then(|| fallback_branches.join(", ")))
+        .unwrap_or_else(|| "—".to_owned());
+    let committer = details
+        .map(|details| details.committer.trim())
+        .filter(|committer| !committer.is_empty())
+        .unwrap_or(commit.author.as_str());
+    let when = if commit.date.is_empty() {
+        commit.relative_time.as_str()
+    } else {
+        commit.date.as_str()
+    };
+    ui.horizontal(|ui| {
+        commit_summary_icon(ui, UiIcon::Message, theme::accent());
+        ui.add(
+            egui::Label::new(RichText::new(&commit.subject).strong().color(theme::text())).wrap(),
+        );
+    });
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        commit_summary_value(
+            ui,
+            UiIcon::Hash,
+            &format!("{} [{}]", commit.hash, commit.short_hash),
+            true,
+            true,
+        );
+        if !parent_text.is_empty() {
+            commit_summary_value(ui, UiIcon::Source, &parent_text, true, false);
+        }
+        commit_summary_value(ui, UiIcon::User, &commit.author, false, false);
+        commit_summary_value(ui, UiIcon::History, when, false, false);
+        if committer != commit.author {
+            commit_summary_value(ui, UiIcon::User, committer, false, false);
+        }
+        if branches != "—" {
+            commit_summary_value(ui, UiIcon::Branch, &branches, false, false);
+        }
+    });
+}
+
+fn commit_summary_icon(ui: &mut Ui, icon: UiIcon, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+    paint_ui_icon(ui, rect, icon, color);
+}
+
+fn commit_summary_value(ui: &mut Ui, icon: UiIcon, value: &str, monospace: bool, primary: bool) {
+    let font = if monospace {
+        FontId::monospace(11.5)
+    } else {
+        FontId::proportional(11.5)
+    };
+    let desired_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(value.to_owned(), font.clone(), theme::text())
+            .size()
+            .x
+            + 26.0
+    });
+    let available_width = ui.available_width().max(72.0);
+    let width = desired_width.clamp(72.0, available_width);
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, 20.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            commit_summary_icon(
+                ui,
+                icon,
+                if primary {
+                    theme::accent()
+                } else {
+                    theme::muted()
+                },
+            );
+            let text = RichText::new(value).font(font).color(if primary {
+                theme::text()
+            } else {
+                theme::muted()
+            });
+            ui.add(egui::Label::new(text).selectable(true).wrap());
+        },
     );
 }
 
@@ -23732,7 +24042,7 @@ enum RepoTabShadowSide {
 }
 
 fn paint_connected_tab_shadow_for_state(ui: &mut Ui, rect: Rect, visuals: TabVisualState) {
-    if visuals.shadow {
+    if visuals.shadow && tab_shadows_enabled() {
         paint_repo_tab_shadow(ui, rect, visuals.bottom_shadow);
     }
 }
@@ -24996,7 +25306,20 @@ fn settings_accent_button(
     label: &str,
     swatch: Color32,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(88.0, 30.0), Sense::click());
+    let font = FontId::proportional(13.0);
+    let text_color = if selected {
+        Color32::WHITE
+    } else {
+        theme::text()
+    };
+    let label_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_owned(), font.clone(), text_color)
+            .size()
+            .x
+    });
+    let width = (label_width + 32.0).max(88.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
     let fill = if selected {
         theme::accent_deep()
     } else if response.hovered() {
@@ -25022,12 +25345,8 @@ fn settings_accent_button(
         Pos2::new(swatch_rect.right() + 6.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(13.0),
-        if selected {
-            Color32::WHITE
-        } else {
-            theme::text()
-        },
+        font,
+        text_color,
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -26445,11 +26764,11 @@ fn paint_branch_row_badges(
     let mut painted = false;
     if let Some(counts) = sync_counts {
         if let Some(label) = upstream_pull_badge(Some(counts)) {
-            right = paint_branch_badge_at(ui, row_rect, right, &label, theme::accent_deep());
+            right = paint_branch_sync_badge_at(ui, row_rect, right, &label);
             painted = true;
         }
         if let Some(label) = upstream_push_badge(Some(counts)) {
-            right = paint_branch_badge_at(ui, row_rect, right, &label, theme::text());
+            right = paint_branch_sync_badge_at(ui, row_rect, right, &label);
             painted = true;
         }
     }
@@ -26476,7 +26795,23 @@ fn paint_branch_row_badges(
 }
 
 fn paint_branch_current_badge_at(ui: &mut Ui, row_rect: Rect, right: f32, label: &str) -> f32 {
-    paint_branch_badge_at(ui, row_rect, right, label, theme::accent_deep())
+    paint_branch_badge_at(
+        ui,
+        row_rect,
+        right,
+        label,
+        theme::accent_deep(),
+        Color32::WHITE,
+    )
+}
+
+fn paint_branch_sync_badge_at(ui: &mut Ui, row_rect: Rect, right: f32, label: &str) -> f32 {
+    let text = if theme::current_mode() == theme::ThemeMode::Dark {
+        theme::accent()
+    } else {
+        theme::accent_deep()
+    };
+    paint_branch_badge_at(ui, row_rect, right, label, theme::accent_soft(), text)
 }
 
 fn paint_branch_badge_at(
@@ -26485,10 +26820,11 @@ fn paint_branch_badge_at(
     right: f32,
     label: &str,
     fill: Color32,
+    text: Color32,
 ) -> f32 {
     let text_width = ui.fonts(|fonts| {
         fonts
-            .layout_no_wrap(label.to_owned(), FontId::proportional(10.5), Color32::WHITE)
+            .layout_no_wrap(label.to_owned(), FontId::proportional(10.5), text)
             .rect
             .width()
     });
@@ -26506,7 +26842,7 @@ fn paint_branch_badge_at(
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(10.5),
-        Color32::WHITE,
+        text,
     );
     rect.left() - 4.0
 }
@@ -28014,11 +28350,11 @@ fn diff_row(
     let row_clip = diff_row_clip_rect(ui, rect);
     let painter = ui.painter().with_clip_rect(row_clip);
     let fill = if selected {
-        Color32::from_rgb(82, 168, 236)
+        theme::diff_selected()
     } else {
         match line.kind {
-            DiffKind::Added => Color32::from_rgb(214, 250, 221),
-            DiffKind::Removed => Color32::from_rgb(255, 226, 226),
+            DiffKind::Added => theme::diff_added_bg(),
+            DiffKind::Removed => theme::diff_removed_bg(),
             DiffKind::Context => Color32::TRANSPARENT,
         }
     };
@@ -28026,9 +28362,9 @@ fn diff_row(
         Color32::WHITE
     } else {
         match line.kind {
-            DiffKind::Added => Color32::from_rgb(16, 92, 42),
-            DiffKind::Removed => Color32::from_rgb(142, 37, 37),
-            DiffKind::Context => Color32::from_rgb(71, 82, 96),
+            DiffKind::Added => theme::diff_added_text(),
+            DiffKind::Removed => theme::diff_removed_text(),
+            DiffKind::Context => theme::diff_context_text(),
         }
     };
     if fill != Color32::TRANSPARENT {
@@ -28052,9 +28388,9 @@ fn diff_row(
         gutter_bg,
         CornerRadius::ZERO,
         if selected {
-            Color32::from_rgb(74, 151, 214)
+            theme::diff_selected_gutter()
         } else {
-            Color32::from_rgb(248, 250, 252)
+            theme::diff_gutter()
         },
     );
     painter.line_segment(
@@ -28065,16 +28401,16 @@ fn diff_row(
         Stroke::new(
             1.0,
             if selected {
-                Color32::from_rgb(67, 137, 195)
+                theme::diff_selected_gutter()
             } else {
-                Color32::from_rgb(224, 229, 236)
+                theme::diff_gutter_border()
             },
         ),
     );
     let gutter = if selected {
-        Color32::from_rgb(235, 247, 255)
+        theme::diff_selected_gutter_text()
     } else {
-        Color32::from_rgb(124, 135, 148)
+        theme::diff_gutter_text()
     };
     painter.text(
         Pos2::new(
@@ -28149,7 +28485,7 @@ fn draw_diff_indent_guides(ui: &mut Ui, text_rect: Rect, body: &str) {
     let painter = ui
         .painter()
         .with_clip_rect(text_rect.intersect(ui.clip_rect()));
-    let dot_color = Color32::from_rgb(190, 198, 210);
+    let dot_color = theme::diff_indent_guide();
     let mut column = 0usize;
     for ch in body.chars() {
         match ch {
@@ -29261,20 +29597,6 @@ fn interactive_rebase_dialog_commits(
     };
     commits.truncate(limit);
     commits
-}
-
-fn interactive_rebase_commits_for_scope(
-    snapshot: &RepositorySnapshot,
-    scope: InteractiveRebaseScope,
-    base_hash: &str,
-    order: HistorySortOrder,
-) -> Vec<Commit> {
-    match scope {
-        InteractiveRebaseScope::LocalUnpushed => interactive_rebase_dialog_commits(snapshot, order),
-        InteractiveRebaseScope::ChildrenOfCommit => {
-            interactive_rebase_children_of_commit(snapshot, base_hash, order)
-        }
-    }
 }
 
 fn interactive_rebase_children_of_commit(
@@ -30594,7 +30916,7 @@ fn apply_searchable_dropdown_visuals(ui: &mut Ui) {
     visuals.window_stroke = Stroke::NONE;
     visuals.window_shadow = menu_popup_shadow();
     visuals.popup_shadow = menu_popup_shadow();
-    visuals.selection.stroke = Stroke::NONE;
+    theme::apply_selected_item_visuals(visuals);
     visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
     visuals.widgets.hovered.bg_stroke = Stroke::NONE;
@@ -30606,8 +30928,13 @@ fn paint_recessed_control_shadow(ui: &Ui, rect: Rect) {
     // Keep every shadow pixel inside the widget clip rect. Controls placed
     // flush against a panel edge otherwise lose their left rounded corner.
     let rect = rect.shrink(1.0);
-    let dark = theme::inset_shadow().gamma_multiply(0.3);
-    let light = theme::inset_highlight().gamma_multiply(0.22);
+    let (dark_strength, light_strength) = if theme::current_mode() == theme::ThemeMode::Dark {
+        (0.60, 0.46)
+    } else {
+        (0.30, 0.22)
+    };
+    let dark = theme::inset_shadow().gamma_multiply(dark_strength);
+    let light = theme::inset_highlight().gamma_multiply(light_strength);
     let radius = 4.0;
     let corner_step = radius * 0.293;
 
@@ -30631,22 +30958,6 @@ fn paint_recessed_control_shadow(ui: &Ui, rect: Rect) {
         ],
         Stroke::new(1.0, light),
     ));
-}
-
-fn recessed_horizontal_separator(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
-    let dark = theme::inset_shadow().gamma_multiply(0.28);
-    let light = theme::inset_highlight().gamma_multiply(0.2);
-    let shadow = Rect::from_min_max(
-        Pos2::new(rect.left(), rect.center().y - 1.0),
-        Pos2::new(rect.right(), rect.center().y + 1.0),
-    );
-    let highlight = Rect::from_min_max(
-        Pos2::new(rect.left(), shadow.bottom()),
-        Pos2::new(rect.right(), shadow.bottom() + 1.0),
-    );
-    ui.painter().rect_filled(shadow, 0.0, dark);
-    ui.painter().rect_filled(highlight, 0.0, light);
 }
 
 fn git_flow_start_point_row(
@@ -31928,7 +32239,7 @@ mod ui_tests {
                 .contains(".rect_filled(full, window_top_corner_radius(ui.ctx()), theme::bg())")
         );
         assert!(top_bar_source.contains(".fill(theme::chrome_bg())"));
-        assert!(top_bar_source.contains(".shadow(panel_shadow())"));
+        assert!(top_bar_source.contains(".shadow(top_bar_shadow())"));
         assert!(top_bar_source.contains(".paint(top_island_rect)"));
         assert!(
             top_bar_source.contains("paint_layout_debug_rect(ui, top_island_rect, \"top.island\"")
@@ -31966,7 +32277,7 @@ mod ui_tests {
             top_bar_source
                 .contains("let global_action_row = tab_right.translate(Vec2::new(0.0, TOP_BAR_GLOBAL_ACTION_Y_OFFSET));")
         );
-        assert!(top_bar_source.contains("top_bar_drag_region(ctx, ui, tab_right"));
+        assert!(!top_bar_source.contains("top_bar_drag_region(ctx, ui, tab_right"));
         assert!(top_bar_source.contains("let tool_content_row = tool_row_panel_rect"));
         assert!(top_bar_source.contains(".map(|rect| Rect::from_min_max(rect.left_top()"));
         assert!(top_bar_source.contains("if let Some(tool_content_row) = tool_content_row"));
@@ -31993,18 +32304,28 @@ mod ui_tests {
             .find("if !self.repository_source_active()")
             .unwrap();
         let tab_right_source = &source[tab_right_start..tab_right_start + tab_right_end];
-        assert!(tab_right_source.contains("toolbar_button(ui, \"settings\""));
-        assert!(tab_right_source.contains("toolbar_button(ui, \"git-flow\""));
-        assert!(tab_right_source.contains("toolbar_button(ui, \"remote\""));
-        assert!(tab_right_source.contains("toolbar_button(ui, \"terminal\""));
-        assert!(tab_right_source.contains(
-            "toolbar_button(\n                    ui,\n                    \"resource-manager\""
-        ));
+        assert!(tab_right_source.contains("ui.set_clip_rect(global_action_row);"));
+        assert!(tab_right_source.contains("responsive_global_action_button(\n                    ui,\n                    \"settings\""));
+        assert!(tab_right_source.contains("\"git-flow\""));
+        assert!(tab_right_source.contains("\"remote\""));
+        assert!(tab_right_source.contains("\"terminal\""));
+        assert!(tab_right_source.contains("\"resource-manager\""));
+        assert!(top_bar_source.contains("let global_action_labels = ["));
+        assert!(top_bar_source.contains("global_action_row_width("));
+        assert!(top_bar_source.contains("global_action_presentation("));
         assert!(!tab_right_source.contains("toolbar_button(ui, \"open\""));
         assert!(
             !tab_right_source.contains(
                 "toolbar_button(\n                    ui,\n                    \"refresh\""
             )
+        );
+        assert_eq!(
+            global_action_presentation(500.0, 500.0),
+            GlobalActionPresentation::Full
+        );
+        assert_eq!(
+            global_action_presentation(500.0, 499.0),
+            GlobalActionPresentation::Compact
         );
         assert_eq!(
             menu_label(Language::Chinese, "tools"),
@@ -33184,10 +33505,24 @@ mod ui_tests {
                 .contains("let mut right = row_rect.right() - BRANCH_CURRENT_BADGE_RIGHT_GAP;")
         );
         assert!(badge_source.contains("paint_branch_badge_at("));
+        assert!(badge_source.contains("paint_branch_sync_badge_at("));
         assert!(badge_source.contains("Rect::from_center_size("));
         assert!(badge_source.contains("right - width / 2.0"));
         assert!(badge_source.contains("row_rect.center().y + BRANCH_CURRENT_BADGE_Y_OFFSET"));
         assert!(!badge_source.contains("BRANCH_CURRENT_BADGE_Y_OFFSET: f32 = 2.5"));
+
+        let sync_badge_start = implementation_source
+            .find("fn paint_branch_sync_badge_at(")
+            .unwrap();
+        let sync_badge_end = implementation_source[sync_badge_start..]
+            .find("fn paint_branch_badge_at(")
+            .unwrap();
+        let sync_badge_source =
+            &implementation_source[sync_badge_start..sync_badge_start + sync_badge_end];
+        assert!(sync_badge_source.contains("theme::accent_soft()"));
+        assert!(sync_badge_source.contains("theme::accent_deep()"));
+        assert!(sync_badge_source.contains("theme::accent()"));
+        assert!(!sync_badge_source.contains("Color32::WHITE"));
     }
 
     #[test]
@@ -33791,6 +34126,17 @@ mod ui_tests {
         assert!(desc_source.contains("history_ref_badge_fill("));
         assert!(desc_source.contains("HistoryRefKind::Tag"));
         assert!(desc_source.contains("paint_ui_icon(ui, icon_rect, UiIcon::Tag"));
+
+        let color_start = implementation_source
+            .find("fn history_ref_badge_text_color(")
+            .unwrap();
+        let color_end = implementation_source[color_start..]
+            .find("fn history_ref_lane_color(")
+            .unwrap();
+        let color_source = &implementation_source[color_start..color_start + color_end];
+        assert!(color_source.contains("history_ref_tinted_near_white(theme::warning())"));
+        assert!(color_source.contains("history_ref_tinted_near_white(lane)"));
+        assert!(color_source.contains("const HUE_WEIGHT: f32 = 0.28"));
     }
 
     #[test]
@@ -33849,6 +34195,7 @@ mod ui_tests {
         assert!(controls_source.contains("history_sort_order_dropdown("));
         assert!(controls_source.contains("history_toolbar_checkbox_at("));
         assert!(!controls_source.contains("egui::Checkbox::new("));
+        assert!(controls_source.contains("HISTORY_BRANCH_SCOPE_CONTROL_WIDTH"));
 
         let dropdown_start = source.find("fn history_toolbar_dropdown_button(").unwrap();
         let dropdown_end = source[dropdown_start..]
@@ -33859,6 +34206,17 @@ mod ui_tests {
         assert!(dropdown_source.contains("(id_salt, \"popup\")"));
         assert!(dropdown_source.contains("ui.interact(rect, button_id"));
         assert!(dropdown_source.contains("toggle_popup(popup_id)"));
+        assert!(dropdown_source.contains("with_clip_rect(label_rect.intersect(ui.clip_rect()))"));
+        let branch_dropdown_start = source.find("fn history_branch_scope_dropdown(").unwrap();
+        let branch_dropdown_end = source[branch_dropdown_start..]
+            .find("fn history_sort_order_dropdown(")
+            .unwrap();
+        let branch_dropdown_source =
+            &source[branch_dropdown_start..branch_dropdown_start + branch_dropdown_end];
+        assert!(
+            branch_dropdown_source
+                .contains("rect.width().max(HISTORY_BRANCH_SCOPE_POPUP_MIN_WIDTH)")
+        );
 
         let checkbox_start = source.find("fn history_toolbar_checkbox_at(").unwrap();
         let checkbox_end = source[checkbox_start..]
@@ -34327,14 +34685,16 @@ mod ui_tests {
 
         assert!(editor_source.contains(".text_color(theme::text())"));
         assert!(editor_ui_source.contains("themed_text_edit_selection(ui);"));
-        assert!(helper_source.contains("selection.bg_fill = theme::accent_soft()"));
-        assert!(helper_source.contains("selection.stroke = Stroke::NONE"));
+        assert!(
+            helper_source.contains("theme::apply_text_edit_selection_visuals(ui.visuals_mut())")
+        );
         assert!(submit_source.contains("theme::accent_deep()"));
         assert!(submit_source.contains("Color32::WHITE"));
         assert!(submit_source.contains("Sense::click()"));
         assert!(submit_source.contains("Sense::hover()"));
         assert!(theme_source.contains("visuals.selection.stroke"));
-        assert!(theme_source.contains("visuals.selection.stroke = Stroke::NONE"));
+        assert!(theme_source.contains("apply_selected_item_visuals(&mut visuals)"));
+        assert!(theme_source.contains("pub fn apply_selected_item_visuals"));
     }
 
     #[test]
@@ -34429,8 +34789,9 @@ mod ui_tests {
         assert!(helper_source.contains(".text_color(theme::text())"));
         assert!(helper_source.contains(".frame(false)"));
         assert!(helper_source.contains("paint_recessed_control_shadow(ui, response.rect);"));
-        assert!(helper_source.contains("selection.bg_fill = theme::accent_soft()"));
-        assert!(helper_source.contains("selection.stroke = Stroke::NONE"));
+        assert!(
+            helper_source.contains("theme::apply_text_edit_selection_visuals(ui.visuals_mut())")
+        );
     }
 
     #[test]
@@ -34463,8 +34824,25 @@ mod ui_tests {
         let top_bar_source = &implementation_source[top_bar_start..top_bar_start + top_bar_end];
 
         assert!(top_bar_source.contains("repo_tab_strip_rect(tab_row, source_active)"));
-        assert!(top_bar_source.contains("source_tab_left_drag_region"));
+        assert!(top_bar_source.contains("source_title_gap_drag_region"));
+        assert!(!top_bar_source.contains("source_tab_left_drag_region"));
+        assert!(!top_bar_source.contains("tab_right_drag_region"));
         assert!(top_bar_source.contains("if source_active {"));
+    }
+
+    #[test]
+    fn title_drag_rect_reserves_menu_and_resize_edge() {
+        let title_bar =
+            Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(900.0, TITLE_BAR_HEIGHT));
+        let drag = custom_title_drag_rect(title_bar, 128.0);
+
+        assert_eq!(TITLE_MENU_RESERVED_WIDTH, 500.0);
+        assert_eq!(TITLE_DRAG_TOP_INSET, 4.0);
+        assert_eq!(drag.left(), title_bar.left() + TITLE_MENU_RESERVED_WIDTH);
+        assert_eq!(drag.right(), title_bar.right() - 128.0);
+        assert_eq!(drag.bottom(), title_bar.bottom());
+        assert_eq!(drag.top(), title_bar.top() + TITLE_DRAG_TOP_INSET);
+        assert!(!drag.contains(title_bar.left_top()));
     }
 
     #[test]
@@ -34498,13 +34876,23 @@ mod ui_tests {
         assert!(!top_bar_source.contains("tab_right.contains(pos)"));
         assert!(!drag_source.contains("drag-region"));
         assert!(implementation_source.contains("fn custom_title_drag_rect("));
+        assert!(implementation_source.contains("TITLE_DRAG_TOP_INSET"));
         assert!(!implementation_source.contains("fn top_bar_press_drag_region("));
         assert!(top_bar_source.contains("source_title_gap_drag_region"));
         assert!(!top_bar_source.contains("source_title_row_drag_region"));
         assert!(
             title_bar_source
-                .contains("top_bar_drag_region(ctx, ui, drag_rect, \"custom_title_drag_region\")")
+                .contains("top_bar_drag_region(ui, drag_rect, \"custom_title_drag_region\")")
         );
+        assert!(title_bar_source.contains("max_rect(rect)"));
+        assert!(
+            title_bar_source.find("ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect)")
+                < title_bar_source
+                    .find("top_bar_drag_region(ui, drag_rect, \"custom_title_drag_region\")")
+        );
+        assert!(!implementation_source.contains("diagnostics::window_drag_probe("));
+        assert!(!implementation_source.contains("diagnostics::flush_window_drag_probes("));
+        assert!(implementation_source.contains("title_drag_layer: Option<Rect>"));
         assert!(top_bar_source.contains("top_bar_drag_region("));
         assert!(!top_bar_source.contains("top_bar_press_drag_region("));
     }
@@ -34528,7 +34916,7 @@ mod ui_tests {
         assert!(!title_bar_source.contains("source_active"));
         assert!(
             title_bar_source
-                .contains("top_bar_drag_region(ctx, ui, drag_rect, \"custom_title_drag_region\")")
+                .contains("top_bar_drag_region(ui, drag_rect, \"custom_title_drag_region\")")
         );
         assert!(top_bar_source.contains("self.custom_title_bar(ctx, ui, has_repo, has_remote);"));
         assert!(
@@ -34549,7 +34937,7 @@ mod ui_tests {
             .unwrap();
         let update_source = &implementation_source[update_start..update_start + update_end];
         let drag_start = implementation_source
-            .find("fn top_bar_drag_region(")
+            .find("fn request_native_title_drag_on_pointer_down(")
             .unwrap();
         let drag_end = implementation_source[drag_start..]
             .find("fn custom_title_bar(")
@@ -34557,9 +34945,18 @@ mod ui_tests {
         let drag_source = &implementation_source[drag_start..drag_start + drag_end];
 
         assert!(drag_source.contains("ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);"));
-        assert!(drag_source.contains("response.drag_started()"));
-        assert!(!drag_source.contains("if pointer_pressed && response.hovered()"));
+        assert!(drag_source.contains(".primary_pressed()"));
+        assert!(implementation_source.contains("title_drag_layer: Option<Rect>"));
+        assert!(drag_source.contains("drag_rect.contains(pointer_pos)"));
         assert!(!update_source.contains("if self.window_drag_requested_this_frame"));
+        assert!(
+            update_source
+                .find("self.request_native_title_drag_on_pointer_down(ctx);")
+                .unwrap()
+                < update_source.find("theme::apply_if_needed(").unwrap()
+        );
+        assert!(implementation_source.contains("diagnostics::record_window_drag_probe("));
+        assert!(implementation_source.contains("diagnostics::flush_window_drag_probe();"));
         assert!(update_source.contains("egui::CentralPanel::default()"));
     }
 
@@ -34778,6 +35175,8 @@ mod ui_tests {
         assert!(panel_source.contains("self.load_repository(path)"));
         assert!(implementation_source.contains("fn workspace_repository_snapshot_for("));
         assert!(implementation_source.contains("paths_equal(&snapshot.root, root)"));
+        assert!(implementation_source.contains("fn workspace_repository_has_unstaged("));
+        assert!(implementation_source.contains("fn workspace_repository_display_order("));
         assert!(implementation_source.contains("fn maybe_start_workspace_repository_status_load("));
         assert!(implementation_source.contains("Duration::from_millis(250)"));
         assert!(row_source.contains("snapshot.branch"));
@@ -36117,7 +36516,9 @@ mod ui_tests {
         assert!(menu_button_source.contains("widgets.hovered.bg_stroke = Stroke::NONE"));
         assert!(menu_button_source.contains("widgets.open.bg_stroke = Stroke::NONE"));
         assert!(menu_button_source.contains("widgets.active.bg_stroke = Stroke::NONE"));
-        assert!(menu_button_source.contains("selection.stroke = Stroke::NONE"));
+        assert!(
+            menu_button_source.contains("theme::apply_selected_item_visuals(&mut style.visuals)")
+        );
         assert!(menu_button_source.contains("paint_text_button_hover_shadow_for_response"));
         assert!(menu_visuals_source.contains("apply_menu_style(ui.style_mut())"));
         assert!(shortcut_source.contains("menu_text_button_with_text("));
@@ -36235,6 +36636,7 @@ mod ui_tests {
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
+            "commits: Vec<Commit>",
             "pending_interactive_rebase_action: Option<InteractiveRebaseActionDialog>",
             "struct InteractiveRebaseActionDialog",
             "fn open_interactive_rebase_dialog(&mut self)",
@@ -36276,6 +36678,8 @@ mod ui_tests {
             .find("fn merge_action_modal(")
             .unwrap();
         let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        assert!(dialog_source.contains("let commits = dialog.commits.clone();"));
+        assert!(!dialog_source.contains("interactive_rebase_commits_for_scope("));
         for required in [
             "show_view_controls: true",
             "show_search: true",
@@ -36300,6 +36704,35 @@ mod ui_tests {
             i18n::t(Language::Chinese, "interactive_rebase.in_progress.detail")
                 .contains("git rebase")
         );
+    }
+
+    #[test]
+    fn interactive_rebase_request_waits_for_history_and_continues_after_it_arrives() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_interactive_rebase_open_after_history: Option<PathBuf>",
+            "pending_interactive_rebase_open_after_history: None",
+            "self.pending_interactive_rebase_open_after_history = Some(snapshot.root.clone());",
+            "let open_interactive_rebase = self",
+            "self.open_interactive_rebase_dialog();",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let history_start = implementation_source
+            .find("fn apply_repository_history(")
+            .unwrap();
+        let history_end = implementation_source[history_start..]
+            .find("fn active_snapshot_matches_background_core_refresh(")
+            .unwrap();
+        let history_source = &implementation_source[history_start..history_start + history_end];
+        assert!(history_source.contains("if open_interactive_rebase"));
+        assert!(
+            history_source.contains("self.pending_interactive_rebase_open_after_history = None;")
+        );
+        assert!(history_source.contains("self.open_interactive_rebase_dialog();"));
     }
 
     #[test]
@@ -36476,7 +36909,7 @@ mod ui_tests {
         let linear_new = sample_commit("new", &["old"], "new");
         let commits = vec![linear_new.clone(), merge.clone(), linear_old.clone()];
         let mut dialog = InteractiveRebaseActionDialog {
-            scope: InteractiveRebaseScope::LocalUnpushed,
+            commits: commits.clone(),
             base_hash: "base".to_owned(),
             base_short_hash: "base".to_owned(),
             rewrites_published_history: false,
@@ -36544,7 +36977,7 @@ mod ui_tests {
         let new = sample_commit("new", &["old"], "new");
         let commits = vec![new.clone(), old.clone()];
         let mut dialog = InteractiveRebaseActionDialog {
-            scope: InteractiveRebaseScope::LocalUnpushed,
+            commits: commits.clone(),
             base_hash: "base".to_owned(),
             base_short_hash: "base".to_owned(),
             rewrites_published_history: false,
@@ -36598,7 +37031,7 @@ mod ui_tests {
         let c = sample_commit("c", &["b"], "c");
         let commits = vec![c.clone(), b.clone(), a.clone()];
         let mut dialog = InteractiveRebaseActionDialog {
-            scope: InteractiveRebaseScope::LocalUnpushed,
+            commits: commits.clone(),
             base_hash: "base".to_owned(),
             base_short_hash: "base".to_owned(),
             rewrites_published_history: false,
@@ -36674,7 +37107,7 @@ mod ui_tests {
         let c = sample_commit("c3333333", &["b2222222"], "gamma stays");
         let commits = vec![c.clone(), b.clone(), a.clone()];
         let mut dialog = InteractiveRebaseActionDialog {
-            scope: InteractiveRebaseScope::LocalUnpushed,
+            commits: commits.clone(),
             base_hash: "base".to_owned(),
             base_short_hash: "base".to_owned(),
             rewrites_published_history: false,
@@ -36750,7 +37183,7 @@ mod ui_tests {
         let new = sample_commit("new", &["old"], "new subject");
         let commits = vec![new.clone(), old.clone()];
         let mut dialog = InteractiveRebaseActionDialog {
-            scope: InteractiveRebaseScope::LocalUnpushed,
+            commits: commits.clone(),
             base_hash: "base".to_owned(),
             base_short_hash: "base".to_owned(),
             rewrites_published_history: false,
@@ -36906,7 +37339,7 @@ mod ui_tests {
         let e = sample_commit("e", &["d"], "e");
         let commits = vec![e.clone(), d.clone(), c.clone(), b.clone(), a.clone()];
         let mut dialog = InteractiveRebaseActionDialog {
-            scope: InteractiveRebaseScope::LocalUnpushed,
+            commits: commits.clone(),
             base_hash: "base".to_owned(),
             base_short_hash: "base".to_owned(),
             rewrites_published_history: false,
@@ -36982,7 +37415,7 @@ mod ui_tests {
         let new = sample_commit("newhash2", &["oldhash1"], "new");
         let commits = vec![new.clone(), old.clone()];
         let mut dialog = InteractiveRebaseActionDialog {
-            scope: InteractiveRebaseScope::LocalUnpushed,
+            commits: commits.clone(),
             base_hash: "base".to_owned(),
             base_short_hash: "base".to_owned(),
             rewrites_published_history: false,
@@ -37312,7 +37745,7 @@ mod ui_tests {
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
         assert!(panel_source.contains("soft_panel_frame(theme::panel_soft(),"));
         assert!(panel_source.contains(".stroke(Stroke::NONE)"));
-        assert!(panel_source.contains(".shadow(panel_shadow())"));
+        assert!(panel_source.contains(".shadow(top_bar_shadow())"));
         assert!(!panel_source.contains("ui.group("));
         assert!(!panel_source.contains("Frame::group"));
 
@@ -38227,6 +38660,45 @@ mod ui_tests {
     }
 
     #[test]
+    fn workspace_repositories_with_unstaged_files_sort_before_name_order() {
+        let alpha = KnownRepository {
+            root: PathBuf::from("D:/workspace/alpha"),
+            name: "alpha".to_owned(),
+            workspace_index: Some(0),
+        };
+        let zulu = KnownRepository {
+            root: PathBuf::from("D:/workspace/zulu"),
+            name: "zulu".to_owned(),
+            workspace_index: Some(0),
+        };
+
+        assert_eq!(
+            workspace_repository_display_order(&zulu, true, &alpha, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            workspace_repository_display_order(&alpha, false, &zulu, false),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            workspace_repository_display_order(&alpha, true, &zulu, true),
+            std::cmp::Ordering::Less
+        );
+
+        let source = include_str!("app.rs");
+        let filter_start = source
+            .find("fn filtered_workspace_panel_repositories(")
+            .unwrap();
+        let filter_end = source[filter_start..]
+            .find("fn workspace_repository_snapshot_for(")
+            .unwrap();
+        let filter_source = &source[filter_start..filter_start + filter_end];
+        assert!(filter_source.contains("repositories.sort_by("));
+        assert!(filter_source.contains("self.workspace_repository_has_unstaged(&left.root)"));
+        assert!(filter_source.contains("self.workspace_repository_has_unstaged(&right.root)"));
+    }
+
+    #[test]
     fn workspace_repository_path_column_keeps_width_when_status_is_unloaded() {
         let text_left = 42.0;
         let text_right = 551.0;
@@ -38404,7 +38876,7 @@ mod ui_tests {
             .find("fn worktree_diff_panel_frame(")
             .unwrap();
         let panel_source = &source[panel_start..panel_start + panel_end];
-        assert!(panel_source.contains(".shadow(panel_shadow())"));
+        assert!(panel_source.contains(".shadow(top_bar_shadow())"));
         assert!(!panel_source.contains(".stroke("));
 
         let start = source.find("fn history_commit_summary(").unwrap();
@@ -38412,9 +38884,9 @@ mod ui_tests {
         let summary_source = &source[start..start + end];
         assert!(!summary_source.contains("history_details_scroll"));
         assert!(
-            summary_source.contains("details_height = ui.available_height().clamp(96.0, 132.0)")
+            summary_source.contains("commit_summary_card(ui, self.language, &commit, details)")
         );
-        assert!(summary_source.contains("recessed_horizontal_separator(ui);"));
+        assert!(!summary_source.contains("recessed_horizontal_separator(ui);"));
         assert!(!summary_source.contains("ui.separator();"));
 
         let search_start = source.find("fn search_commit_summary(").unwrap();
@@ -38422,16 +38894,34 @@ mod ui_tests {
             .find("fn history_file_table(")
             .unwrap();
         let search_summary_source = &source[search_start..search_start + search_end];
-        assert!(search_summary_source.contains("recessed_horizontal_separator(ui);"));
+        assert!(!search_summary_source.contains("recessed_horizontal_separator(ui);"));
         assert!(!search_summary_source.contains("ui.separator();"));
 
-        let separator_start = source.find("fn recessed_horizontal_separator(").unwrap();
-        let separator_end = source[separator_start..]
-            .find("fn git_flow_start_point_row(")
+        let card_start = source.find("fn commit_summary_card(").unwrap();
+        let card_end = source[card_start..]
+            .find("fn source_tree_meta_line(")
             .unwrap();
-        let separator_source = &source[separator_start..separator_start + separator_end];
-        assert!(separator_source.contains("theme::inset_shadow()"));
-        assert!(separator_source.contains("theme::inset_highlight()"));
+        let card_source = &source[card_start..card_start + card_end];
+        assert!(card_source.contains("ui.horizontal_wrapped"));
+        assert!(card_source.contains("commit_summary_value("));
+        assert!(card_source.contains("UiIcon::Message"));
+        assert!(card_source.contains("UiIcon::Hash"));
+        assert!(card_source.contains("UiIcon::Source"));
+        assert!(card_source.contains("UiIcon::User"));
+        assert!(!card_source.contains("Frame::new()"));
+        assert!(!card_source.contains("commit_metadata_card_line"));
+        assert!(
+            source.contains(
+                "UiIcon::Message => egui::include_image!(\"../assets/icons/message.svg\")"
+            )
+        );
+        assert!(
+            source.contains("UiIcon::Hash => egui::include_image!(\"../assets/icons/hash.svg\")")
+        );
+        assert!(
+            source
+                .contains("UiIcon::Source => egui::include_image!(\"../assets/icons/source.svg\")")
+        );
     }
 
     #[test]
@@ -39075,8 +39565,10 @@ mod ui_tests {
             .find("fn diff_row_clip_rect(")
             .unwrap();
         let diff_row_source = &source[diff_row_start..diff_row_start + row_end];
-        assert!(diff_row_source.contains("Color32::from_rgb(214, 250, 221)"));
-        assert!(diff_row_source.contains("Color32::from_rgb(255, 226, 226)"));
+        assert!(diff_row_source.contains("theme::diff_added_bg()"));
+        assert!(diff_row_source.contains("theme::diff_removed_bg()"));
+        assert!(diff_row_source.contains("theme::diff_gutter()"));
+        assert!(diff_row_source.contains("theme::diff_context_text()"));
         assert!(!diff_row_source.contains("from_rgba_unmultiplied(55, 135, 75"));
     }
 
@@ -39241,7 +39733,7 @@ index 1111111..2222222 100644
         assert!(diff_row_source.contains("PointerButton::Primary"));
         assert!(diff_row_source.contains("input.modifiers.ctrl"));
         assert!(diff_row_source.contains("PointerButton::Secondary"));
-        assert!(diff_row_source.contains("Color32::from_rgb(82, 168, 236)"));
+        assert!(diff_row_source.contains("theme::diff_selected()"));
         assert!(diff_row_source.contains("copy_text(selected_diff_rows_text(selected_rows))"));
     }
 
@@ -39385,6 +39877,46 @@ diff --git a/file.txt b/file.txt
         assert_eq!(toolbar_icon("add", ""), UiIcon::Folder);
         assert_eq!(toolbar_icon("create", ""), UiIcon::Plus);
         assert_eq!(toolbar_icon("+", ""), UiIcon::Plus);
+    }
+
+    #[test]
+    fn theme_accent_options_use_named_hues_and_wrap_to_fit() {
+        assert_eq!(
+            theme_accent_label(Language::Chinese, theme::ThemeAccent::Blue),
+            "\u{5929}\u{7a7a}\u{84dd}"
+        );
+        assert_eq!(
+            theme_accent_label(Language::Chinese, theme::ThemeAccent::Green),
+            "\u{8367}\u{5149}\u{7eff}"
+        );
+        assert_eq!(
+            theme_accent_label(Language::Chinese, theme::ThemeAccent::SunRed),
+            "\u{592a}\u{9633}\u{7ea2}"
+        );
+        assert_eq!(
+            theme_accent_label(Language::Chinese, theme::ThemeAccent::DeepSeaBlue),
+            "\u{6df1}\u{6d77}\u{84dd}"
+        );
+        assert_eq!(
+            theme_accent_label(Language::Chinese, theme::ThemeAccent::ForestGreen),
+            "\u{68ee}\u{7cfb}\u{7eff}"
+        );
+
+        let source = include_str!("app.rs");
+        let settings_start = source.find("fn global_general_settings(&mut self").unwrap();
+        let settings_end = source[settings_start..]
+            .find("fn repo_remotes_settings_page(")
+            .unwrap();
+        let settings_source = &source[settings_start..settings_start + settings_end];
+        assert!(settings_source.contains("ui.horizontal_wrapped(|ui|"));
+
+        let button_start = source.find("fn settings_accent_button(").unwrap();
+        let button_end = source[button_start..]
+            .find("fn settings_checkbox_row(")
+            .unwrap();
+        let button_source = &source[button_start..button_start + button_end];
+        assert!(button_source.contains("layout_no_wrap(label.to_owned()"));
+        assert!(button_source.contains("let width = (label_width + 32.0).max(88.0)"));
     }
 
     #[test]
@@ -40467,6 +40999,7 @@ diff --git a/file.txt b/file.txt
         }
         assert!(dropdown_source.contains("visuals.window_stroke = Stroke::NONE"));
         assert!(dropdown_source.contains("visuals.popup_shadow = menu_popup_shadow()"));
+        assert!(dropdown_source.contains("theme::apply_selected_item_visuals(visuals)"));
         assert!(dropdown_source.contains("visuals.widgets.open.bg_stroke = Stroke::NONE"));
     }
 
@@ -40914,6 +41447,21 @@ diff --git a/file.txt b/file.txt
         assert!(bottom.bottom() <= rect.bottom());
         assert!(bottom.left() >= rect.left());
         assert!(bottom.right() <= rect.right());
+    }
+
+    #[test]
+    fn dark_top_bar_uses_flat_shell_and_tabs_without_square_shadow_edges() {
+        assert_eq!(top_bar_shadow_for_mode(theme::ThemeMode::Dark).color.a(), 0);
+        assert!(top_bar_shadow_for_mode(theme::ThemeMode::Light).color.a() > 0);
+        let source = include_str!("app.rs");
+        let shadow_start = source
+            .find("fn paint_connected_tab_shadow_for_state(")
+            .unwrap();
+        let shadow_end = source[shadow_start..]
+            .find("fn paint_repo_tab_shadow(")
+            .unwrap();
+        let shadow_source = &source[shadow_start..shadow_start + shadow_end];
+        assert!(shadow_source.contains("visuals.shadow && tab_shadows_enabled()"));
     }
 
     #[test]

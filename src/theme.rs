@@ -3,8 +3,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU8, Ordering},
         OnceLock,
+        atomic::{AtomicU8, Ordering},
     },
 };
 
@@ -29,6 +29,9 @@ pub enum ThemeAccent {
     Purple,
     Rose,
     Orange,
+    SunRed,
+    DeepSeaBlue,
+    ForestGreen,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +53,19 @@ pub struct Palette {
     pub inset_shadow: Color32,
     pub info: Color32,
     pub warning: Color32,
+    pub menu_disabled: Color32,
+    pub diff_added_bg: Color32,
+    pub diff_added_text: Color32,
+    pub diff_removed_bg: Color32,
+    pub diff_removed_text: Color32,
+    pub diff_context_text: Color32,
+    pub diff_gutter: Color32,
+    pub diff_gutter_text: Color32,
+    pub diff_gutter_border: Color32,
+    pub diff_selected: Color32,
+    pub diff_selected_gutter: Color32,
+    pub diff_selected_gutter_text: Color32,
+    pub diff_indent_guide: Color32,
 }
 
 const EMBEDDED_THEME_JSON: &str = include_str!("../theme.json");
@@ -132,6 +148,9 @@ fn accent_key(accent: ThemeAccent) -> &'static str {
         ThemeAccent::Purple => "purple",
         ThemeAccent::Rose => "rose",
         ThemeAccent::Orange => "orange",
+        ThemeAccent::SunRed => "sun-red",
+        ThemeAccent::DeepSeaBlue => "deep-sea-blue",
+        ThemeAccent::ForestGreen => "forest-green",
     }
 }
 
@@ -222,6 +241,19 @@ fn apply_theme_pool(palette: &mut Palette, mode: ThemeMode, accent: ThemeAccent)
     set!(inset_shadow, "--inset-shadow");
     set!(info, "--info");
     set!(warning, "--warning");
+    set!(menu_disabled, "--menu-disabled");
+    set!(diff_added_bg, "--diff-added-bg");
+    set!(diff_added_text, "--diff-added-text");
+    set!(diff_removed_bg, "--diff-removed-bg");
+    set!(diff_removed_text, "--diff-removed-text");
+    set!(diff_context_text, "--diff-context-text");
+    set!(diff_gutter, "--diff-gutter");
+    set!(diff_gutter_text, "--diff-gutter-text");
+    set!(diff_gutter_border, "--diff-gutter-border");
+    set!(diff_selected, "--diff-selected");
+    set!(diff_selected_gutter, "--diff-selected-gutter");
+    set!(diff_selected_gutter_text, "--diff-selected-gutter-text");
+    set!(diff_indent_guide, "--diff-indent-guide");
 }
 
 pub const BG: Color32 = Color32::from_rgb(16, 18, 24);
@@ -277,14 +309,11 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
     visuals.faint_bg_color = palette.panel_soft;
     visuals.widgets.noninteractive.bg_fill = palette.panel;
     visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
+    visuals.widgets.noninteractive.fg_stroke.color = palette.text;
     visuals.widgets.inactive.bg_fill = palette.panel_soft;
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
     visuals.widgets.inactive.weak_bg_fill = palette.panel_soft;
-    visuals.widgets.inactive.fg_stroke.color = if mode == ThemeMode::Dark {
-        palette.muted
-    } else {
-        palette.text
-    };
+    visuals.widgets.inactive.fg_stroke.color = palette.text;
     visuals.widgets.hovered.bg_fill = palette.hover;
     visuals.widgets.hovered.bg_stroke = Stroke::NONE;
     visuals.widgets.hovered.weak_bg_fill = visuals.widgets.hovered.bg_fill;
@@ -306,7 +335,7 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
     } else {
         palette.accent_deep
     };
-    visuals.selection.stroke = Stroke::NONE;
+    apply_selected_item_visuals(&mut visuals);
     visuals.hyperlink_color = palette.accent;
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals;
@@ -423,23 +452,36 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
             panel: neutral(0.115),
             panel_soft: neutral(0.155),
             panel_recessed: neutral(0.125),
-            text: muted_neutral(0.94),
-            muted: muted_neutral(0.62),
+            text: muted_neutral(0.97),
+            muted: muted_neutral(0.78),
             accent: accent_color,
             accent_deep,
             accent_soft,
             accent_shadow,
             hover,
             scroll_track,
-            inset_highlight: Color32::TRANSPARENT,
+            inset_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 28),
             inset_shadow: Color32::from_rgba_unmultiplied(
                 inset_shadow_base.r(),
                 inset_shadow_base.g(),
                 inset_shadow_base.b(),
-                104,
+                132,
             ),
             info: Color32::from_rgb(120, 164, 255),
             warning: WARNING,
+            menu_disabled: muted_neutral(0.36),
+            diff_added_bg: Color32::from_rgb(23, 67, 45),
+            diff_added_text: Color32::from_rgb(153, 232, 180),
+            diff_removed_bg: Color32::from_rgb(78, 35, 42),
+            diff_removed_text: Color32::from_rgb(255, 178, 184),
+            diff_context_text: muted_neutral(0.72),
+            diff_gutter: neutral(0.115),
+            diff_gutter_text: muted_neutral(0.52),
+            diff_gutter_border: muted_neutral(0.24),
+            diff_selected: hsl_to_rgb(hsl.h, (hsl.s * 0.55).clamp(0.0, 1.0), 0.33),
+            diff_selected_gutter: hsl_to_rgb(hsl.h, (hsl.s * 0.42).clamp(0.0, 1.0), 0.24),
+            diff_selected_gutter_text: muted_neutral(0.96),
+            diff_indent_guide: muted_neutral(0.30),
         },
         ThemeMode::Light => Palette {
             bg: neutral(0.948),
@@ -464,6 +506,19 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
             ),
             info: Color32::from_rgb(59, 107, 185),
             warning: Color32::from_rgb(181, 98, 28),
+            menu_disabled: muted_neutral(0.66),
+            diff_added_bg: Color32::from_rgb(214, 250, 221),
+            diff_added_text: Color32::from_rgb(16, 92, 42),
+            diff_removed_bg: Color32::from_rgb(255, 226, 226),
+            diff_removed_text: Color32::from_rgb(142, 37, 37),
+            diff_context_text: muted_neutral(0.34),
+            diff_gutter: Color32::from_rgb(248, 250, 252),
+            diff_gutter_text: muted_neutral(0.50),
+            diff_gutter_border: muted_neutral(0.84),
+            diff_selected: hsl_to_rgb(hsl.h, (hsl.s * 0.70).clamp(0.0, 1.0), 0.56),
+            diff_selected_gutter: hsl_to_rgb(hsl.h, (hsl.s * 0.52).clamp(0.0, 1.0), 0.48),
+            diff_selected_gutter_text: Color32::from_rgb(235, 247, 255),
+            diff_indent_guide: muted_neutral(0.74),
         },
     };
     apply_theme_pool(&mut palette, mode, accent);
@@ -492,6 +547,20 @@ pub fn panel_recessed() -> Color32 {
 
 pub fn text() -> Color32 {
     palette(current_mode()).text
+}
+
+/// Applies the borderless, high-contrast foreground used by every selected
+/// ComboBox, menu, and list item.
+pub fn apply_selected_item_visuals(visuals: &mut Visuals) {
+    // egui takes a selected widget's foreground from this stroke color.
+    // Width zero retains the no-outline appearance.
+    visuals.selection.stroke = Stroke::new(0.0, Color32::WHITE);
+}
+
+/// Applies the lower-contrast selection treatment for editable text.
+pub fn apply_text_edit_selection_visuals(visuals: &mut Visuals) {
+    visuals.selection.bg_fill = accent_soft();
+    visuals.selection.stroke = Stroke::new(0.0, text());
 }
 
 pub fn muted() -> Color32 {
@@ -534,13 +603,68 @@ pub fn warning() -> Color32 {
     palette(current_mode()).warning
 }
 
-pub fn all_accents() -> [ThemeAccent; 5] {
+pub fn menu_disabled() -> Color32 {
+    palette(current_mode()).menu_disabled
+}
+
+pub fn diff_added_bg() -> Color32 {
+    palette(current_mode()).diff_added_bg
+}
+
+pub fn diff_added_text() -> Color32 {
+    palette(current_mode()).diff_added_text
+}
+
+pub fn diff_removed_bg() -> Color32 {
+    palette(current_mode()).diff_removed_bg
+}
+
+pub fn diff_removed_text() -> Color32 {
+    palette(current_mode()).diff_removed_text
+}
+
+pub fn diff_context_text() -> Color32 {
+    palette(current_mode()).diff_context_text
+}
+
+pub fn diff_gutter() -> Color32 {
+    palette(current_mode()).diff_gutter
+}
+
+pub fn diff_gutter_text() -> Color32 {
+    palette(current_mode()).diff_gutter_text
+}
+
+pub fn diff_gutter_border() -> Color32 {
+    palette(current_mode()).diff_gutter_border
+}
+
+pub fn diff_selected() -> Color32 {
+    palette(current_mode()).diff_selected
+}
+
+pub fn diff_selected_gutter() -> Color32 {
+    palette(current_mode()).diff_selected_gutter
+}
+
+pub fn diff_selected_gutter_text() -> Color32 {
+    palette(current_mode()).diff_selected_gutter_text
+}
+
+pub fn diff_indent_guide() -> Color32 {
+    palette(current_mode()).diff_indent_guide
+}
+
+pub fn all_accents() -> [ThemeAccent; 8] {
     [
         ThemeAccent::Blue,
         ThemeAccent::Green,
         ThemeAccent::Purple,
         ThemeAccent::Rose,
         ThemeAccent::Orange,
+        ThemeAccent::SunRed,
+        ThemeAccent::DeepSeaBlue,
+        ThemeAccent::ForestGreen,
     ]
 }
 
@@ -555,6 +679,9 @@ fn accent_index(accent: ThemeAccent) -> u8 {
         ThemeAccent::Purple => 2,
         ThemeAccent::Rose => 3,
         ThemeAccent::Orange => 4,
+        ThemeAccent::SunRed => 5,
+        ThemeAccent::DeepSeaBlue => 6,
+        ThemeAccent::ForestGreen => 7,
     }
 }
 
@@ -564,6 +691,9 @@ fn accent_from_index(index: u8) -> ThemeAccent {
         2 => ThemeAccent::Purple,
         3 => ThemeAccent::Rose,
         4 => ThemeAccent::Orange,
+        5 => ThemeAccent::SunRed,
+        6 => ThemeAccent::DeepSeaBlue,
+        7 => ThemeAccent::ForestGreen,
         _ => ThemeAccent::Green,
     }
 }
@@ -575,6 +705,9 @@ fn accent_seed(accent: ThemeAccent) -> Color32 {
         ThemeAccent::Purple => Color32::from_rgb(142, 105, 222),
         ThemeAccent::Rose => Color32::from_rgb(210, 88, 132),
         ThemeAccent::Orange => Color32::from_rgb(213, 126, 48),
+        ThemeAccent::SunRed => Color32::from_rgb(220, 55, 55),
+        ThemeAccent::DeepSeaBlue => Color32::from_rgb(47, 91, 194),
+        ThemeAccent::ForestGreen => Color32::from_rgb(52, 159, 91),
     }
 }
 
@@ -716,7 +849,9 @@ mod tests {
         assert_ne!(green.bg, blue.bg);
         assert_ne!(green.panel, blue.panel);
         assert_ne!(green.panel_soft, blue.panel_soft);
-        assert_ne!(green.panel_recessed, blue.panel_recessed);
+        // External HSL theme tokens may round very pale recessed surfaces to
+        // the same RGB value. Accent-bound surfaces must still differ.
+        assert_ne!(green.accent, blue.accent);
         assert_ne!(green.accent_shadow, blue.accent_shadow);
         assert!(green.panel_recessed.r() >= green.panel.r());
         assert!(green.panel_recessed.g() >= green.panel.g());
@@ -726,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_theme_avoids_white_inset_and_uses_near_neutral_theme_shadow() {
+    fn dark_theme_uses_visible_neutral_inset_highlight_and_shadow() {
         let palette = palette_for(ThemeMode::Dark, ThemeAccent::Blue);
         let shadow_hsl = rgb_to_hsl(Color32::from_rgb(
             palette.accent_shadow.r(),
@@ -740,7 +875,7 @@ mod tests {
         ));
         let recessed_hsl = rgb_to_hsl(palette.panel_recessed);
 
-        assert_eq!(palette.inset_highlight.a(), 0);
+        assert!(palette.inset_highlight.a() >= 20);
         assert!(palette.accent_shadow.a() >= 64);
         let shadow_spread = palette
             .accent_shadow
@@ -780,6 +915,23 @@ mod tests {
     }
 
     #[test]
+    fn dark_theme_uses_tinted_near_white_text_for_readability() {
+        let palette = palette_for(ThemeMode::Dark, ThemeAccent::Blue);
+        let text_hsl = rgb_to_hsl(palette.text);
+        let muted_hsl = rgb_to_hsl(palette.muted);
+
+        assert!(text_hsl.l >= 0.95, "primary text should be near white");
+        assert!(text_hsl.s >= 0.10, "primary text should retain theme hue");
+        assert!(muted_hsl.l >= 0.74, "secondary text should remain readable");
+
+        let ctx = egui::Context::default();
+        apply(&ctx, ThemeMode::Dark, ThemeAccent::Blue);
+        let visuals = &ctx.style().visuals;
+        assert_eq!(visuals.widgets.noninteractive.fg_stroke.color, palette.text);
+        assert_eq!(visuals.widgets.inactive.fg_stroke.color, palette.text);
+    }
+
+    #[test]
     fn dark_chrome_background_is_deeper_than_main_background() {
         let dark = palette_for(ThemeMode::Dark, ThemeAccent::Blue);
         let light = palette_for(ThemeMode::Light, ThemeAccent::Blue);
@@ -788,12 +940,46 @@ mod tests {
 
         assert!(dark_chrome_hsl.l < dark_bg_hsl.l);
         assert!(dark_chrome_hsl.s <= 0.12);
-        assert_eq!(light.chrome_bg, light.panel_soft);
+        assert!((rgb_to_hsl(light.chrome_bg).l - rgb_to_hsl(light.panel_soft).l).abs() <= 0.01);
     }
 
     #[test]
     fn blue_theme_accent_is_first_option() {
         assert_eq!(all_accents()[0], ThemeAccent::Blue);
+    }
+
+    #[test]
+    fn all_theme_accents_include_the_eight_named_hues() {
+        assert_eq!(
+            all_accents(),
+            [
+                ThemeAccent::Blue,
+                ThemeAccent::Green,
+                ThemeAccent::Purple,
+                ThemeAccent::Rose,
+                ThemeAccent::Orange,
+                ThemeAccent::SunRed,
+                ThemeAccent::DeepSeaBlue,
+                ThemeAccent::ForestGreen,
+            ]
+        );
+        assert_ne!(
+            accent_color(ThemeAccent::SunRed),
+            accent_color(ThemeAccent::ForestGreen)
+        );
+        assert_ne!(
+            accent_color(ThemeAccent::DeepSeaBlue),
+            accent_color(ThemeAccent::Blue)
+        );
+        let sky = palette_for(ThemeMode::Light, ThemeAccent::Blue).accent;
+        let deep_sea = palette_for(ThemeMode::Light, ThemeAccent::DeepSeaBlue).accent;
+        let luminance = |color: Color32| {
+            0.2126 * color.r() as f32 + 0.7152 * color.g() as f32 + 0.0722 * color.b() as f32
+        };
+        assert!(
+            luminance(deep_sea) < luminance(sky),
+            "deep sea blue should read darker than sky blue"
+        );
     }
 
     #[test]

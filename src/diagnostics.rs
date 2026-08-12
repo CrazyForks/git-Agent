@@ -16,6 +16,11 @@ static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_TRACE_ID: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_EXPIRES_MS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_PROBE_FLUSHED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_PROBE_X_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_PROBE_Y_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_PROBE_AREA: AtomicU64 = AtomicU64::new(0);
 
 pub struct TraceSpan {
     event: &'static str,
@@ -91,6 +96,56 @@ pub fn branch_switch_log_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("data")
         .join("branch-switch.log")
+}
+
+/// Temporary drag diagnostics. The press path writes only atomics after dispatching the native
+/// command; formatting, locking, and file I/O are delayed until the button has been released.
+pub fn record_window_drag_probe(x: f32, y: f32, area: u8) {
+    WINDOW_DRAG_PROBE_X_BITS.store(x.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_PROBE_Y_BITS.store(y.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_PROBE_AREA.store(area as u64, Ordering::Release);
+    WINDOW_DRAG_PROBE_SEQUENCE.fetch_add(1, Ordering::Release);
+}
+
+pub fn flush_window_drag_probe() {
+    let sequence = WINDOW_DRAG_PROBE_SEQUENCE.load(Ordering::Acquire);
+    let flushed = WINDOW_DRAG_PROBE_FLUSHED_SEQUENCE.load(Ordering::Acquire);
+    if sequence == flushed {
+        return;
+    }
+    WINDOW_DRAG_PROBE_FLUSHED_SEQUENCE.store(sequence, Ordering::Release);
+
+    let x = f32::from_bits(WINDOW_DRAG_PROBE_X_BITS.load(Ordering::Acquire) as u32);
+    let y = f32::from_bits(WINDOW_DRAG_PROBE_Y_BITS.load(Ordering::Acquire) as u32);
+    let area = match WINDOW_DRAG_PROBE_AREA.load(Ordering::Acquire) {
+        1 => "title-layer",
+        2 => "source-gap",
+        _ => "title-other",
+    };
+    let line = format!(
+        "epoch_ms={} pid={} sequence={} event=window_drag.pointer_press x={x:.1} y={y:.1} area={area}\n",
+        epoch_ms(),
+        std::process::id(),
+        sequence,
+    );
+    let _guard = write_lock();
+    let path = window_drag_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+pub fn window_drag_log_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("data")
+        .join("window-drag.log")
 }
 
 fn append_line(trace_id: u64, now: u64, event: &str, fields: &str) {

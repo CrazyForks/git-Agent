@@ -2604,7 +2604,7 @@ const EN: &[(&str, &str)] = &[
     ("commit.staged_files", "staged file(s)"),
     ("commit.no_changes", "No file changes recorded."),
     ("commit.select_file", "Select a changed file."),
-    ("commit.search", "Search commits"),
+    ("commit.search", "Search"),
     ("commit.no_matches", "No matching commits"),
     ("commit.no_commits", "No commits yet"),
     ("commit.stats_loaded", "commits loaded"),

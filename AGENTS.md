@@ -28,6 +28,12 @@ spawn an external tool, or reload repository state must follow the same transiti
 New long-running actions need regression tests that prove: immediate visible feedback, async task
 ownership, shared busy gating, stale-cache avoidance when required, and gate release on completion.
 
+## Desktop Top-Bar Dragging
+
+Before changing the custom title bar, repository tabs, toolbar hit regions, or theme application
+path, read `docs/top-bar-window-drag.md`. Preserve its drag-region separation, drag-start timing,
+continuous-painting, and no-hot-path-work rules; add focused regression coverage for any change.
+
 ## Web UI Skill Gate
 
 For the `ui-ux-pro-max` skill, use this decision flow instead of matching every UI-related task:

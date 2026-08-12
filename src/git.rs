@@ -321,6 +321,10 @@ enum CommitScope {
 pub struct CommitDetails {
     pub hash: String,
     pub files: Vec<FileChange>,
+    #[serde(default)]
+    pub committer: String,
+    #[serde(default)]
+    pub branches: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -780,16 +784,45 @@ pub fn validate_remote_url(url: &str) -> Result<()> {
 }
 
 pub fn load_commit_details(root: impl AsRef<Path>, hash: &str) -> Result<CommitDetails> {
+    let root = root.as_ref();
     let output = git_output(
-        root.as_ref(),
+        root,
         &["show", "--format=", "--name-status", "--find-renames", hash],
     )?;
 
     let files = parse_file_changes(&output);
+    let committer = git_output(root, &["show", "-s", "--format=%cn", hash])
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let mut branches = Vec::new();
+    if let Ok(output) = git_output(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "--contains",
+            hash,
+            "refs/heads",
+            "refs/remotes",
+        ],
+    ) {
+        for branch in output
+            .lines()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+        {
+            if !branches.iter().any(|existing| existing == branch) {
+                branches.push(branch.to_owned());
+            }
+        }
+    }
 
     Ok(CommitDetails {
         hash: hash.to_owned(),
         files,
+        committer,
+        branches,
     })
 }
 
