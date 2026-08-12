@@ -37745,7 +37745,7 @@ mod ui_tests {
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
         assert!(panel_source.contains("soft_panel_frame(theme::panel_soft(),"));
         assert!(panel_source.contains(".stroke(Stroke::NONE)"));
-        assert!(panel_source.contains(".shadow(top_bar_shadow())"));
+        assert!(panel_source.contains(".shadow(panel_shadow())"));
         assert!(!panel_source.contains("ui.group("));
         assert!(!panel_source.contains("Frame::group"));
 
