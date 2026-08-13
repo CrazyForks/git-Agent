@@ -1,13 +1,16 @@
 [package]
 name = "git-agent"
-version = "1.0.10"
+version = "1.2.0-alpha.1"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+aes-gcm = { version = "0.10", features = ["getrandom"] }
 base64 = "0.22"
 eframe = "0.31"
 egui_extras = { version = "0.31", features = ["svg"] }
+getrandom = "0.2"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

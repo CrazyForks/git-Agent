@@ -32,6 +32,7 @@ fn parses_named_merge_tool_arguments() {
             stage: false,
             theme: MergeTheme::Dark,
             language: MergeLanguage::English,
+            ai_model_name: None,
         }
     );
 }
@@ -102,10 +103,36 @@ fn parses_theme_and_language_options() {
 }
 
 #[test]
+fn parses_selected_ai_model_without_accepting_a_secret_argument() {
+    let args = parse_merge_args([
+        "git-agent-merge",
+        "--base",
+        "base.txt",
+        "--local",
+        "local.txt",
+        "--remote",
+        "remote.txt",
+        "--output",
+        "merged.txt",
+        "--ai-model",
+        "Team DeepSeek",
+    ])
+    .unwrap();
+
+    assert_eq!(args.ai_model_name.as_deref(), Some("Team DeepSeek"));
+}
+
+#[test]
 fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     let source = include_str!("../src/merge_tool.rs");
 
     assert!(source.contains("TopBottomPanel::top(\"merge_toolbar\")"));
+    assert!(source.contains("MergeToolbarToggleIcon::Ai"));
+    assert!(source.contains("merge_ai_suggestion_overlays("));
+    assert!(source.contains("collect_merge_ai_context("));
+    assert!(source.contains("request_merge_ai_suggestions("));
+    assert!(source.contains("load_merge_ai_model_config"));
+    assert!(!source.contains("--ai-api-key"));
     assert!(source.contains("TopBottomPanel::bottom(\"merge_footer\")"));
     assert!(source.contains("CentralPanel::default()"));
     assert!(source.contains("merge_editor_columns("));
@@ -142,12 +169,35 @@ fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     assert!(source.contains(".corner_radius(egui::CornerRadius::same(MERGE_PANEL_RADIUS))"));
     assert!(!source.contains("egui::Button::new(\"^\")"));
     assert!(!source.contains("egui::Button::new(\"v\")"));
-    assert!(source.contains("\"使用我的版本\""));
-    assert!(source.contains("\"使用他的版本\""));
+    assert!(source.contains("\"使用左边\""));
+    assert!(source.contains("\"使用右边\""));
+    assert!(!source.contains("\"使用我的版本\""));
+    assert!(!source.contains("\"使用他的版本\""));
     assert!(source.contains(".stroke(egui::Stroke::NONE)"));
     assert!(!source.contains("ui.separator()"));
     assert!(source.contains("\"合并修订\""));
     assert!(source.contains("\"中文\""));
+}
+
+#[test]
+fn merge_ai_analysis_is_hidden_localized_complete_and_movable() {
+    let source = include_str!("../src/merge_tool.rs");
+
+    assert!(source.contains("MERGE_WINDOWS_CREATE_NO_WINDOW"));
+    assert!(source.contains("command.creation_flags(MERGE_WINDOWS_CREATE_NO_WINDOW)"));
+    assert!(source.matches("\"--all\".to_owned()").count() >= 2);
+    assert!(source.contains("MergeAiNotice::Completed"));
+    assert!(source.contains("AI 正在分析冲突"));
+    assert!(source.contains("AI 分析完成：暂无可用建议"));
+    assert!(source.contains("Simplified Chinese"));
+    assert!(source.contains("MergeLineActionTarget::BaseOnlyGroup"));
+    assert!(source.contains("DELETION DECISIONS"));
+    assert!(source.contains(".movable(true)"));
+    assert!(source.contains("reason_zh"));
+    assert!(source.contains("reason_en"));
+    assert!(source.contains("paint_merge_ai_suggestion_connector"));
+    assert!(source.contains("merge_ai_overlay_allowed_offset("));
+    assert!(source.contains("moved.y.clamp(allowed_offset.min.y, allowed_offset.max.y)"));
 }
 
 #[test]
@@ -181,6 +231,7 @@ fn write_merge_output_can_stage_resolved_file() {
         stage: true,
         theme: MergeTheme::Light,
         language: MergeLanguage::Chinese,
+        ai_model_name: None,
     };
 
     write_merge_output(&args, "resolved\n").unwrap();

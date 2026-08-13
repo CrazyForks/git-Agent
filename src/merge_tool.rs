@@ -1,9 +1,9 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     ops::Range,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -18,11 +18,14 @@ use eframe::egui::containers::scroll_area::ScrollBarVisibility;
 use eframe::{
     App,
     egui::{
-        self, Align, Align2, Color32, ComboBox, FontId, Layout, Pos2, Rect, RichText, ScrollArea,
-        Sense, Ui, Vec2,
+        self, Align, Align2, Color32, ComboBox, CursorIcon, FontId, Layout, Pos2, Rect, RichText,
+        ScrollArea, Sense, Ui, Vec2,
     },
 };
 use similar::{Algorithm, DiffTag, capture_diff_slices};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 use crate::dialog;
 
@@ -53,6 +56,7 @@ enum MergeHighlightMode {
 
 #[derive(Clone, Copy)]
 enum MergeToolbarToggleIcon {
+    Ai,
     Collapse,
     Expand,
     Sun,
@@ -65,6 +69,42 @@ struct MergeSourceText {
     base: String,
     local: String,
     remote: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MergeAiChoice {
+    Local,
+    Remote,
+    Manual,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MergeAiSuggestion {
+    target: MergeLineActionTarget,
+    choice: MergeAiChoice,
+    reason_zh: String,
+    reason_en: String,
+}
+
+impl MergeAiSuggestion {
+    fn reason(&self, language: MergeLanguage) -> &str {
+        match language {
+            MergeLanguage::Chinese => &self.reason_zh,
+            MergeLanguage::English => &self.reason_en,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeAiNotice {
+    Completed(usize),
+    NoSuggestions,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MergeAiContext {
+    history: String,
+    related_files: String,
 }
 
 struct PreparedMergeDocument {
@@ -110,6 +150,9 @@ pub struct MergeArgs {
     pub stage: bool,
     pub theme: MergeTheme,
     pub language: MergeLanguage,
+    /// The selected configuration name is safe to pass from the main app. The standalone tool
+    /// resolves the secret itself through the operating system key store.
+    pub ai_model_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,7 +192,7 @@ pub struct ConflictBlock {
     line_indices: Vec<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MergeSide {
     Local,
     Remote,
@@ -161,7 +204,7 @@ enum MergeLineAction {
     Drop,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MergeLineActionTarget {
     Conflict(usize),
     BaseOnlyGroup(usize),
@@ -173,13 +216,15 @@ enum NavDirection {
     Next,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MergeSideLineTone {
     Unchanged,
     Added,
     BaseOnly,
     Deleted,
     Replaced,
+    LocalDeletedRemoteEdited,
+    LocalEditedRemoteDeleted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +240,10 @@ const MERGE_NAV_BUTTON_SIZE: f32 = 18.0;
 const MERGE_PANEL_RADIUS: u8 = 6;
 const MERGE_CODE_ROW_HEIGHT: f32 = 18.0;
 const MERGE_CODE_FONT_SIZE: f32 = 12.0;
+const MERGE_SIDE_CODE_GUTTER_WIDTH: f32 = 100.0;
+const MERGE_RESULT_CODE_GUTTER_WIDTH: f32 = 62.0;
+const MERGE_HORIZONTAL_SCROLLBAR_HEIGHT: f32 = 12.0;
+const MERGE_HORIZONTAL_SCROLLBAR_GAP: f32 = 4.0;
 const MERGE_WORD_BLOCK_OPACITY: f32 = 1.0;
 const MERGE_WORD_ACTIVE_BLOCK_OPACITY: f32 = 1.0;
 const MERGE_BASE_ONLY_MARKER_HEIGHT: f32 = 3.0;
@@ -202,6 +251,13 @@ const MERGE_VIRTUAL_ROW_THRESHOLD: usize = 2_000;
 const MERGE_COLLAPSE_MIN_UNCHANGED_ROWS: usize = 12;
 const MERGE_COLLAPSE_CONTEXT_ROWS: usize = 3;
 const MERGE_BUILD_CONFIG: &str = include_str!("../config/merge-tool.toml");
+const MERGE_AI_MAX_RELATED_FILE_BYTES: usize = 48 * 1024;
+const MERGE_AI_MAX_CONTEXT_BYTES: usize = 384 * 1024;
+const MERGE_AI_MAX_HISTORY_CHARS: usize = 16 * 1024;
+const MERGE_AI_TOOL_NAME: &str = "submit_merge_suggestions";
+const MERGE_AI_OVERLAY_DRAG_MARGIN: f32 = 8.0;
+#[cfg(target_os = "windows")]
+const MERGE_WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 static MERGE_CONNECTOR_DEBUG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
@@ -228,11 +284,30 @@ struct MergePalette {
 #[derive(Default)]
 struct MergePanelGeometry {
     rows: Vec<(usize, Rect)>,
+    horizontal_bounds: Option<(f32, f32)>,
+}
+
+#[derive(Clone, Copy)]
+struct MergeConnectorColumns {
+    local: Rect,
+    result: Rect,
+    remote: Rect,
 }
 
 impl MergePanelGeometry {
     fn record_row(&mut self, index: usize, rect: Rect) {
         self.rows.push((index, rect));
+    }
+
+    fn set_horizontal_bounds(&mut self, viewport: Rect) {
+        self.horizontal_bounds = Some((viewport.left(), viewport.right()));
+    }
+
+    fn apply_horizontal_bounds(&self, rect: Rect) -> Rect {
+        let Some((left, right)) = self.horizontal_bounds else {
+            return rect;
+        };
+        Rect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(right, rect.bottom()))
     }
 
     fn span_rect(&self, first: usize, count: usize) -> Option<Rect> {
@@ -242,6 +317,7 @@ impl MergePanelGeometry {
             .filter(|(index, _)| *index >= first && *index < last)
             .map(|(_, rect)| *rect)
             .reduce(|merged, rect| merged.union(rect))
+            .map(|rect| self.apply_horizontal_bounds(rect))
     }
 
     fn boundary_marker_rect(&self, row_index: usize, height: f32) -> Option<Rect> {
@@ -258,10 +334,10 @@ impl MergePanelGeometry {
         });
         let reference = next.or(previous)?;
         let y = next.map_or(reference.bottom(), |rect| rect.top());
-        Some(Rect::from_min_max(
+        Some(self.apply_horizontal_bounds(Rect::from_min_max(
             Pos2::new(reference.left(), y - height * 0.5),
             Pos2::new(reference.right(), y + height * 0.5),
-        ))
+        )))
     }
 }
 
@@ -276,6 +352,18 @@ struct MergeResultPanelOutput {
     scroll_y: f32,
     viewport_height: f32,
     geometry: MergePanelGeometry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeAiOverlayAction {
+    Apply(MergeLineActionTarget),
+    Ignore(MergeLineActionTarget),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MergeAiCardPlacement {
+    Middle,
+    Side(MergeSide),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -323,7 +411,7 @@ struct BaseOnlyDisplayGroup {
     missing_side: MergeSide,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct MergeEditSnapshot {
     document: MergeDocument,
     result_text: String,
@@ -333,6 +421,8 @@ struct MergeEditSnapshot {
     remote_conflict_cursor: usize,
     local_navigation_target: Option<MergeLineActionTarget>,
     remote_navigation_target: Option<MergeLineActionTarget>,
+    ai_suggestions: HashMap<MergeLineActionTarget, MergeAiSuggestion>,
+    ai_overlay_offsets: HashMap<(MergeLineActionTarget, MergeAiCardPlacement), Vec2>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +437,13 @@ enum MergeSideDiffRow<'a> {
     Deleted(&'a str),
     Added(&'a str),
     Replaced(&'a str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeBaseLineState {
+    Kept,
+    Deleted,
+    Replaced,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,6 +485,7 @@ where
     let mut stage = false;
     let mut theme = MergeTheme::Dark;
     let mut language = MergeLanguage::English;
+    let mut ai_model_name = None;
     let mut iter = items.into_iter();
 
     while let Some(item) = iter.next() {
@@ -410,6 +508,7 @@ where
             "--repo-root" => repo_root = Some(PathBuf::from(value)),
             "--theme" => theme = parse_theme(&value)?,
             "--language" | "--lang" => language = parse_language(&value)?,
+            "--ai-model" => ai_model_name = Some(value),
             other => return Err(anyhow!("unknown argument {other}")),
         }
     }
@@ -432,6 +531,7 @@ where
         stage,
         theme,
         language,
+        ai_model_name,
     })
 }
 
@@ -1074,6 +1174,7 @@ pub struct MergeToolApp {
     local_scroll_anchors: Vec<(f32, f32)>,
     remote_scroll_anchors: Vec<(f32, f32)>,
     manual_result_override: bool,
+    shared_scroll_x: f32,
     shared_scroll_y: f32,
     local_conflict_cursor: usize,
     remote_conflict_cursor: usize,
@@ -1086,6 +1187,12 @@ pub struct MergeToolApp {
     load_progress: MergeLoadProgress,
     load_started_at: Option<Instant>,
     write_task: Option<Receiver<anyhow::Result<()>>>,
+    ai_task: Option<Receiver<Result<Vec<MergeAiSuggestion>, String>>>,
+    ai_suggestions: HashMap<MergeLineActionTarget, MergeAiSuggestion>,
+    ai_overlay_offsets: HashMap<(MergeLineActionTarget, MergeAiCardPlacement), Vec2>,
+    ai_logged_missing_anchors: HashSet<(MergeLineActionTarget, MergeSide)>,
+    ai_notice: Option<MergeAiNotice>,
+    ai_analysis_error: Option<String>,
     undo_stack: Vec<MergeEditSnapshot>,
     redo_stack: Vec<MergeEditSnapshot>,
     display_epoch: u64,
@@ -1159,6 +1266,7 @@ impl MergeToolApp {
             local_scroll_anchors,
             remote_scroll_anchors,
             manual_result_override: false,
+            shared_scroll_x: 0.0,
             shared_scroll_y: 0.0,
             local_conflict_cursor: 0,
             remote_conflict_cursor: 0,
@@ -1173,6 +1281,12 @@ impl MergeToolApp {
             },
             load_started_at: None,
             write_task: None,
+            ai_task: None,
+            ai_suggestions: HashMap::new(),
+            ai_overlay_offsets: HashMap::new(),
+            ai_logged_missing_anchors: HashSet::new(),
+            ai_notice: None,
+            ai_analysis_error: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             display_epoch: 0,
@@ -1199,6 +1313,7 @@ impl MergeToolApp {
             local_scroll_anchors: prepared.local_scroll_anchors,
             remote_scroll_anchors: prepared.remote_scroll_anchors,
             manual_result_override: false,
+            shared_scroll_x: 0.0,
             shared_scroll_y: 0.0,
             local_conflict_cursor: 0,
             remote_conflict_cursor: 0,
@@ -1213,6 +1328,12 @@ impl MergeToolApp {
             },
             load_started_at: None,
             write_task: None,
+            ai_task: None,
+            ai_suggestions: HashMap::new(),
+            ai_overlay_offsets: HashMap::new(),
+            ai_logged_missing_anchors: HashSet::new(),
+            ai_notice: None,
+            ai_analysis_error: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             display_epoch: 0,
@@ -1271,6 +1392,8 @@ impl MergeToolApp {
             remote_conflict_cursor: self.remote_conflict_cursor,
             local_navigation_target: self.local_navigation_target,
             remote_navigation_target: self.remote_navigation_target,
+            ai_suggestions: self.ai_suggestions.clone(),
+            ai_overlay_offsets: self.ai_overlay_offsets.clone(),
         }
     }
 
@@ -1283,6 +1406,9 @@ impl MergeToolApp {
         self.remote_conflict_cursor = snapshot.remote_conflict_cursor;
         self.local_navigation_target = snapshot.local_navigation_target;
         self.remote_navigation_target = snapshot.remote_navigation_target;
+        self.ai_suggestions = snapshot.ai_suggestions;
+        self.ai_overlay_offsets = snapshot.ai_overlay_offsets;
+        self.ai_logged_missing_anchors.clear();
         self.rebuild_display_rows();
     }
 
@@ -1304,6 +1430,7 @@ impl MergeToolApp {
             .map(|row| row.text.to_owned())
             .collect();
         self.manual_result_override = false;
+        self.shared_scroll_x = 0.0;
         self.shared_scroll_y = 0.0;
         self.local_conflict_cursor = 0;
         self.remote_conflict_cursor = 0;
@@ -1349,6 +1476,191 @@ impl MergeToolApp {
 
     fn can_apply_result(&self) -> bool {
         self.write_task.is_none() && self.unresolved_conflict_count() == 0
+    }
+
+    fn request_ai_analysis(&mut self) {
+        if self.ai_task.is_some()
+            || (self.document.conflicts().is_empty()
+                && base_only_display_groups(&self.document).is_empty())
+        {
+            crate::diagnostics::merge_ai_trace(
+                "request.skipped",
+                "reason=already_running_or_no_targets",
+            );
+            return;
+        }
+        let Some(sources) = self.sources.clone() else {
+            let error = mt(self.language, "ai_sources_unavailable").to_owned();
+            crate::diagnostics::merge_ai_trace(
+                "request.failed",
+                &format!("stage=sources error={error}"),
+            );
+            self.ai_analysis_error = Some(error);
+            return;
+        };
+        let args = self.args.clone();
+        let document = self.document.clone();
+        crate::diagnostics::merge_ai_trace(
+            "request.clicked",
+            &format!(
+                "model_name={} output={} conflicts={} deletions={} language={:?}",
+                args.ai_model_name.as_deref().unwrap_or("<selected>"),
+                args.output.display(),
+                document.conflicts().len(),
+                base_only_display_groups(&document).len(),
+                args.language,
+            ),
+        );
+        let (sender, receiver) = mpsc::channel();
+        self.ai_suggestions.clear();
+        self.ai_overlay_offsets.clear();
+        self.ai_logged_missing_anchors.clear();
+        self.ai_task = Some(receiver);
+        self.ai_notice = None;
+        self.ai_analysis_error = None;
+        thread::spawn(move || {
+            let result = crate::app::load_merge_ai_model_config(args.ai_model_name.as_deref())
+                .and_then(|config| {
+                    crate::diagnostics::merge_ai_trace(
+                        "config.loaded",
+                        &format!(
+                            "name={} format={:?} base_url={} model_id={} api_key_present={}",
+                            config.name,
+                            config.api_format,
+                            merge_ai_url_for_log(&config.base_url),
+                            config.model_id,
+                            !config.api_key.trim().is_empty(),
+                        ),
+                    );
+                    let context = collect_merge_ai_context(&args)?;
+                    crate::diagnostics::merge_ai_trace(
+                        "context.collected",
+                        &format!(
+                            "history_chars={} related_chars={} base_chars={} local_chars={} remote_chars={}",
+                            context.history.chars().count(),
+                            context.related_files.chars().count(),
+                            sources.base.chars().count(),
+                            sources.local.chars().count(),
+                            sources.remote.chars().count(),
+                        ),
+                    );
+                    request_merge_ai_suggestions(&config, &args, &sources, &document, &context)
+                });
+            match &result {
+                Ok(suggestions) => crate::diagnostics::merge_ai_trace(
+                    "request.finished",
+                    &format!("accepted_suggestions={}", suggestions.len()),
+                ),
+                Err(error) => {
+                    crate::diagnostics::merge_ai_trace("request.failed", &format!("error={error}"))
+                }
+            }
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_ai_task(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.ai_task.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(suggestions)) => {
+                let suggestion_count = suggestions.len();
+                self.ai_suggestions = suggestions
+                    .into_iter()
+                    .map(|suggestion| (suggestion.target, suggestion))
+                    .collect();
+                self.ai_overlay_offsets.clear();
+                self.ai_logged_missing_anchors.clear();
+                self.ai_notice = Some(if suggestion_count == 0 {
+                    MergeAiNotice::NoSuggestions
+                } else {
+                    MergeAiNotice::Completed(suggestion_count)
+                });
+                self.ai_analysis_error = None;
+                crate::diagnostics::merge_ai_trace(
+                    "ui.received",
+                    &format!("suggestions={suggestion_count}"),
+                );
+                ctx.request_repaint();
+            }
+            Ok(Err(error)) => {
+                crate::diagnostics::merge_ai_trace("ui.error", &format!("error={error}"));
+                self.ai_analysis_error = Some(error);
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.ai_task = Some(receiver);
+                ctx.request_repaint_after(Duration::from_millis(80));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let error = mt(self.language, "ai_analysis_stopped").to_owned();
+                crate::diagnostics::merge_ai_trace(
+                    "ui.error",
+                    &format!("stage=channel_disconnected error={error}"),
+                );
+                self.ai_analysis_error = Some(error);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn apply_ai_suggestion(&mut self, target: MergeLineActionTarget) {
+        if self.manual_result_override {
+            return;
+        }
+        let Some(choice) = self
+            .ai_suggestions
+            .get(&target)
+            .map(|suggestion| suggestion.choice.clone())
+        else {
+            return;
+        };
+        let chosen_side = match choice {
+            MergeAiChoice::Local => MergeSide::Local,
+            MergeAiChoice::Remote => MergeSide::Remote,
+            MergeAiChoice::Manual => return,
+        };
+        let base_only_group = match target {
+            MergeLineActionTarget::BaseOnlyGroup(line_index) => {
+                let Some(group) = base_only_display_groups(&self.document)
+                    .into_iter()
+                    .find(|group| group.line_index == line_index)
+                else {
+                    return;
+                };
+                Some(group)
+            }
+            MergeLineActionTarget::Conflict(_) => None,
+        };
+        let before = self.snapshot();
+        match target {
+            MergeLineActionTarget::Conflict(conflict_index) => {
+                self.document.apply_conflict(conflict_index, chosen_side)
+            }
+            MergeLineActionTarget::BaseOnlyGroup(line_index) => {
+                let group = base_only_group.expect("base-only suggestion target was validated");
+                if chosen_side == group.missing_side {
+                    self.document
+                        .take_base_only_group(line_index, group.missing_side);
+                } else {
+                    self.document
+                        .drop_base_only_group(line_index, group.missing_side);
+                }
+            }
+        }
+        self.ai_suggestions.remove(&target);
+        self.ai_overlay_offsets
+            .retain(|(current, _), _| *current != target);
+        self.result_text = self.document.result_text();
+        self.reset_manual_result_lines();
+        self.finish_document_edit(before);
+    }
+
+    fn ignore_ai_suggestion(&mut self, target: MergeLineActionTarget) {
+        self.ai_suggestions.remove(&target);
+        self.ai_overlay_offsets
+            .retain(|(current, _), _| *current != target);
     }
 
     fn undo(&mut self) -> bool {
@@ -1717,10 +2029,780 @@ fn stage_merge_output(repo_root: &Path, output: &Path) -> anyhow::Result<()> {
     }
 }
 
+fn collect_merge_ai_context(args: &MergeArgs) -> Result<MergeAiContext, String> {
+    let Some(repo_root) = args.repo_root.as_deref() else {
+        return Ok(MergeAiContext::default());
+    };
+    let relative_output = args
+        .output
+        .strip_prefix(repo_root)
+        .unwrap_or(&args.output)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let history = git_context_output(
+        repo_root,
+        [
+            "log".to_owned(),
+            "--all".to_owned(),
+            "--format=%H%n%s%n%b%n---".to_owned(),
+            "-n".to_owned(),
+            "16".to_owned(),
+            "--".to_owned(),
+            relative_output.clone(),
+        ],
+    )
+    .unwrap_or_default();
+    let commit_ids = git_context_output(
+        repo_root,
+        [
+            "log".to_owned(),
+            "--all".to_owned(),
+            "--format=%H".to_owned(),
+            "-n".to_owned(),
+            "16".to_owned(),
+            "--".to_owned(),
+            relative_output.clone(),
+        ],
+    )
+    .unwrap_or_default();
+    let mut related_paths = git_context_output(
+        repo_root,
+        [
+            "diff".to_owned(),
+            "--name-only".to_owned(),
+            "--diff-filter=U".to_owned(),
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    related_paths.push(relative_output);
+    for commit in commit_ids.lines().filter(|line| !line.trim().is_empty()) {
+        if let Ok(paths) = git_context_output(
+            repo_root,
+            [
+                "show".to_owned(),
+                "--format=".to_owned(),
+                "--name-only".to_owned(),
+                "--no-renames".to_owned(),
+                commit.to_owned(),
+            ],
+        ) {
+            related_paths.extend(paths.lines().map(str::to_owned));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut related_files = String::new();
+    for relative_path in related_paths {
+        let normalized = relative_path.trim().replace('\\', "/");
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        let relative = Path::new(&normalized);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            continue;
+        }
+        let path = repo_root.join(&normalized);
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || related_files.len() >= MERGE_AI_MAX_CONTEXT_BYTES {
+            continue;
+        }
+        let remaining = MERGE_AI_MAX_CONTEXT_BYTES.saturating_sub(related_files.len());
+        let max_file_bytes = MERGE_AI_MAX_RELATED_FILE_BYTES.min(remaining);
+        let Ok(mut file) = fs::File::open(&path) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        if file
+            .by_ref()
+            .take(max_file_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        let truncated = bytes.len() > max_file_bytes;
+        bytes.truncate(max_file_bytes);
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        related_files.push_str("\n--- related file: ");
+        related_files.push_str(&normalized);
+        related_files.push_str(" ---\n");
+        related_files.push_str(&text);
+        if !text.ends_with('\n') {
+            related_files.push('\n');
+        }
+        if truncated {
+            related_files.push_str("[file excerpt truncated]\n");
+        }
+    }
+    Ok(MergeAiContext {
+        history: truncate_merge_ai_text(&history, MERGE_AI_MAX_HISTORY_CHARS),
+        related_files,
+    })
+}
+
+fn git_context_output<I>(repo_root: &Path, args: I) -> Result<String, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut command = Command::new("git");
+    #[cfg(target_os = "windows")]
+    command.creation_flags(MERGE_WINDOWS_CREATE_NO_WINDOW);
+    let output = command
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .map_err(|error| format!("Unable to read Git context: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+fn request_merge_ai_suggestions(
+    config: &crate::app::MergeAiModelConfig,
+    args: &MergeArgs,
+    sources: &MergeSourceText,
+    document: &MergeDocument,
+    context: &MergeAiContext,
+) -> Result<Vec<MergeAiSuggestion>, String> {
+    let endpoint = merge_ai_endpoint(config)?;
+    let prompt = merge_ai_prompt(args, sources, document, context);
+    crate::diagnostics::merge_ai_trace(
+        "http.start",
+        &format!(
+            "format={:?} endpoint={} model_id={} prompt_chars={} targets={}",
+            config.api_format,
+            merge_ai_url_for_log(&endpoint),
+            config.model_id,
+            prompt.chars().count(),
+            document.conflicts().len() + base_only_display_groups(document).len(),
+        ),
+    );
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(90))
+        .build();
+    let response = match config.api_format {
+        crate::app::MergeAiApiFormat::OpenAiCompatible => agent
+            .post(&endpoint)
+            .set(
+                "Authorization",
+                &format!("Bearer {}", config.api_key.trim()),
+            )
+            .set("Content-Type", "application/json")
+            .send_json(serde_json::json!({
+                "model": config.model_id.trim(),
+                "temperature": 0.1,
+                "messages": [
+                    { "role": "system", "content": merge_ai_system_prompt() },
+                    { "role": "user", "content": prompt },
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": MERGE_AI_TOOL_NAME,
+                        "description": "Submit one validated recommendation for every merge conflict and deletion decision.",
+                        "parameters": merge_ai_suggestions_input_schema(),
+                    }
+                }],
+                "tool_choice": {
+                    "type": "function",
+                    "function": { "name": MERGE_AI_TOOL_NAME }
+                },
+            })),
+        crate::app::MergeAiApiFormat::Claude => agent
+            .post(&endpoint)
+            .set("x-api-key", config.api_key.trim())
+            .set("anthropic-version", "2023-06-01")
+            .set("Content-Type", "application/json")
+            .send_json(serde_json::json!({
+                "model": config.model_id.trim(),
+                "max_tokens": 4096,
+                "temperature": 0.1,
+                // Merge suggestions are a compact machine-readable result. Disabling extended
+                // thinking prevents compatible providers whose thinking defaults to on from
+                // spending the whole output budget before emitting the final text block.
+                "thinking": { "type": "disabled" },
+                "system": merge_ai_system_prompt(),
+                "messages": [{ "role": "user", "content": prompt }],
+                "tools": [{
+                    "name": MERGE_AI_TOOL_NAME,
+                    "description": "Submit one validated recommendation for every merge conflict and deletion decision.",
+                    "input_schema": merge_ai_suggestions_input_schema(),
+                }],
+                "tool_choice": { "type": "tool", "name": MERGE_AI_TOOL_NAME },
+            })),
+    }
+    .map_err(|error| match error {
+        ureq::Error::Status(status, response) => {
+            let detail = response.into_string().unwrap_or_default();
+            let detail = truncate_merge_ai_text(&detail, 500);
+            if detail.is_empty() {
+                format!("AI server returned HTTP {status}")
+            } else {
+                format!("AI server returned HTTP {status}: {detail}")
+            }
+        }
+        ureq::Error::Transport(error) => format!("AI request failed: {error}"),
+    })?;
+    crate::diagnostics::merge_ai_trace("http.success", "status=2xx");
+    let response: serde_json::Value = response
+        .into_json()
+        .map_err(|_| "AI server returned an invalid JSON response".to_owned())?;
+    crate::diagnostics::merge_ai_trace(
+        "response.structure",
+        &merge_ai_response_structure(config.api_format, &response),
+    );
+    let (content, response_mode) = merge_ai_response_payload(config.api_format, &response)?;
+    crate::diagnostics::merge_ai_trace(
+        "response.payload",
+        &format!(
+            "mode={} chars={} preview={}",
+            response_mode,
+            content.chars().count(),
+            serde_json::to_string(&truncate_merge_ai_text(&content, 4_000))
+                .unwrap_or_else(|_| "\"<encode error>\"".to_owned()),
+        ),
+    );
+    let mut valid_targets = document
+        .conflicts()
+        .iter()
+        .map(|conflict| MergeLineActionTarget::Conflict(conflict.index))
+        .collect::<HashSet<_>>();
+    valid_targets.extend(
+        base_only_display_groups(document)
+            .into_iter()
+            .map(|group| MergeLineActionTarget::BaseOnlyGroup(group.line_index)),
+    );
+    parse_merge_ai_suggestions(&content, &valid_targets, args.language)
+}
+
+fn merge_ai_url_for_log(value: &str) -> &str {
+    value.split_once('?').map_or(value, |(path, _)| path)
+}
+
+fn merge_ai_suggestions_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "suggestions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "target_type": {
+                            "type": "string",
+                            "enum": ["conflict", "deletion"]
+                        },
+                        "target_index": { "type": "integer", "minimum": 0 },
+                        "choice": {
+                            "type": "string",
+                            "enum": ["left", "right", "manual"]
+                        },
+                        "reason_zh": {
+                            "type": "string",
+                            "description": "A concise Simplified Chinese explanation using 左边、右边、中间 for the three panes."
+                        },
+                        "reason_en": {
+                            "type": "string",
+                            "description": "A concise English explanation using Left, Right, and Middle for the three panes."
+                        }
+                    },
+                    "required": ["target_type", "target_index", "choice", "reason_zh", "reason_en"]
+                }
+            }
+        },
+        "required": ["suggestions"]
+    })
+}
+
+fn merge_ai_endpoint(config: &crate::app::MergeAiModelConfig) -> Result<String, String> {
+    let base_url = config.base_url.trim().trim_end_matches('/');
+    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+        return Err("AI base URL must start with http:// or https://".to_owned());
+    }
+    let suffix = match config.api_format {
+        crate::app::MergeAiApiFormat::OpenAiCompatible => "chat/completions",
+        crate::app::MergeAiApiFormat::Claude if base_url.ends_with("/v1") => "messages",
+        crate::app::MergeAiApiFormat::Claude => "v1/messages",
+    };
+    Ok(format!("{base_url}/{suffix}"))
+}
+
+fn merge_ai_response_content(
+    format: crate::app::MergeAiApiFormat,
+    response: &serde_json::Value,
+) -> Result<String, String> {
+    let content = match format {
+        crate::app::MergeAiApiFormat::OpenAiCompatible => response
+            .pointer("/choices/0/message/content")
+            .and_then(merge_ai_content_value_text),
+        crate::app::MergeAiApiFormat::Claude => response
+            .get("content")
+            .and_then(merge_ai_content_value_text)
+            // A few API gateways expose an Anthropic request endpoint but keep an OpenAI-style
+            // response envelope. Accept that common compatibility shape without weakening target
+            // validation of the suggestion JSON itself.
+            .or_else(|| {
+                response
+                    .pointer("/choices/0/message/content")
+                    .and_then(merge_ai_content_value_text)
+            }),
+    };
+    content
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| "AI response did not include a text completion".to_owned())
+}
+
+fn merge_ai_response_payload(
+    format: crate::app::MergeAiApiFormat,
+    response: &serde_json::Value,
+) -> Result<(String, &'static str), String> {
+    let preferred = match format {
+        crate::app::MergeAiApiFormat::OpenAiCompatible => {
+            merge_ai_openai_tool_arguments(response).map(|payload| (payload, "openai_function"))
+        }
+        crate::app::MergeAiApiFormat::Claude => {
+            merge_ai_claude_tool_input(response).map(|payload| (payload, "anthropic_tool_use"))
+        }
+    };
+    if let Some((payload, mode)) = preferred {
+        return payload
+            .map(|payload| (payload, mode))
+            .map_err(|error| format!("AI tool arguments were invalid: {error}"));
+    }
+
+    // Compatibility gateways occasionally keep the other provider's response envelope even when
+    // accepting the configured request style.
+    let compatible = match format {
+        crate::app::MergeAiApiFormat::OpenAiCompatible => {
+            merge_ai_claude_tool_input(response).map(|payload| (payload, "anthropic_tool_use"))
+        }
+        crate::app::MergeAiApiFormat::Claude => {
+            merge_ai_openai_tool_arguments(response).map(|payload| (payload, "openai_function"))
+        }
+    };
+    if let Some((payload, mode)) = compatible {
+        return payload
+            .map(|payload| (payload, mode))
+            .map_err(|error| format!("AI tool arguments were invalid: {error}"));
+    }
+
+    merge_ai_response_content(format, response).map(|content| (content, "text_fallback"))
+}
+
+fn merge_ai_openai_tool_arguments(response: &serde_json::Value) -> Option<Result<String, String>> {
+    let function = response
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|calls| {
+            calls.iter().find_map(|call| {
+                let function = call.get("function")?;
+                (function.get("name").and_then(serde_json::Value::as_str)
+                    == Some(MERGE_AI_TOOL_NAME))
+                .then_some(function)
+            })
+        })
+        .or_else(|| {
+            let function = response.pointer("/choices/0/message/function_call")?;
+            (function.get("name").and_then(serde_json::Value::as_str) == Some(MERGE_AI_TOOL_NAME))
+                .then_some(function)
+        })?;
+    Some(merge_ai_tool_arguments_value(function.get("arguments")))
+}
+
+fn merge_ai_claude_tool_input(response: &serde_json::Value) -> Option<Result<String, String>> {
+    let input = response
+        .get("content")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find_map(|block| {
+            (block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                && block.get("name").and_then(serde_json::Value::as_str)
+                    == Some(MERGE_AI_TOOL_NAME))
+            .then(|| block.get("input"))
+            .flatten()
+        })?;
+    Some(
+        serde_json::to_string(input)
+            .map_err(|error| format!("unable to encode Anthropic tool input: {error}")),
+    )
+}
+
+fn merge_ai_tool_arguments_value(value: Option<&serde_json::Value>) -> Result<String, String> {
+    let value = value.ok_or_else(|| "missing function arguments".to_owned())?;
+    if let Some(arguments) = value.as_str() {
+        serde_json::from_str::<serde_json::Value>(arguments)
+            .map_err(|error| format!("function arguments are not valid JSON: {error}"))?;
+        return Ok(arguments.to_owned());
+    }
+    serde_json::to_string(value).map_err(|error| format!("unable to encode arguments: {error}"))
+}
+
+fn merge_ai_content_value_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_owned());
+    }
+    let blocks = value.as_array()?;
+    Some(
+        blocks
+            .iter()
+            .filter_map(|block| {
+                block
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| block.get("content").and_then(serde_json::Value::as_str))
+            })
+            .collect::<String>(),
+    )
+}
+
+fn merge_ai_response_structure(
+    format: crate::app::MergeAiApiFormat,
+    response: &serde_json::Value,
+) -> String {
+    let top_level_keys = response
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_else(|| "<non-object>".to_owned());
+    match format {
+        crate::app::MergeAiApiFormat::Claude => {
+            let blocks = response
+                .get("content")
+                .and_then(serde_json::Value::as_array);
+            let block_types = blocks
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .map(|block| {
+                            block
+                                .get("type")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("<unknown>")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_else(|| "<not-array>".to_owned());
+            let tool_names = blocks
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(serde_json::Value::as_str)
+                                == Some("tool_use")
+                        })
+                        .filter_map(|block| block.get("name").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .filter(|names| !names.is_empty())
+                .unwrap_or_else(|| "<none>".to_owned());
+            format!(
+                "format=Claude keys={top_level_keys} stop_reason={} content_types={} tool_names={} input_tokens={} output_tokens={}",
+                response
+                    .get("stop_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<missing>"),
+                block_types,
+                tool_names,
+                response
+                    .pointer("/usage/input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or_else(|| "<missing>".to_owned(), |value| value.to_string()),
+                response
+                    .pointer("/usage/output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or_else(|| "<missing>".to_owned(), |value| value.to_string()),
+            )
+        }
+        crate::app::MergeAiApiFormat::OpenAiCompatible => {
+            let tool_names = response
+                .pointer("/choices/0/message/tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| {
+                            call.pointer("/function/name")
+                                .and_then(serde_json::Value::as_str)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .filter(|names| !names.is_empty())
+                .unwrap_or_else(|| "<none>".to_owned());
+            format!(
+                "format=OpenAiCompatible keys={top_level_keys} finish_reason={} content_kind={} tool_names={} prompt_tokens={} completion_tokens={}",
+                response
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<missing>"),
+                response
+                    .pointer("/choices/0/message/content")
+                    .map(|content| if content.is_string() {
+                        "string"
+                    } else if content.is_array() {
+                        "array"
+                    } else {
+                        "other"
+                    })
+                    .unwrap_or("<missing>"),
+                tool_names,
+                response
+                    .pointer("/usage/prompt_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or_else(|| "<missing>".to_owned(), |value| value.to_string()),
+                response
+                    .pointer("/usage/completion_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or_else(|| "<missing>".to_owned(), |value| value.to_string()),
+            )
+        }
+    }
+}
+
+fn parse_merge_ai_suggestions(
+    response: &str,
+    valid_targets: &HashSet<MergeLineActionTarget>,
+    _language: MergeLanguage,
+) -> Result<Vec<MergeAiSuggestion>, String> {
+    let response = response
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```");
+    let response = response.trim_end_matches("```").trim();
+    let value: serde_json::Value = serde_json::from_str(response)
+        .map_err(|_| "AI did not return the requested suggestion JSON".to_owned())?;
+    let items = value
+        .get("suggestions")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+        .ok_or_else(|| "AI response did not include suggestions".to_owned())?;
+    let mut used = HashSet::new();
+    let mut suggestions = Vec::new();
+    let mut missing_index = 0usize;
+    let mut unsupported_target_type = 0usize;
+    let mut invalid_target = 0usize;
+    let mut duplicate_target = 0usize;
+    let mut unsupported_choice = 0usize;
+    for item in items {
+        let Some(index) = item
+            .get("target_index")
+            .or_else(|| item.get("conflict_index"))
+            .and_then(serde_json::Value::as_u64)
+        else {
+            missing_index += 1;
+            trace_rejected_merge_ai_item("missing_index", item);
+            continue;
+        };
+        let index = index as usize;
+        let target_type = item
+            .get("target_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("conflict")
+            .trim()
+            .to_ascii_lowercase();
+        let target = match target_type.as_str() {
+            "conflict" => MergeLineActionTarget::Conflict(index),
+            "deletion" | "base_only" | "base-only" => MergeLineActionTarget::BaseOnlyGroup(index),
+            _ => {
+                unsupported_target_type += 1;
+                trace_rejected_merge_ai_item("unsupported_target_type", item);
+                continue;
+            }
+        };
+        if !valid_targets.contains(&target) {
+            invalid_target += 1;
+            trace_rejected_merge_ai_item("target_not_in_document", item);
+            continue;
+        }
+        if !used.insert(target) {
+            duplicate_target += 1;
+            trace_rejected_merge_ai_item("duplicate_target", item);
+            continue;
+        }
+        let choice_value = item
+            .get("choice")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let choice = match choice_value.as_str() {
+            "local" | "left" => MergeAiChoice::Local,
+            "remote" | "right" | "theirs" => MergeAiChoice::Remote,
+            "manual" | "none" | "uncertain" => MergeAiChoice::Manual,
+            _ => {
+                unsupported_choice += 1;
+                trace_rejected_merge_ai_item("unsupported_choice", item);
+                continue;
+            }
+        };
+        let legacy_reason = item
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.trim().is_empty());
+        let reason_zh = item
+            .get("reason_zh")
+            .and_then(serde_json::Value::as_str)
+            .or(legacy_reason)
+            .map(|reason| truncate_merge_ai_text(reason, 700))
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| mt(MergeLanguage::Chinese, "ai_no_reason").to_owned());
+        let reason_en = item
+            .get("reason_en")
+            .and_then(serde_json::Value::as_str)
+            .or(legacy_reason)
+            .map(|reason| truncate_merge_ai_text(reason, 700))
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| mt(MergeLanguage::English, "ai_no_reason").to_owned());
+        crate::diagnostics::merge_ai_trace(
+            "parse.accepted",
+            &format!("target={target:?} choice={choice:?}"),
+        );
+        suggestions.push(MergeAiSuggestion {
+            target,
+            choice,
+            reason_zh,
+            reason_en,
+        });
+    }
+    crate::diagnostics::merge_ai_trace(
+        "parse.summary",
+        &format!(
+            "items={} accepted={} missing_index={} unsupported_target_type={} invalid_target={} duplicate_target={} unsupported_choice={}",
+            items.len(),
+            suggestions.len(),
+            missing_index,
+            unsupported_target_type,
+            invalid_target,
+            duplicate_target,
+            unsupported_choice,
+        ),
+    );
+    Ok(suggestions)
+}
+
+fn trace_rejected_merge_ai_item(reason: &str, item: &serde_json::Value) {
+    let preview = serde_json::to_string(item).unwrap_or_else(|_| "<encode error>".to_owned());
+    crate::diagnostics::merge_ai_trace(
+        "parse.rejected",
+        &format!(
+            "reason={reason} item={}",
+            truncate_merge_ai_text(&preview, 1_000)
+        ),
+    );
+}
+
+fn merge_ai_system_prompt() -> &'static str {
+    "You are a conservative Git merge assistant. Never claim to edit files and never execute changes. Analyze each conflict and deletion decision using the supplied three-way text, Git history, and related file context. The panes are named Left, Middle, and Right; they do not imply local or remote repository ownership. Recommend left only when the Left pane should win, right only when the Right pane should win, or manual when the Middle result needs human editing. Submit recommendations exactly once through the submit_merge_suggestions tool."
+}
+
+fn merge_ai_prompt(
+    args: &MergeArgs,
+    sources: &MergeSourceText,
+    document: &MergeDocument,
+    context: &MergeAiContext,
+) -> String {
+    let conflicts = document
+        .conflicts()
+        .iter()
+        .map(|conflict| {
+            format!(
+                "\n## Conflict {}\nBASE:\n{}\nLEFT:\n{}\nRIGHT:\n{}\n",
+                conflict.index,
+                conflict.base.join("\n"),
+                conflict.local.join("\n"),
+                conflict.remote.join("\n"),
+            )
+        })
+        .collect::<String>();
+    let deletions = base_only_display_groups(document)
+        .into_iter()
+        .map(|group| {
+            let lines = &document.lines[group.line_index..group.line_index + group.line_count];
+            let side_name = match group.missing_side {
+                MergeSide::Local => "LEFT",
+                MergeSide::Remote => "RIGHT",
+            };
+            format!(
+                "\n## Deletion {}\nThe {} pane deleted this block. Choosing {} accepts the deletion; choosing the other pane keeps the block.\nBASE:\n{}\nLEFT:\n{}\nRIGHT:\n{}\n",
+                group.line_index,
+                side_name,
+                side_name,
+                lines
+                    .iter()
+                    .filter_map(|line| line.base.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                lines
+                    .iter()
+                    .filter_map(|line| line.local.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                lines
+                    .iter()
+                    .filter_map(|line| line.remote.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        })
+        .collect::<String>();
+    let sources = format!(
+        "BASE FILE EXCERPT:\n{}\nLEFT FILE EXCERPT:\n{}\nRIGHT FILE EXCERPT:\n{}",
+        truncate_merge_ai_text(&sources.base, 32 * 1024),
+        truncate_merge_ai_text(&sources.local, 32 * 1024),
+        truncate_merge_ai_text(&sources.remote, 32 * 1024),
+    );
+    format!(
+        "Analyze a merge for `{}`. For every suggestion, write both `reason_zh` in Simplified Chinese and `reason_en` in English. In those reasons call the panes 左边/中间/右边 and Left/Middle/Right respectively; never infer or say local branch or remote branch. Call `{MERGE_AI_TOOL_NAME}` exactly once and include one suggestion for every conflict and every deletion decision. The call is advisory only: do not claim that any file or merge result was changed.\n\nCONFLICTS:{conflicts}\n\nDELETION DECISIONS:{deletions}\n\nGIT HISTORY:\n{}\n\nRELATED FILE CONTEXT:{}\n\n{}",
+        args.output.display(),
+        if context.history.is_empty() {
+            "(unavailable)"
+        } else {
+            &context.history
+        },
+        if context.related_files.is_empty() {
+            "(none found)"
+        } else {
+            &context.related_files
+        },
+        sources,
+    )
+}
+
+fn truncate_merge_ai_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    truncated.push_str("\n[context truncated]");
+    truncated
+}
+
 impl App for MergeToolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_load_task(ctx);
         self.poll_write_task(ctx);
+        self.poll_ai_task(ctx);
         self.handle_close_request(ctx);
         let palette = merge_palette(self.theme);
         apply_merge_theme(ctx, self.theme);
@@ -2238,6 +3320,29 @@ fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
                 Vec2::new(controls_width, ui.available_height()),
                 Layout::right_to_left(Align::Center),
                 |ui| {
+                    let ai_loading = app.ai_task.is_some();
+                    if merge_toolbar_ai_button(ui, app.language, ai_loading, palette).clicked() {
+                        app.request_ai_analysis();
+                    }
+                    if ai_loading {
+                        ui.label(
+                            RichText::new(mt(app.language, "ai_analyzing"))
+                                .small()
+                                .color(palette.accent),
+                        );
+                    } else if let Some(notice) = app.ai_notice {
+                        let text = match notice {
+                            MergeAiNotice::Completed(count) => format!(
+                                "{} {count} {}",
+                                mt(app.language, "ai_completed_prefix"),
+                                mt(app.language, "ai_completed_suffix")
+                            ),
+                            MergeAiNotice::NoSuggestions => {
+                                mt(app.language, "ai_no_suggestions").to_owned()
+                            }
+                        };
+                        ui.label(RichText::new(text).small().color(palette.accent));
+                    }
                     if merge_toolbar_toggle_button(
                         ui,
                         MergeToolbarToggleIcon::Language,
@@ -2301,10 +3406,38 @@ fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
                     if let Some(status) = &app.status {
                         ui.label(RichText::new(status).color(palette.conflict_text));
                     }
+                    if let Some(error) = &app.ai_analysis_error {
+                        ui.label(RichText::new(error).small().color(palette.conflict_text));
+                    }
                 },
             );
         },
     );
+}
+
+fn merge_toolbar_ai_button(
+    ui: &mut Ui,
+    language: MergeLanguage,
+    loading: bool,
+    palette: MergePalette,
+) -> egui::Response {
+    if !loading {
+        return merge_toolbar_toggle_button(
+            ui,
+            MergeToolbarToggleIcon::Ai,
+            mt(language, "ai_analyze"),
+            false,
+            palette,
+        );
+    }
+    let output = egui::Frame::new()
+        .fill(palette.accent)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(5))
+        .show(ui, |ui| {
+            ui.add(egui::Spinner::new().size(18.0).color(Color32::WHITE));
+        });
+    output.response.on_hover_text(mt(language, "ai_analyzing"))
 }
 
 fn merge_toolbar_toggle_button(
@@ -2338,6 +3471,7 @@ fn merge_toolbar_toggle_button(
 
 fn merge_toolbar_icon_source(icon: MergeToolbarToggleIcon) -> egui::ImageSource<'static> {
     match icon {
+        MergeToolbarToggleIcon::Ai => egui::include_image!("../assets/icons/merge-ai.svg"),
         MergeToolbarToggleIcon::Collapse => {
             egui::include_image!("../assets/icons/merge-collapse.svg")
         }
@@ -2502,9 +3636,19 @@ fn merge_cancel_confirm_dialog(ctx: &egui::Context, app: &mut MergeToolApp, pale
 }
 
 fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
-    let rect = ui
+    let available = ui
         .available_rect_before_wrap()
         .shrink2(Vec2::new(10.0, 8.0));
+    let rect = Rect::from_min_max(
+        available.min,
+        Pos2::new(
+            available.right(),
+            (available.bottom()
+                - MERGE_HORIZONTAL_SCROLLBAR_HEIGHT
+                - MERGE_HORIZONTAL_SCROLLBAR_GAP)
+                .max(available.top()),
+        ),
+    );
     let gap = MERGE_COLUMN_GAP;
     let panes_width = rect.width() - MERGE_OVERVIEW_WIDTH - MERGE_OVERVIEW_GAP;
     let left_w = (panes_width * 0.32).max(250.0);
@@ -2523,6 +3667,33 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         Pos2::new(right.right() + MERGE_OVERVIEW_GAP, rect.top()),
         Vec2::new(MERGE_OVERVIEW_WIDTH, rect.height()),
     );
+    let horizontal_scrollbar = Rect::from_min_max(
+        Pos2::new(left.left(), rect.bottom() + MERGE_HORIZONTAL_SCROLLBAR_GAP),
+        Pos2::new(
+            right.right(),
+            rect.bottom() + MERGE_HORIZONTAL_SCROLLBAR_GAP + MERGE_HORIZONTAL_SCROLLBAR_HEIGHT,
+        ),
+    );
+    let code_content_width = merge_code_content_width(ui, app, palette);
+    let narrowest_code_viewport = [
+        (left.width() - 12.0 - MERGE_SIDE_CODE_GUTTER_WIDTH).max(1.0),
+        (result.width() - 12.0 - MERGE_RESULT_CODE_GUTTER_WIDTH).max(1.0),
+        (right.width() - 12.0 - MERGE_SIDE_CODE_GUTTER_WIDTH).max(1.0),
+    ]
+    .into_iter()
+    .fold(f32::INFINITY, f32::min);
+    let max_scroll_x = (code_content_width - narrowest_code_viewport).max(0.0);
+    let horizontal_scroll_delta = merge_horizontal_scroll_input(ui, left, result, right);
+    let requested_scroll_x =
+        (app.shared_scroll_x - horizontal_scroll_delta).clamp(0.0, max_scroll_x);
+    if horizontal_scroll_delta.abs() > f32::EPSILON {
+        ui.ctx().request_repaint();
+    }
+    // Capture side-pane wheel input before any ScrollArea has a chance to consume it. The side
+    // panes are driven from result coordinates, so their programmatic offset can legitimately be
+    // clamped when one side has fewer rows. That passive clamp must never be interpreted as user
+    // input or it will write a smaller offset back and make bottom scrolling bounce upward.
+    let side_scroll_input = merge_side_scroll_input(ui, left, right);
 
     let requested_scroll_y = app.shared_scroll_y;
     let mut result_output = MergeResultPanelOutput {
@@ -2535,8 +3706,15 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
     // the source-document coordinates used by the normal three-way anchor mapper.
     let use_direct_shared_scroll = app.collapse_unchanged;
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(result), |ui| {
-        result_output =
-            merge_result_panel(ui, app, "merge_result_scroll", requested_scroll_y, palette);
+        result_output = merge_result_panel(
+            ui,
+            app,
+            "merge_result_scroll",
+            requested_scroll_x,
+            code_content_width,
+            requested_scroll_y,
+            palette,
+        );
     });
     let frame_scroll_y = result_output.scroll_y;
     let mut next_shared_scroll_y = frame_scroll_y;
@@ -2554,7 +3732,10 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
                 app,
                 MergeSide::Local,
                 "merge_local_scroll",
+                requested_scroll_x,
+                code_content_width,
                 local_scroll_y,
+                side_scroll_input.is_some_and(|(side, _)| side == MergeSide::Local),
                 palette,
             )
         })
@@ -2573,7 +3754,10 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
                 app,
                 MergeSide::Remote,
                 "merge_remote_scroll",
+                requested_scroll_x,
+                code_content_width,
                 remote_scroll_y,
+                side_scroll_input.is_some_and(|(side, _)| side == MergeSide::Remote),
                 palette,
             )
         })
@@ -2595,6 +3779,18 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         stable_content_height,
         app.collapse_unchanged,
     );
+    if let Some((_, scroll_delta_y)) = side_scroll_input {
+        // ScrollArea uses `offset -= smooth_scroll_delta`. Apply the same movement directly in the
+        // canonical result coordinate system; this also works when the pointed-at side contains
+        // too few rows to scroll by itself.
+        next_shared_scroll_y = merge_scroll_offset_after_input(
+            frame_scroll_y,
+            scroll_delta_y,
+            result_output.viewport_height,
+            stable_content_height,
+        );
+        ui.ctx().request_repaint();
+    }
     // Virtual ScrollAreas only record geometry for rows materialized in this frame.
     // The connector painter already ignores blocks without recorded geometry, so keep it
     // enabled for large files and paint only the currently visible conflict fragments.
@@ -2604,7 +3800,22 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         &local_output.geometry,
         &result_output.geometry,
         &remote_output.geometry,
+        MergeConnectorColumns {
+            local: left,
+            result,
+            remote: right,
+        },
+        app.local_conflict_cursor,
+        app.remote_conflict_cursor,
         app.connector_debug,
+        palette,
+    );
+    let ai_overlay_action = merge_ai_suggestion_overlays(
+        ui.ctx(),
+        app,
+        &local_output.geometry,
+        &result_output.geometry,
+        &remote_output.geometry,
         palette,
     );
     if let Some(scroll_y) = merge_overview_target(
@@ -2619,6 +3830,14 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         next_shared_scroll_y = scroll_y;
         ui.ctx().request_repaint();
     }
+    app.shared_scroll_x = merge_shared_horizontal_scrollbar(
+        ui,
+        horizontal_scrollbar,
+        requested_scroll_x,
+        narrowest_code_viewport,
+        code_content_width,
+        palette,
+    );
     app.shared_scroll_y = next_shared_scroll_y;
     // Apply after every pane and connector used the same document snapshot. Mutating while the
     // local pane is rendering used to leave result/remote geometry from a different state.
@@ -2634,6 +3853,528 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         app.apply_line_action(target, side, action);
         ui.ctx().request_repaint();
     }
+    if let Some(action) = ai_overlay_action {
+        match action {
+            MergeAiOverlayAction::Apply(target) => app.apply_ai_suggestion(target),
+            MergeAiOverlayAction::Ignore(target) => app.ignore_ai_suggestion(target),
+        }
+        ui.ctx().request_repaint();
+    }
+}
+
+fn merge_side_scroll_input(ui: &Ui, local: Rect, remote: Rect) -> Option<(MergeSide, f32)> {
+    let (scroll_delta_y, shift) = ui
+        .ctx()
+        .input(|input| (input.smooth_scroll_delta.y, input.modifiers.shift));
+    if shift {
+        return None;
+    }
+    if scroll_delta_y.abs() <= f32::EPSILON {
+        return None;
+    }
+    let pointer = ui.ctx().pointer_hover_pos()?;
+    if local.contains(pointer) {
+        Some((MergeSide::Local, scroll_delta_y))
+    } else if remote.contains(pointer) {
+        Some((MergeSide::Remote, scroll_delta_y))
+    } else {
+        None
+    }
+}
+
+fn merge_horizontal_scroll_input(ui: &Ui, local: Rect, result: Rect, remote: Rect) -> f32 {
+    let (delta, shift) = ui
+        .ctx()
+        .input(|input| (input.smooth_scroll_delta, input.modifiers.shift));
+    let horizontal_delta = if delta.x.abs() > f32::EPSILON {
+        delta.x
+    } else if shift {
+        delta.y
+    } else {
+        0.0
+    };
+    if horizontal_delta.abs() <= f32::EPSILON {
+        return 0.0;
+    }
+    let Some(pointer) = ui.ctx().pointer_hover_pos() else {
+        return 0.0;
+    };
+    if local.contains(pointer) || result.contains(pointer) || remote.contains(pointer) {
+        horizontal_delta
+    } else {
+        0.0
+    }
+}
+
+fn merge_scroll_offset_after_input(
+    current_scroll_y: f32,
+    scroll_delta_y: f32,
+    viewport_height: f32,
+    content_height: f32,
+) -> f32 {
+    merge_clamp_scroll_offset(
+        current_scroll_y - scroll_delta_y,
+        content_height,
+        viewport_height,
+    )
+}
+
+fn merge_code_content_width(ui: &Ui, app: &MergeToolApp, palette: MergePalette) -> f32 {
+    let longest_line_bytes = app
+        .local_display_rows
+        .iter()
+        .map(|row| row.text.len())
+        .chain(app.remote_display_rows.iter().map(|row| row.text.len()))
+        .chain(app.manual_result_lines.iter().map(String::len))
+        .max()
+        .unwrap_or(0);
+    let glyph_width = merge_text_width(
+        ui,
+        "M",
+        &FontId::monospace(MERGE_CODE_FONT_SIZE),
+        palette.text,
+    )
+    .max(1.0);
+    longest_line_bytes as f32 * glyph_width + 24.0
+}
+
+fn merge_shared_horizontal_scrollbar(
+    ui: &mut Ui,
+    rect: Rect,
+    current_scroll_x: f32,
+    viewport_width: f32,
+    content_width: f32,
+    palette: MergePalette,
+) -> f32 {
+    let track = rect.shrink2(Vec2::new(2.0, 2.0));
+    if track.width() <= 0.0 || track.height() <= 0.0 {
+        return 0.0;
+    }
+    ui.painter().rect_filled(
+        track,
+        egui::CornerRadius::same(4),
+        color_with_opacity(palette.panel_soft, 0.9),
+    );
+    let max_scroll_x = (content_width - viewport_width).max(0.0);
+    if max_scroll_x <= f32::EPSILON {
+        ui.painter().rect_filled(
+            track,
+            egui::CornerRadius::same(4),
+            color_with_opacity(palette.muted, 0.22),
+        );
+        return 0.0;
+    }
+
+    let thumb_width = (track.width() * (viewport_width / content_width).clamp(0.0, 1.0))
+        .clamp(32.0, track.width());
+    let travel = (track.width() - thumb_width).max(0.0);
+    let current_scroll_x = current_scroll_x.clamp(0.0, max_scroll_x);
+    let thumb_left = track.left() + travel * (current_scroll_x / max_scroll_x);
+    let thumb = Rect::from_min_size(
+        Pos2::new(thumb_left, track.top()),
+        Vec2::new(thumb_width, track.height()),
+    );
+    ui.painter().rect_filled(
+        thumb,
+        egui::CornerRadius::same(4),
+        color_with_opacity(palette.accent, 0.72),
+    );
+    let response = ui
+        .interact(
+            rect,
+            ui.make_persistent_id("merge_shared_horizontal_scrollbar"),
+            Sense::click_and_drag(),
+        )
+        .on_hover_cursor(CursorIcon::ResizeHorizontal);
+    if !response.clicked() && !response.dragged() {
+        return current_scroll_x;
+    }
+    let Some(pointer) = response.interact_pointer_pos() else {
+        return current_scroll_x;
+    };
+    ui.ctx().request_repaint();
+    merge_horizontal_scroll_target(track, pointer.x, thumb_width, max_scroll_x)
+}
+
+fn merge_horizontal_scroll_target(
+    track: Rect,
+    pointer_x: f32,
+    thumb_width: f32,
+    max_scroll_x: f32,
+) -> f32 {
+    let travel = (track.width() - thumb_width).max(0.0);
+    if travel <= f32::EPSILON || max_scroll_x <= f32::EPSILON {
+        return 0.0;
+    }
+    let thumb_left =
+        (pointer_x - thumb_width * 0.5).clamp(track.left(), track.right() - thumb_width);
+    ((thumb_left - track.left()) / travel * max_scroll_x).clamp(0.0, max_scroll_x)
+}
+
+fn merge_scrolled_code_text_rects(
+    row_rect: Rect,
+    gutter_width: f32,
+    scroll_x: f32,
+    content_width: f32,
+) -> (Rect, Rect) {
+    let clip_rect = Rect::from_min_max(
+        Pos2::new(row_rect.left() + gutter_width, row_rect.top()),
+        row_rect.right_bottom(),
+    );
+    let content_rect = Rect::from_min_size(
+        Pos2::new(clip_rect.left() - scroll_x.max(0.0), row_rect.top()),
+        Vec2::new(content_width.max(clip_rect.width()), row_rect.height()),
+    );
+    (clip_rect, content_rect)
+}
+
+fn merge_ai_suggestion_overlays(
+    ctx: &egui::Context,
+    app: &mut MergeToolApp,
+    local_geometry: &MergePanelGeometry,
+    result_geometry: &MergePanelGeometry,
+    remote_geometry: &MergePanelGeometry,
+    palette: MergePalette,
+) -> Option<MergeAiOverlayAction> {
+    if app.ai_task.is_some() || app.manual_result_override {
+        return None;
+    }
+    let suggestions = app.ai_suggestions.values().cloned().collect::<Vec<_>>();
+    let mut action = None;
+    for suggestion in suggestions {
+        let local_action_anchor = merge_ai_action_anchor(
+            &app.document,
+            local_geometry,
+            &app.local_display_rows,
+            suggestion.target,
+            MergeSide::Local,
+        );
+        let remote_action_anchor = merge_ai_action_anchor(
+            &app.document,
+            remote_geometry,
+            &app.remote_display_rows,
+            suggestion.target,
+            MergeSide::Remote,
+        );
+        let (placement, anchor, connector_anchors) =
+            match (local_action_anchor, remote_action_anchor) {
+                (Some(local), Some(remote)) => {
+                    let Some(anchor) = merge_ai_middle_anchor(
+                        &app.document,
+                        result_geometry,
+                        suggestion.target,
+                        local,
+                        remote,
+                    ) else {
+                        continue;
+                    };
+                    (MergeAiCardPlacement::Middle, anchor, vec![local, remote])
+                }
+                (Some(local), None) => {
+                    let Some(anchor) = merge_ai_suggestion_anchor(
+                        &app.document,
+                        local_geometry,
+                        &app.local_display_rows,
+                        suggestion.target,
+                        MergeSide::Local,
+                    ) else {
+                        continue;
+                    };
+                    (
+                        MergeAiCardPlacement::Side(MergeSide::Local),
+                        anchor,
+                        vec![local],
+                    )
+                }
+                (None, Some(remote)) => {
+                    let Some(anchor) = merge_ai_suggestion_anchor(
+                        &app.document,
+                        remote_geometry,
+                        &app.remote_display_rows,
+                        suggestion.target,
+                        MergeSide::Remote,
+                    ) else {
+                        continue;
+                    };
+                    (
+                        MergeAiCardPlacement::Side(MergeSide::Remote),
+                        anchor,
+                        vec![remote],
+                    )
+                }
+                (None, None) => {
+                    for side in [MergeSide::Local, MergeSide::Remote] {
+                        if app
+                            .ai_logged_missing_anchors
+                            .insert((suggestion.target, side))
+                        {
+                            crate::diagnostics::merge_ai_trace(
+                                "ui.anchor_missing",
+                                &format!("target={:?} side={side:?}", suggestion.target),
+                            );
+                        }
+                    }
+                    continue;
+                }
+            };
+        let width = 252.0_f32.min(anchor.width() - 12.0).max(164.0);
+        let x = match placement {
+            MergeAiCardPlacement::Middle => anchor.center().x - width * 0.5,
+            MergeAiCardPlacement::Side(_) => {
+                (anchor.left() + 64.0).min(anchor.right() - width - 8.0)
+            }
+        };
+        let anchor_pos = Pos2::new(x, anchor.top() + 3.0);
+        let offset_key = (suggestion.target, placement);
+        let offset = app
+            .ai_overlay_offsets
+            .get(&offset_key)
+            .copied()
+            .unwrap_or(Vec2::ZERO);
+        let area_id = egui::Id::new(("merge_ai_suggestion", placement, suggestion.target));
+        let language = app.language;
+        let output = egui::Area::new(area_id)
+            .order(egui::Order::Foreground)
+            .current_pos(anchor_pos + offset)
+            .movable(true)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                egui::Frame::new()
+                    .fill(palette.panel)
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(7))
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .shadow(palette.shadow)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "AI · {}",
+                                    merge_ai_choice_label(language, &suggestion.choice)
+                                ))
+                                .small()
+                                .strong()
+                                .color(palette.accent),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(egui::Button::new(RichText::new("×").small()).frame(false))
+                                    .on_hover_text(mt(language, "ai_ignore"))
+                                    .clicked()
+                                {
+                                    action.get_or_insert(MergeAiOverlayAction::Ignore(
+                                        suggestion.target,
+                                    ));
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(suggestion.reason(language))
+                                .small()
+                                .color(palette.text),
+                        );
+                        if !matches!(suggestion.choice, MergeAiChoice::Manual) {
+                            ui.add_space(4.0);
+                            if ui
+                                .small_button(mt(language, "ai_apply_suggestion"))
+                                .on_hover_text(mt(language, "ai_apply_hint"))
+                                .clicked()
+                            {
+                                action
+                                    .get_or_insert(MergeAiOverlayAction::Apply(suggestion.target));
+                            }
+                        }
+                    });
+            });
+        for (index, connector_anchor) in connector_anchors.into_iter().enumerate() {
+            paint_merge_ai_suggestion_connector(
+                ctx,
+                area_id.with(index),
+                connector_anchor,
+                output.response.rect,
+                palette,
+            );
+        }
+        let moved = output.response.rect.min - anchor_pos;
+        let allowed_offset = merge_ai_overlay_allowed_offset(
+            ctx.screen_rect(),
+            anchor_pos,
+            output.response.rect.size(),
+        );
+        app.ai_overlay_offsets.insert(
+            offset_key,
+            Vec2::new(
+                moved.x.clamp(allowed_offset.min.x, allowed_offset.max.x),
+                moved.y.clamp(allowed_offset.min.y, allowed_offset.max.y),
+            ),
+        );
+    }
+    action
+}
+
+fn merge_ai_middle_anchor(
+    document: &MergeDocument,
+    result_geometry: &MergePanelGeometry,
+    target: MergeLineActionTarget,
+    local_anchor: Pos2,
+    remote_anchor: Pos2,
+) -> Option<Rect> {
+    let rect = match target {
+        MergeLineActionTarget::Conflict(index) => document
+            .conflicts()
+            .iter()
+            .find(|conflict| conflict.index == index)
+            .and_then(|conflict| {
+                merge_block_result_rect_from_geometry(document, conflict, result_geometry).or_else(
+                    || merge_conflict_insertion_marker_rect(document, conflict, result_geometry),
+                )
+            }),
+        MergeLineActionTarget::BaseOnlyGroup(line_index) => base_only_display_groups(document)
+            .into_iter()
+            .find(|group| group.line_index == line_index)
+            .and_then(|group| {
+                merge_base_only_result_rect_from_geometry(document, group, result_geometry)
+            }),
+    };
+    rect.or_else(|| {
+        let (left, right) = result_geometry.horizontal_bounds?;
+        let y = (local_anchor.y + remote_anchor.y) * 0.5;
+        Some(Rect::from_min_max(
+            Pos2::new(left, y - MERGE_CODE_ROW_HEIGHT * 0.5),
+            Pos2::new(right, y + MERGE_CODE_ROW_HEIGHT * 0.5),
+        ))
+    })
+}
+
+fn merge_ai_overlay_allowed_offset(viewport: Rect, anchor_pos: Pos2, card_size: Vec2) -> Rect {
+    let min = viewport.min + Vec2::splat(MERGE_AI_OVERLAY_DRAG_MARGIN) - anchor_pos;
+    let max =
+        viewport.max - Vec2::splat(MERGE_AI_OVERLAY_DRAG_MARGIN) - card_size - anchor_pos.to_vec2();
+    Rect::from_min_max(
+        Pos2::new(min.x.min(max.x), min.y.min(max.y)),
+        Pos2::new(min.x.max(max.x), min.y.max(max.y)),
+    )
+}
+
+fn merge_ai_action_anchor(
+    document: &MergeDocument,
+    geometry: &MergePanelGeometry,
+    rows: &[CachedMergeSideDisplayRow],
+    target: MergeLineActionTarget,
+    side: MergeSide,
+) -> Option<Pos2> {
+    let action_row = match target {
+        MergeLineActionTarget::Conflict(_) => geometry.rows.iter().find_map(|(index, rect)| {
+            rows.get(*index)
+                .filter(|row| row.show_conflict_actions && row.action_target == Some(target))
+                .map(|_| *rect)
+        }),
+        MergeLineActionTarget::BaseOnlyGroup(line_index) => {
+            let group = base_only_display_groups(document)
+                .into_iter()
+                .find(|group| group.line_index == line_index)?;
+            (group.missing_side == side)
+                .then(|| merge_base_only_side_rect_from_geometry(document, group, geometry))
+                .flatten()
+                .map(|marker| {
+                    Rect::from_center_size(
+                        marker.center(),
+                        Vec2::new(marker.width(), MERGE_CODE_ROW_HEIGHT),
+                    )
+                })
+                .or_else(|| {
+                    geometry.rows.iter().find_map(|(index, rect)| {
+                        rows.get(*index)
+                            .filter(|row| {
+                                row.show_conflict_actions && row.action_target == Some(target)
+                            })
+                            .map(|_| *rect)
+                    })
+                })
+        }
+    }?;
+    let actions = conflict_action_rects(action_row, side);
+    Some(actions.drop.union(actions.take).right_center())
+}
+
+fn paint_merge_ai_suggestion_connector(
+    ctx: &egui::Context,
+    area_id: egui::Id,
+    action_anchor: Pos2,
+    card_rect: Rect,
+    palette: MergePalette,
+) {
+    let card_anchor = closest_rect_edge_point(card_rect, action_anchor);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        area_id.with("connector"),
+    ));
+    let stroke = egui::Stroke::new(1.5, color_with_opacity(palette.accent, 0.72));
+    painter.line_segment([action_anchor, card_anchor], stroke);
+    painter.circle_filled(action_anchor, 2.25, stroke.color);
+}
+
+fn closest_rect_edge_point(rect: Rect, point: Pos2) -> Pos2 {
+    let clamped_x = point.x.clamp(rect.left(), rect.right());
+    let clamped_y = point.y.clamp(rect.top(), rect.bottom());
+    let edges = [
+        (point.x - rect.left()).abs(),
+        (point.x - rect.right()).abs(),
+        (point.y - rect.top()).abs(),
+        (point.y - rect.bottom()).abs(),
+    ];
+    let edge = edges
+        .iter()
+        .enumerate()
+        .min_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    match edge {
+        0 => Pos2::new(rect.left(), clamped_y),
+        1 => Pos2::new(rect.right(), clamped_y),
+        2 => Pos2::new(clamped_x, rect.top()),
+        _ => Pos2::new(clamped_x, rect.bottom()),
+    }
+}
+
+fn merge_ai_suggestion_anchor(
+    document: &MergeDocument,
+    geometry: &MergePanelGeometry,
+    rows: &[CachedMergeSideDisplayRow],
+    target: MergeLineActionTarget,
+    side: MergeSide,
+) -> Option<Rect> {
+    match target {
+        MergeLineActionTarget::Conflict(conflict_index) => geometry
+            .rows
+            .iter()
+            .filter_map(|(display_index, rect)| {
+                rows.get(*display_index)
+                    .filter(|row| row.conflict_index == Some(conflict_index))
+                    .map(|_| *rect)
+            })
+            .reduce(|merged, rect| merged.union(rect)),
+        MergeLineActionTarget::BaseOnlyGroup(line_index) => {
+            let group = base_only_display_groups(document)
+                .into_iter()
+                .find(|group| group.line_index == line_index)?;
+            if side == group.missing_side {
+                merge_base_only_side_rect_from_geometry(document, group, geometry)
+            } else {
+                let first = merge_side_display_row_for_line(document, side, group.line_index)?;
+                geometry.span_rect(first, group.line_count)
+            }
+        }
+    }
+}
+
+fn merge_ai_choice_label(language: MergeLanguage, choice: &MergeAiChoice) -> &'static str {
+    match choice {
+        MergeAiChoice::Local => mt(language, "ai_choose_local"),
+        MergeAiChoice::Remote => mt(language, "ai_choose_remote"),
+        MergeAiChoice::Manual => mt(language, "ai_manual"),
+    }
 }
 
 fn merge_side_panel(
@@ -2641,7 +4382,10 @@ fn merge_side_panel(
     app: &mut MergeToolApp,
     side: MergeSide,
     scroll_id: &'static str,
+    scroll_x: f32,
+    code_content_width: f32,
     scroll_y: f32,
+    accepts_scroll_input: bool,
     palette: MergePalette,
 ) -> MergeSidePanelOutput {
     let mut requested_result_scroll_y = None;
@@ -2711,12 +4455,17 @@ fn merge_side_panel(
                         row.action_target,
                         background,
                         app.highlight_mode,
+                        scroll_x,
+                        code_content_width,
                         palette,
                         &mut pending_line_action,
                     );
                     geometry.record_row(display_index, rect);
                 }
             });
+        // Use the stable code viewport edge for connector x anchors. It matches the row fill edge
+        // and spans the complete inter-column gap, while remaining independent of scroll_x.
+        geometry.set_horizontal_bounds(output.inner_rect);
         // Missing-side markers use the same visible-row geometry as the virtual list. Keeping
         // them enabled is required for large files; off-screen groups naturally return None.
         if !app.manual_result_override {
@@ -2738,7 +4487,7 @@ fn merge_side_panel(
                 output.content_size.y,
                 output.inner_rect.height(),
             );
-            if (clamped_scroll_y - scroll_y).abs() > f32::EPSILON {
+            if merge_side_offset_changed_by_user(accepts_scroll_input, scroll_y, clamped_scroll_y) {
                 requested_result_scroll_y = Some(if app.collapse_unchanged {
                     clamped_scroll_y
                 } else if use_virtual_rows {
@@ -2762,6 +4511,8 @@ fn merge_result_panel(
     ui: &mut Ui,
     app: &mut MergeToolApp,
     scroll_id: &'static str,
+    scroll_x: f32,
+    code_content_width: f32,
     scroll_y: f32,
     palette: MergePalette,
 ) -> MergeResultPanelOutput {
@@ -2838,6 +4589,8 @@ fn merge_result_panel(
                         background,
                         app.highlight_mode,
                         reference_text,
+                        scroll_x,
+                        code_content_width,
                         palette,
                     );
                     geometry.record_row(result_index, rect);
@@ -2846,6 +4599,10 @@ fn merge_result_panel(
                     }
                 }
             });
+        // TextEdit can be wider than the pane, but the connector starts where the visible result
+        // row ends. Using the fixed inner viewport prevents both horizontal-scroll drift and the
+        // panel-padding seam that appears when anchoring at the outer column shell.
+        geometry.set_horizontal_bounds(output.inner_rect);
         if !changed_lines.is_empty() {
             let mut before = app.snapshot();
             for (index, line) in changed_lines {
@@ -2884,6 +4641,14 @@ fn merge_visible_tail_len(rows: &[CachedMergeSideDisplayRow], collapse: bool) ->
 
 fn merge_clamp_scroll_offset(offset_y: f32, content_height: f32, viewport_height: f32) -> f32 {
     offset_y.clamp(0.0, (content_height - viewport_height).max(0.0))
+}
+
+fn merge_side_offset_changed_by_user(
+    accepts_scroll_input: bool,
+    requested_scroll_y: f32,
+    actual_scroll_y: f32,
+) -> bool {
+    accepts_scroll_input && (actual_scroll_y - requested_scroll_y).abs() > f32::EPSILON
 }
 
 fn merge_result_content_height(app: &MergeToolApp) -> f32 {
@@ -3174,7 +4939,10 @@ fn merge_overview_tone_color(tone: MergeSideLineTone, palette: MergePalette) -> 
     match tone {
         MergeSideLineTone::Added => Some(palette.added_text),
         MergeSideLineTone::BaseOnly => Some(palette.base_only_text),
-        MergeSideLineTone::Deleted | MergeSideLineTone::Replaced => Some(palette.conflict_text),
+        MergeSideLineTone::Deleted
+        | MergeSideLineTone::Replaced
+        | MergeSideLineTone::LocalDeletedRemoteEdited
+        | MergeSideLineTone::LocalEditedRemoteDeleted => Some(palette.conflict_text),
         MergeSideLineTone::Unchanged => None,
     }
 }
@@ -3361,6 +5129,8 @@ fn merge_code_row(
     action_target: Option<MergeLineActionTarget>,
     background: Option<(Color32, usize)>,
     highlight_mode: MergeHighlightMode,
+    scroll_x: f32,
+    code_content_width: f32,
     palette: MergePalette,
     pending_action: &mut Option<(MergeLineActionTarget, MergeLineAction)>,
 ) -> Rect {
@@ -3411,14 +5181,19 @@ fn merge_code_row(
             palette.muted,
         );
     }
-    let text_rect = Rect::from_min_max(
-        Pos2::new(rect.left() + 100.0, rect.top()),
-        rect.right_bottom(),
+    let (text_clip_rect, text_rect) = merge_scrolled_code_text_rects(
+        rect,
+        MERGE_SIDE_CODE_GUTTER_WIDTH,
+        scroll_x,
+        code_content_width,
     );
     let text_color = match tone {
         MergeSideLineTone::Added => palette.added_text,
         MergeSideLineTone::BaseOnly => palette.base_only_text,
-        MergeSideLineTone::Deleted | MergeSideLineTone::Replaced
+        MergeSideLineTone::Deleted
+        | MergeSideLineTone::Replaced
+        | MergeSideLineTone::LocalDeletedRemoteEdited
+        | MergeSideLineTone::LocalEditedRemoteDeleted
             if conflict_index.is_some() && !side_resolved =>
         {
             palette.conflict_text
@@ -3432,12 +5207,13 @@ fn merge_code_row(
         paint_word_highlight_text(
             ui,
             text_rect,
+            text_clip_rect,
             text,
             reference_text.unwrap_or(""),
             text_color,
         );
     } else {
-        ui.painter().with_clip_rect(text_rect).text(
+        ui.painter().with_clip_rect(text_clip_rect).text(
             text_rect.left_center(),
             Align2::LEFT_CENTER,
             text,
@@ -3451,13 +5227,14 @@ fn merge_code_row(
 fn paint_word_highlight_text(
     ui: &Ui,
     text_rect: Rect,
+    text_clip_rect: Rect,
     text: &str,
     reference: &str,
     text_color: Color32,
 ) {
     let font = FontId::monospace(MERGE_CODE_FONT_SIZE);
-    paint_word_highlight_backgrounds(ui, text_rect, text, reference, text_color);
-    ui.painter().with_clip_rect(text_rect).text(
+    paint_word_highlight_backgrounds(ui, text_rect, text_clip_rect, text, reference, text_color);
+    ui.painter().with_clip_rect(text_clip_rect).text(
         text_rect.left_center(),
         Align2::LEFT_CENTER,
         text,
@@ -3469,6 +5246,7 @@ fn paint_word_highlight_text(
 fn paint_word_highlight_backgrounds(
     ui: &Ui,
     text_rect: Rect,
+    text_clip_rect: Rect,
     text: &str,
     reference: &str,
     text_color: Color32,
@@ -3481,7 +5259,7 @@ fn paint_word_highlight_backgrounds(
             Pos2::new(text_rect.left() + prefix_width, text_rect.top() + 2.0),
             Vec2::new(token_width.max(2.0), text_rect.height() - 4.0),
         );
-        ui.painter().rect_filled(
+        ui.painter().with_clip_rect(text_clip_rect).rect_filled(
             highlight,
             egui::CornerRadius::same(2),
             color_with_opacity(text_color, 0.26),
@@ -3505,24 +5283,33 @@ fn merge_code_row_fill(
     highlight_mode: MergeHighlightMode,
     palette: MergePalette,
 ) -> Option<Color32> {
+    if unresolved_conflict {
+        // One pair of take/drop controls applies to the whole side block. Painting retained lines
+        // with a different BaseOnly/unchanged background made one operation look like unrelated
+        // edits and could appear as if the opposite side's tone leaked into this pane.
+        let fill = if active_conflict {
+            palette.active_conflict_fill
+        } else {
+            palette.conflict_fill
+        };
+        return Some(merge_highlight_fill(
+            MergeSideLineTone::Replaced,
+            fill,
+            active_conflict,
+            highlight_mode,
+        ));
+    }
     // Word mode still needs a quiet line-level cue for every changed block. The stronger
     // token highlights alone made non-conflicting insertions read as unchanged whitespace.
     let show_word_mode_change = highlight_mode == MergeHighlightMode::Words;
     let fill = match tone {
-        // An addition inside an unresolved conflict is still a competing choice, not a
-        // settled addition. Using the near-white green insertion fill here made the whole
-        // block disappear in word mode while replacement conflicts stayed visibly peach.
-        MergeSideLineTone::Added if unresolved_conflict => {
-            if active_conflict {
-                palette.active_conflict_fill
-            } else {
-                palette.conflict_fill
-            }
-        }
         MergeSideLineTone::Added if show_word_mode_change => palette.added_fill,
         MergeSideLineTone::BaseOnly => palette.base_only_fill,
-        MergeSideLineTone::Deleted | MergeSideLineTone::Replaced
-            if unresolved_conflict || show_word_mode_change =>
+        MergeSideLineTone::Deleted
+        | MergeSideLineTone::Replaced
+        | MergeSideLineTone::LocalDeletedRemoteEdited
+        | MergeSideLineTone::LocalEditedRemoteDeleted
+            if show_word_mode_change =>
         {
             if active_conflict {
                 palette.active_conflict_fill
@@ -4010,7 +5797,14 @@ fn push_conflict_side_display_rows<'a>(
             line_number,
             conflict_index: Some(conflict.index),
             side_resolved,
-            tone,
+            // Keep the alignment rows after a decision so all three panes remain vertically
+            // synchronized, but stop painting them as pending changes. Otherwise deleted-line
+            // placeholders survive as opaque gray blocks after an AI suggestion is applied.
+            tone: if side_resolved {
+                MergeSideLineTone::Unchanged
+            } else {
+                tone
+            },
             show_conflict_actions,
             action_target: show_conflict_actions
                 .then_some(MergeLineActionTarget::Conflict(conflict.index)),
@@ -4163,6 +5957,8 @@ fn merge_editable_result_row(
     background: Option<(Color32, usize)>,
     highlight_mode: MergeHighlightMode,
     reference_text: Option<&str>,
+    scroll_x: f32,
+    code_content_width: f32,
     palette: MergePalette,
 ) -> (Rect, Option<String>) {
     let (rect, _) = ui.allocate_exact_size(
@@ -4182,21 +5978,27 @@ fn merge_editable_result_row(
         ui.painter()
             .rect_filled(fill_rect, egui::CornerRadius::ZERO, fill);
     }
+    paint_result_side_status_badges(ui, rect, tone, palette);
     ui.painter().text(
-        Pos2::new(rect.left() + 16.0, rect.center().y),
+        Pos2::new(rect.left() + 32.0, rect.center().y),
         Align2::LEFT_CENTER,
         format!("{:>4}", index + 1),
         FontId::monospace(MERGE_CODE_FONT_SIZE),
         palette.muted,
     );
-    let text_rect = Rect::from_min_max(
-        Pos2::new(rect.left() + 62.0, rect.top()),
-        rect.right_bottom(),
+    let (text_clip_rect, text_rect) = merge_scrolled_code_text_rects(
+        rect,
+        MERGE_RESULT_CODE_GUTTER_WIDTH,
+        scroll_x,
+        code_content_width,
     );
     let text_color = match tone {
         MergeSideLineTone::Added => palette.added_text,
         MergeSideLineTone::BaseOnly => palette.base_only_text,
-        MergeSideLineTone::Deleted | MergeSideLineTone::Replaced => palette.conflict_text,
+        MergeSideLineTone::Deleted
+        | MergeSideLineTone::Replaced
+        | MergeSideLineTone::LocalDeletedRemoteEdited
+        | MergeSideLineTone::LocalEditedRemoteDeleted => palette.conflict_text,
         MergeSideLineTone::Unchanged => palette.text,
     };
     if highlight_mode == MergeHighlightMode::Words
@@ -4206,12 +6008,15 @@ fn merge_editable_result_row(
         paint_word_highlight_backgrounds(
             ui,
             text_rect,
+            text_clip_rect,
             text,
             reference_text.unwrap_or(""),
             text_color,
         );
     }
     let before = text.clone();
+    let previous_clip_rect = ui.clip_rect();
+    ui.set_clip_rect(previous_clip_rect.intersect(text_clip_rect));
     let changed = ui
         .put(
             text_rect,
@@ -4226,7 +6031,63 @@ fn merge_editable_result_row(
         )
         .changed()
         .then_some(before);
+    ui.set_clip_rect(previous_clip_rect);
     (rect, changed)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MergeResultSideStatus {
+    Deleted,
+    Edited,
+}
+
+fn paint_result_side_status_badges(
+    ui: &Ui,
+    rect: Rect,
+    tone: MergeSideLineTone,
+    palette: MergePalette,
+) {
+    let Some((local_status, remote_status)) = result_side_status_pair(tone) else {
+        return;
+    };
+    for (offset, status) in [(2.0, local_status), (17.0, remote_status)] {
+        let badge = Rect::from_min_size(
+            Pos2::new(rect.left() + offset, rect.top() + 2.0),
+            Vec2::new(13.0, rect.height() - 4.0),
+        );
+        let (fill, foreground, symbol) = match status {
+            MergeResultSideStatus::Deleted => (palette.base_only_fill, palette.base_only_text, "−"),
+            MergeResultSideStatus::Edited => (palette.conflict_fill, palette.conflict_text, "~"),
+        };
+        // Draw a one-pixel semantic outline so the edit badge is still visible on a conflict row.
+        ui.painter()
+            .rect_filled(badge, egui::CornerRadius::same(3), foreground);
+        ui.painter()
+            .rect_filled(badge.shrink(1.0), egui::CornerRadius::same(2), fill);
+        ui.painter().text(
+            badge.center(),
+            Align2::CENTER_CENTER,
+            symbol,
+            FontId::monospace(10.0),
+            foreground,
+        );
+    }
+}
+
+fn result_side_status_pair(
+    tone: MergeSideLineTone,
+) -> Option<(MergeResultSideStatus, MergeResultSideStatus)> {
+    match tone {
+        MergeSideLineTone::LocalDeletedRemoteEdited => Some((
+            MergeResultSideStatus::Deleted,
+            MergeResultSideStatus::Edited,
+        )),
+        MergeSideLineTone::LocalEditedRemoteDeleted => Some((
+            MergeResultSideStatus::Edited,
+            MergeResultSideStatus::Deleted,
+        )),
+        _ => None,
+    }
 }
 
 fn merge_result_row_fill(
@@ -4237,7 +6098,10 @@ fn merge_result_row_fill(
     match tone {
         MergeSideLineTone::Added => palette.added_fill,
         MergeSideLineTone::BaseOnly => palette.base_only_fill,
-        MergeSideLineTone::Deleted | MergeSideLineTone::Replaced => {
+        MergeSideLineTone::Deleted
+        | MergeSideLineTone::Replaced
+        | MergeSideLineTone::LocalDeletedRemoteEdited
+        | MergeSideLineTone::LocalEditedRemoteDeleted => {
             if active_conflict {
                 palette.active_conflict_fill
             } else {
@@ -4263,14 +6127,18 @@ fn merge_highlight_fill(
             fill
         }
         MergeHighlightMode::Lines => fill,
-        MergeHighlightMode::Words => color_with_opacity(
-            fill,
-            if active_conflict {
+        MergeHighlightMode::Words => {
+            let opacity = if active_conflict {
                 MERGE_WORD_ACTIVE_BLOCK_OPACITY
             } else {
                 MERGE_WORD_BLOCK_OPACITY
-            },
-        ),
+            };
+            if opacity >= 1.0 {
+                fill
+            } else {
+                color_with_opacity(fill, opacity)
+            }
+        }
     }
 }
 
@@ -4417,57 +6285,160 @@ fn push_conflict_result_display_rows<'a>(
 }
 
 fn merge_base_result_tones(conflict: &ConflictBlock) -> Vec<MergeSideLineTone> {
-    let local_kept = merge_base_lines_kept_by_side(&conflict.base, &conflict.local);
-    let remote_kept = merge_base_lines_kept_by_side(&conflict.base, &conflict.remote);
-    let has_local_only_base = local_kept
-        .iter()
-        .zip(remote_kept.iter())
-        .any(|(local, remote)| *local && !*remote);
-    let has_remote_only_base = local_kept
-        .iter()
-        .zip(remote_kept.iter())
-        .any(|(local, remote)| !*local && *remote);
+    let local_states = merge_base_line_states(&conflict.base, &conflict.local);
+    let remote_states = merge_base_line_states(&conflict.base, &conflict.remote);
+    let has_local_only_base =
+        local_states
+            .iter()
+            .zip(remote_states.iter())
+            .any(|(local, remote)| {
+                *local == MergeBaseLineState::Kept && *remote == MergeBaseLineState::Deleted
+            });
+    let has_remote_only_base =
+        local_states
+            .iter()
+            .zip(remote_states.iter())
+            .any(|(local, remote)| {
+                *local == MergeBaseLineState::Deleted && *remote == MergeBaseLineState::Kept
+            });
     let opposing_base_deletions = has_local_only_base && has_remote_only_base;
-
-    local_kept
+    // A delete-vs-edit run is one overlapping conflict even if only its first line changed on the
+    // edited side. Keeping the unchanged body gray splits a changed `if` from its retained `return`
+    // and closing brace. Propagate replacement tone forward through that continuous run, but do not
+    // recolor independent one-sided deletions that appear before a later replacement in the same
+    // broad conflict block.
+    let mut replacement_run_tone = None;
+    local_states
         .iter()
-        .zip(remote_kept.iter())
+        .zip(remote_states.iter())
         .map(|(local, remote)| match (*local, *remote) {
-            (true, true) => MergeSideLineTone::Unchanged,
-            (true, false) | (false, true) if opposing_base_deletions => MergeSideLineTone::Replaced,
-            (true, false) | (false, true) => MergeSideLineTone::BaseOnly,
-            (false, false) => MergeSideLineTone::Replaced,
+            (MergeBaseLineState::Kept, MergeBaseLineState::Kept) => {
+                replacement_run_tone = None;
+                MergeSideLineTone::Unchanged
+            }
+            (MergeBaseLineState::Deleted, MergeBaseLineState::Replaced) => {
+                replacement_run_tone = Some(MergeSideLineTone::LocalDeletedRemoteEdited);
+                MergeSideLineTone::LocalDeletedRemoteEdited
+            }
+            (MergeBaseLineState::Replaced, MergeBaseLineState::Deleted) => {
+                replacement_run_tone = Some(MergeSideLineTone::LocalEditedRemoteDeleted);
+                MergeSideLineTone::LocalEditedRemoteDeleted
+            }
+            (MergeBaseLineState::Kept, MergeBaseLineState::Deleted)
+            | (MergeBaseLineState::Deleted, MergeBaseLineState::Kept)
+                if replacement_run_tone.is_some() =>
+            {
+                replacement_run_tone.expect("replacement run tone exists")
+            }
+            (MergeBaseLineState::Kept, MergeBaseLineState::Deleted)
+            | (MergeBaseLineState::Deleted, MergeBaseLineState::Kept)
+                if opposing_base_deletions =>
+            {
+                MergeSideLineTone::Replaced
+            }
+            (MergeBaseLineState::Kept, MergeBaseLineState::Deleted)
+            | (MergeBaseLineState::Deleted, MergeBaseLineState::Kept) => {
+                MergeSideLineTone::BaseOnly
+            }
+            _ => {
+                replacement_run_tone = Some(MergeSideLineTone::Replaced);
+                MergeSideLineTone::Replaced
+            }
         })
         .collect()
 }
 
-fn merge_base_lines_kept_by_side(base: &[String], side: &[String]) -> Vec<bool> {
-    let mut lcs = vec![vec![0; side.len() + 1]; base.len() + 1];
-    for base_index in (0..base.len()).rev() {
-        for side_index in (0..side.len()).rev() {
-            lcs[base_index][side_index] = if base[base_index] == side[side_index] {
-                lcs[base_index + 1][side_index + 1] + 1
-            } else {
-                lcs[base_index + 1][side_index].max(lcs[base_index][side_index + 1])
-            };
+fn merge_base_line_states(base: &[String], side: &[String]) -> Vec<MergeBaseLineState> {
+    let mut states = vec![MergeBaseLineState::Deleted; base.len()];
+    // Plain LCS is ambiguous for source code because braces, blank lines and statements such as
+    // `return "review";` repeat frequently. It can match a later identical statement to an
+    // earlier base line across a changed block, making a real replacement look unchanged in the
+    // result preview. Patience diff anchors unique surrounding lines first and therefore keeps
+    // equal rows attached to their local edit block.
+    for operation in capture_diff_slices(Algorithm::Patience, base, side) {
+        let (tag, base_range, side_range) = operation.as_tag_tuple();
+        match tag {
+            DiffTag::Equal => states[base_range].fill(MergeBaseLineState::Kept),
+            DiffTag::Replace => {
+                mark_replaced_base_lines(&mut states, base, side, base_range, side_range)
+            }
+            DiffTag::Delete | DiffTag::Insert => {}
         }
+    }
+    states
+}
+
+fn mark_replaced_base_lines(
+    states: &mut [MergeBaseLineState],
+    base: &[String],
+    side: &[String],
+    base_range: Range<usize>,
+    side_range: Range<usize>,
+) {
+    if base_range.is_empty() || side_range.is_empty() {
+        return;
+    }
+    if side_range.len() >= base_range.len() {
+        states[base_range].fill(MergeBaseLineState::Replaced);
+        return;
+    }
+    if base_range.len().saturating_mul(side_range.len()) > 4_096 {
+        states[base_range].fill(MergeBaseLineState::Replaced);
+        return;
     }
 
-    let mut kept = vec![false; base.len()];
-    let mut base_index = 0;
-    let mut side_index = 0;
-    while base_index < base.len() && side_index < side.len() {
-        if base[base_index] == side[side_index] {
-            kept[base_index] = true;
-            base_index += 1;
-            side_index += 1;
-        } else if lcs[base_index + 1][side_index] >= lcs[base_index][side_index + 1] {
-            base_index += 1;
-        } else {
-            side_index += 1;
+    let mut candidates = base_range
+        .clone()
+        .flat_map(|base_index| {
+            side_range.clone().map(move |side_index| {
+                (
+                    merge_line_similarity(&base[base_index], &side[side_index]),
+                    base_index,
+                    side_index,
+                )
+            })
+        })
+        .filter(|(similarity, _, _)| *similarity >= 0.35)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.total_cmp(&left.0));
+
+    let mut paired_base = HashSet::new();
+    let mut paired_side = HashSet::new();
+    for (_, base_index, side_index) in candidates {
+        if paired_base.contains(&base_index) || paired_side.contains(&side_index) {
+            continue;
         }
+        paired_base.insert(base_index);
+        paired_side.insert(side_index);
+        states[base_index] = MergeBaseLineState::Replaced;
     }
-    kept
+
+    // If none of the lines has a meaningful textual relationship, the replace hunk is still an
+    // overlapping edit. Treating it as a pure deletion would recreate the misleading gray state.
+    if paired_side.is_empty() {
+        states[base_range].fill(MergeBaseLineState::Replaced);
+    }
+}
+
+fn merge_line_similarity(left: &str, right: &str) -> f32 {
+    let left = left.trim().chars().take(256).collect::<Vec<_>>();
+    let right = right.trim().chars().take(256).collect::<Vec<_>>();
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let mut previous = vec![0_usize; right.len() + 1];
+    for left_char in &left {
+        let mut current = vec![0_usize; right.len() + 1];
+        for (right_index, right_char) in right.iter().enumerate() {
+            current[right_index + 1] = if left_char == right_char {
+                previous[right_index] + 1
+            } else {
+                current[right_index].max(previous[right_index + 1])
+            };
+        }
+        previous = current;
+    }
+    previous[right.len()] as f32 / left.len().max(right.len()) as f32
 }
 
 fn paint_merge_block_connectors(
@@ -4476,6 +6447,9 @@ fn paint_merge_block_connectors(
     local_geometry: &MergePanelGeometry,
     result_geometry: &MergePanelGeometry,
     remote_geometry: &MergePanelGeometry,
+    columns: MergeConnectorColumns,
+    local_conflict_cursor: usize,
+    remote_conflict_cursor: usize,
     debug: MergeConnectorDebug,
     palette: MergePalette,
 ) {
@@ -4493,6 +6467,14 @@ fn paint_merge_block_connectors(
         let Some(result_rect) = result_rect else {
             continue;
         };
+        let unresolved = !document.conflict_fully_resolved(conflict.index);
+        let result_fill = merge_result_row_fill(
+            tone,
+            unresolved
+                && (conflict.index == local_conflict_cursor
+                    || conflict.index == remote_conflict_cursor),
+            palette,
+        );
         if conflict.base.is_empty() {
             // Zero-width conflicts do not own a result row. Paint the marker directly on the
             // boundary so the line remains visible without shifting later rows downward.
@@ -4510,7 +6492,22 @@ fn paint_merge_block_connectors(
             MergeSide::Local,
             local_geometry,
         ) {
-            paint_side_block_bridge(ui, result_rect, local_rect, MergeSide::Local, tone, palette);
+            paint_side_block_bridge(
+                ui,
+                result_rect,
+                local_rect,
+                columns.result,
+                columns.local,
+                MergeSide::Local,
+                tone,
+                result_fill,
+                if unresolved && conflict.index == local_conflict_cursor {
+                    palette.active_conflict_fill
+                } else {
+                    palette.conflict_fill
+                },
+                palette,
+            );
             paint_side_block_debug(
                 ui,
                 debug,
@@ -4519,6 +6516,8 @@ fn paint_merge_block_connectors(
                 MergeSide::Local,
                 result_rect,
                 local_rect,
+                columns.result,
+                columns.local,
                 tone,
             );
         }
@@ -4532,8 +6531,16 @@ fn paint_merge_block_connectors(
                 ui,
                 result_rect,
                 remote_rect,
+                columns.result,
+                columns.remote,
                 MergeSide::Remote,
                 tone,
+                result_fill,
+                if unresolved && conflict.index == remote_conflict_cursor {
+                    palette.active_conflict_fill
+                } else {
+                    palette.conflict_fill
+                },
                 palette,
             );
             paint_side_block_debug(
@@ -4544,6 +6551,8 @@ fn paint_merge_block_connectors(
                 MergeSide::Remote,
                 result_rect,
                 remote_rect,
+                columns.result,
+                columns.remote,
                 tone,
             );
         }
@@ -4564,7 +6573,19 @@ fn paint_merge_block_connectors(
         if let Some(side_rect) =
             merge_base_only_side_rect_from_geometry(document, group, side_geometry)
         {
-            paint_base_only_marker_bridge(ui, result_rect, side_rect, group.missing_side, palette);
+            let side_column = match group.missing_side {
+                MergeSide::Local => columns.local,
+                MergeSide::Remote => columns.remote,
+            };
+            paint_base_only_marker_bridge(
+                ui,
+                result_rect,
+                side_rect,
+                columns.result,
+                side_column,
+                group.missing_side,
+                palette,
+            );
             paint_side_block_debug(
                 ui,
                 debug,
@@ -4573,6 +6594,8 @@ fn paint_merge_block_connectors(
                 group.missing_side,
                 result_rect,
                 side_rect,
+                columns.result,
+                side_column,
                 tone,
             );
         }
@@ -4632,7 +6655,10 @@ fn merge_block_connector_tone(
         .filter(|row| row.conflict_index == Some(conflict.index))
     {
         match row.tone {
-            MergeSideLineTone::Replaced | MergeSideLineTone::Deleted => {
+            MergeSideLineTone::Replaced
+            | MergeSideLineTone::Deleted
+            | MergeSideLineTone::LocalDeletedRemoteEdited
+            | MergeSideLineTone::LocalEditedRemoteDeleted => {
                 return MergeSideLineTone::Replaced;
             }
             MergeSideLineTone::BaseOnly => has_base_only = true,
@@ -5163,62 +7189,130 @@ fn paint_side_block_bridge(
     ui: &Ui,
     result_rect: Rect,
     side_rect: Rect,
+    result_column: Rect,
+    side_column: Rect,
     side: MergeSide,
     tone: MergeSideLineTone,
+    result_endpoint_fill: Color32,
+    side_endpoint_fill: Color32,
     palette: MergePalette,
 ) {
-    let (result_x, side_x) = match side {
-        MergeSide::Local => (result_rect.left(), side_rect.right()),
-        MergeSide::Remote => (result_rect.right(), side_rect.left()),
-    };
-    let knee_x = (result_x + side_x) * 0.5;
-    let fill = merge_connector_fill(tone, palette);
+    let (result_inner_x, result_edge_x, side_edge_x, side_inner_x) =
+        connector_bridge_x_positions(result_rect, side_rect, result_column, side_column, side);
+    paint_connector_endpoint_extension(
+        ui,
+        result_inner_x,
+        result_edge_x,
+        result_rect.top(),
+        result_rect.bottom(),
+        result_endpoint_fill,
+    );
+    paint_connector_endpoint_extension(
+        ui,
+        side_edge_x,
+        side_inner_x,
+        side_rect.top(),
+        side_rect.bottom(),
+        side_endpoint_fill,
+    );
     ui.painter().add(egui::Shape::convex_polygon(
-        vec![
-            Pos2::new(result_x, result_rect.top()),
-            Pos2::new(knee_x, result_rect.top()),
-            Pos2::new(side_x, side_rect.top()),
-            Pos2::new(side_x, side_rect.bottom()),
-            Pos2::new(knee_x, result_rect.bottom()),
-            Pos2::new(result_x, result_rect.bottom()),
-        ],
-        fill,
+        connector_gap_points(result_rect, side_rect, result_column, side_column, side),
+        merge_connector_fill(tone, palette),
         egui::Stroke::NONE,
     ));
+}
+
+fn paint_connector_endpoint_extension(
+    ui: &Ui,
+    first_x: f32,
+    second_x: f32,
+    top: f32,
+    bottom: f32,
+    fill: Color32,
+) {
+    ui.painter().rect_filled(
+        Rect::from_min_max(
+            Pos2::new(first_x.min(second_x), top),
+            Pos2::new(first_x.max(second_x), bottom),
+        ),
+        egui::CornerRadius::ZERO,
+        fill,
+    );
+}
+
+fn connector_bridge_x_positions(
+    result_rect: Rect,
+    side_rect: Rect,
+    _result_column: Rect,
+    side_column: Rect,
+    side: MergeSide,
+) -> (f32, f32, f32, f32) {
+    match side {
+        MergeSide::Local => (
+            result_rect.left(),
+            side_column.right(),
+            side_rect.right(),
+            side_rect.right(),
+        ),
+        MergeSide::Remote => (
+            result_rect.right(),
+            side_column.left(),
+            side_rect.left(),
+            side_rect.left(),
+        ),
+    }
+}
+
+fn connector_gap_points(
+    result_rect: Rect,
+    side_rect: Rect,
+    result_column: Rect,
+    side_column: Rect,
+    side: MergeSide,
+) -> Vec<Pos2> {
+    let (_, result_edge_x, side_edge_x, _) =
+        connector_bridge_x_positions(result_rect, side_rect, result_column, side_column, side);
+    vec![
+        Pos2::new(result_edge_x, result_rect.top()),
+        Pos2::new(side_edge_x, side_rect.top()),
+        Pos2::new(side_edge_x, side_rect.bottom()),
+        Pos2::new(result_edge_x, result_rect.bottom()),
+    ]
 }
 
 fn paint_base_only_marker_bridge(
     ui: &Ui,
     result_rect: Rect,
     marker_rect: Rect,
+    result_column: Rect,
+    side_column: Rect,
     side: MergeSide,
     palette: MergePalette,
 ) {
+    let endpoint_fill = palette.base_only_fill;
+    let (result_inner_x, result_edge_x, side_edge_x, side_inner_x) =
+        connector_bridge_x_positions(result_rect, marker_rect, result_column, side_column, side);
+    paint_connector_endpoint_extension(
+        ui,
+        result_inner_x,
+        result_edge_x,
+        result_rect.top(),
+        result_rect.bottom(),
+        endpoint_fill,
+    );
+    paint_connector_endpoint_extension(
+        ui,
+        side_edge_x,
+        side_inner_x,
+        marker_rect.top(),
+        marker_rect.bottom(),
+        endpoint_fill,
+    );
     ui.painter().add(egui::Shape::convex_polygon(
-        base_only_marker_bridge_points(result_rect, marker_rect, side),
+        connector_gap_points(result_rect, marker_rect, result_column, side_column, side),
         merge_connector_fill(MergeSideLineTone::BaseOnly, palette),
         egui::Stroke::NONE,
     ));
-}
-
-fn base_only_marker_bridge_points(
-    result_rect: Rect,
-    marker_rect: Rect,
-    side: MergeSide,
-) -> Vec<Pos2> {
-    let (result_x, side_x) = match side {
-        MergeSide::Local => (result_rect.left(), marker_rect.right()),
-        MergeSide::Remote => (result_rect.right(), marker_rect.left()),
-    };
-    let knee_x = (result_x + side_x) * 0.5;
-    vec![
-        Pos2::new(result_x, result_rect.top()),
-        Pos2::new(knee_x, result_rect.top()),
-        Pos2::new(side_x, marker_rect.top()),
-        Pos2::new(side_x, marker_rect.bottom()),
-        Pos2::new(knee_x, result_rect.bottom()),
-        Pos2::new(result_x, result_rect.bottom()),
-    ]
 }
 
 fn paint_side_block_debug(
@@ -5229,6 +7323,8 @@ fn paint_side_block_debug(
     side: MergeSide,
     result_rect: Rect,
     side_rect: Rect,
+    result_column: Rect,
+    side_column: Rect,
     tone: MergeSideLineTone,
 ) {
     if mode == MergeConnectorDebug::Off {
@@ -5240,39 +7336,50 @@ fn paint_side_block_debug(
     let result_color = Color32::from_rgb(37, 99, 235);
     let side_stroke = egui::Stroke::new(2.0, side_color);
     let result_stroke = egui::Stroke::new(2.0, result_color);
-    painter.line_segment([side_rect.left_top(), side_rect.right_top()], side_stroke);
-    painter.line_segment(
-        [side_rect.left_bottom(), side_rect.right_bottom()],
+    painter.rect_stroke(
+        side_rect,
+        egui::CornerRadius::ZERO,
         side_stroke,
+        egui::StrokeKind::Inside,
     );
-    painter.line_segment(
-        [result_rect.left_top(), result_rect.right_top()],
+    painter.rect_stroke(
+        result_rect,
+        egui::CornerRadius::ZERO,
         result_stroke,
-    );
-    painter.line_segment(
-        [result_rect.left_bottom(), result_rect.right_bottom()],
-        result_stroke,
+        egui::StrokeKind::Inside,
     );
 
-    let (result_x, side_x) = match side {
-        MergeSide::Local => (result_rect.left(), side_rect.right()),
-        MergeSide::Remote => (result_rect.right(), side_rect.left()),
-    };
+    let (result_inner_x, result_edge_x, side_edge_x, side_inner_x) =
+        connector_bridge_x_positions(result_rect, side_rect, result_column, side_column, side);
     let guide_stroke = egui::Stroke::new(2.0, Color32::from_rgb(220, 38, 38));
     painter.line_segment(
         [
-            Pos2::new(side_x, side_rect.top()),
-            Pos2::new(result_x, result_rect.top()),
+            Pos2::new(result_edge_x, result_rect.top()),
+            Pos2::new(side_edge_x, side_rect.top()),
         ],
         guide_stroke,
     );
     painter.line_segment(
         [
-            Pos2::new(side_x, side_rect.bottom()),
-            Pos2::new(result_x, result_rect.bottom()),
+            Pos2::new(result_edge_x, result_rect.bottom()),
+            Pos2::new(side_edge_x, side_rect.bottom()),
         ],
         guide_stroke,
     );
+    for (x, color) in [
+        (result_inner_x, Color32::from_rgb(37, 99, 235)),
+        (result_edge_x, Color32::from_rgb(16, 185, 129)),
+        (side_edge_x, Color32::from_rgb(245, 158, 11)),
+        (side_inner_x, Color32::from_rgb(147, 51, 234)),
+    ] {
+        painter.line_segment(
+            [
+                Pos2::new(x, result_rect.top()),
+                Pos2::new(x, result_rect.bottom()),
+            ],
+            egui::Stroke::new(1.5, color),
+        );
+    }
 
     if mode == MergeConnectorDebug::Log {
         let count = MERGE_CONNECTOR_DEBUG_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -5280,11 +7387,16 @@ fn paint_side_block_debug(
             eprintln!(
                 "merge-connector {kind}#{index} side={side:?} tone={tone:?} \
                  side=({:.1},{:.1}) result=({:.1},{:.1}) \
+                 x=result_inner:{:.1} result_edge:{:.1} side_edge:{:.1} side_inner:{:.1} \
                  delta_top={:.1} delta_bottom={:.1}",
                 side_rect.top(),
                 side_rect.bottom(),
                 result_rect.top(),
                 result_rect.bottom(),
+                result_inner_x,
+                result_edge_x,
+                side_edge_x,
+                side_inner_x,
                 result_rect.top() - side_rect.top(),
                 result_rect.bottom() - side_rect.bottom(),
             );
@@ -5296,7 +7408,10 @@ fn merge_connector_color(tone: MergeSideLineTone, palette: MergePalette) -> Colo
     match tone {
         MergeSideLineTone::Added => palette.connector,
         MergeSideLineTone::BaseOnly => palette.base_only_text,
-        MergeSideLineTone::Deleted | MergeSideLineTone::Replaced => palette.conflict_text,
+        MergeSideLineTone::Deleted
+        | MergeSideLineTone::Replaced
+        | MergeSideLineTone::LocalDeletedRemoteEdited
+        | MergeSideLineTone::LocalEditedRemoteDeleted => palette.conflict_text,
         MergeSideLineTone::Unchanged => palette.connector,
     }
 }
@@ -5305,7 +7420,10 @@ fn merge_connector_fill(tone: MergeSideLineTone, palette: MergePalette) -> Color
     let fill = match tone {
         MergeSideLineTone::Added => palette.added_fill,
         MergeSideLineTone::BaseOnly => palette.base_only_connector_fill,
-        MergeSideLineTone::Deleted | MergeSideLineTone::Replaced => palette.conflict_fill,
+        MergeSideLineTone::Deleted
+        | MergeSideLineTone::Replaced
+        | MergeSideLineTone::LocalDeletedRemoteEdited
+        | MergeSideLineTone::LocalEditedRemoteDeleted => palette.conflict_fill,
         MergeSideLineTone::Unchanged => return Color32::TRANSPARENT,
     };
     color_with_opacity(fill, 0.9)
@@ -5515,16 +7633,30 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (MergeLanguage::Chinese, "auto_applied") => "非冲突内容已自动合并",
         (MergeLanguage::Chinese, "no_changes") => "无其他变更。",
         (MergeLanguage::Chinese, "conflict_count") => "个冲突。",
-        (MergeLanguage::Chinese, "local") => "本地变更",
-        (MergeLanguage::Chinese, "remote") => "远端变更",
-        (MergeLanguage::Chinese, "result") => "合并结果",
-        (MergeLanguage::Chinese, "accept_left") => "使用我的版本",
-        (MergeLanguage::Chinese, "accept_right") => "使用他的版本",
+        (MergeLanguage::Chinese, "local") => "左边",
+        (MergeLanguage::Chinese, "remote") => "右边",
+        (MergeLanguage::Chinese, "result") => "中间",
+        (MergeLanguage::Chinese, "accept_left") => "使用左边",
+        (MergeLanguage::Chinese, "accept_right") => "使用右边",
         (MergeLanguage::Chinese, "apply") => "应用",
         (MergeLanguage::Chinese, "cancel") => "取消",
         (MergeLanguage::Chinese, "light") => "白天",
         (MergeLanguage::Chinese, "dark") => "黑夜",
         (MergeLanguage::Chinese, "analyzing_merge") => "正在分析合并内容...",
+        (MergeLanguage::Chinese, "ai_analyze") => "使用 AI 分析冲突",
+        (MergeLanguage::Chinese, "ai_analyzing") => "AI 正在分析冲突",
+        (MergeLanguage::Chinese, "ai_completed_prefix") => "AI 分析完成：",
+        (MergeLanguage::Chinese, "ai_completed_suffix") => "条建议",
+        (MergeLanguage::Chinese, "ai_no_suggestions") => "AI 分析完成：暂无可用建议",
+        (MergeLanguage::Chinese, "ai_no_reason") => "未提供说明。",
+        (MergeLanguage::Chinese, "ai_choose_local") => "建议采用左边",
+        (MergeLanguage::Chinese, "ai_choose_remote") => "建议采用右边",
+        (MergeLanguage::Chinese, "ai_manual") => "建议在中间手动处理",
+        (MergeLanguage::Chinese, "ai_apply_suggestion") => "确定采用建议",
+        (MergeLanguage::Chinese, "ai_apply_hint") => "仅将建议应用到合并结果；不会自动保存文件",
+        (MergeLanguage::Chinese, "ai_ignore") => "忽略此建议",
+        (MergeLanguage::Chinese, "ai_sources_unavailable") => "AI 分析需要三个版本的已加载内容",
+        (MergeLanguage::Chinese, "ai_analysis_stopped") => "AI 分析任务已停止",
         (MergeLanguage::Chinese, "analysis_stopped") => "合并分析已停止",
         (MergeLanguage::Chinese, "loading_title") => "准备合并编辑器",
         (MergeLanguage::Chinese, "loading_reading") => "读取三个版本",
@@ -5563,16 +7695,32 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (_, "auto_applied") => "Non-conflicting changes auto-applied",
         (_, "no_changes") => "No changes.",
         (_, "conflict_count") => "conflict(s).",
-        (_, "local") => "Local Changes",
-        (_, "remote") => "Remote Changes",
-        (_, "result") => "Result",
-        (_, "accept_left") => "Use Mine",
-        (_, "accept_right") => "Use Theirs",
+        (_, "local") => "Left",
+        (_, "remote") => "Right",
+        (_, "result") => "Middle",
+        (_, "accept_left") => "Use Left",
+        (_, "accept_right") => "Use Right",
         (_, "apply") => "Apply",
         (_, "cancel") => "Cancel",
         (_, "light") => "Light",
         (_, "dark") => "Dark",
         (_, "analyzing_merge") => "Analyzing merge content...",
+        (_, "ai_analyze") => "Analyze conflicts with AI",
+        (_, "ai_analyzing") => "AI is analyzing conflicts",
+        (_, "ai_completed_prefix") => "AI analysis complete:",
+        (_, "ai_completed_suffix") => "suggestion(s)",
+        (_, "ai_no_suggestions") => "AI analysis complete: no suggestions",
+        (_, "ai_no_reason") => "No explanation provided.",
+        (_, "ai_choose_local") => "Recommend Left",
+        (_, "ai_choose_remote") => "Recommend Right",
+        (_, "ai_manual") => "Edit in Middle manually",
+        (_, "ai_apply_suggestion") => "Apply suggestion",
+        (_, "ai_apply_hint") => {
+            "Updates the merge result only; it does not save the file automatically."
+        }
+        (_, "ai_ignore") => "Ignore this suggestion",
+        (_, "ai_sources_unavailable") => "AI analysis needs the loaded three-way file contents",
+        (_, "ai_analysis_stopped") => "AI analysis stopped",
         (_, "analysis_stopped") => "Merge analysis stopped",
         (_, "loading_title") => "Preparing merge editor",
         (_, "loading_reading") => "Read three versions",
@@ -5620,6 +7768,7 @@ mod tests {
             stage: false,
             theme: MergeTheme::Light,
             language: MergeLanguage::Chinese,
+            ai_model_name: None,
         }
     }
 
@@ -5629,6 +7778,384 @@ mod tests {
             "header\nconflict-a = local\nstable-a\nstable-b\nconflict-b = local\nstable-c\ndelete-from-remote\nstable-d\nconflict-c = local\nfooter\n",
             "header\nconflict-a = remote\nstable-a\ndelete-from-local\nstable-b\nconflict-b = remote\nstable-c\nstable-d\nconflict-c = remote\nfooter\n",
         )
+    }
+
+    #[test]
+    fn ai_suggestion_json_is_strictly_bound_to_current_conflicts() {
+        let valid_targets = HashSet::from([
+            MergeLineActionTarget::Conflict(0),
+            MergeLineActionTarget::Conflict(2),
+        ]);
+        let suggestions = parse_merge_ai_suggestions(
+            r#"{"suggestions":[
+                {"conflict_index":0,"choice":"left","reason":"keeps local validation"},
+                {"conflict_index":2,"choice":"manual","reason":"both changes are needed"},
+                {"conflict_index":3,"choice":"remote","reason":"not current"}
+            ]}"#,
+            &valid_targets,
+            MergeLanguage::English,
+        )
+        .unwrap();
+
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].choice, MergeAiChoice::Local);
+        assert_eq!(suggestions[1].choice, MergeAiChoice::Manual);
+    }
+
+    #[test]
+    fn claude_response_ignores_thinking_blocks_and_reads_final_text() {
+        let response = serde_json::json!({
+            "type": "message",
+            "stop_reason": "end_turn",
+            "content": [
+                { "type": "thinking", "thinking": "internal analysis" },
+                { "type": "text", "text": "{\"suggestions\":[]}" }
+            ],
+            "usage": { "input_tokens": 120, "output_tokens": 30 }
+        });
+
+        assert_eq!(
+            merge_ai_response_content(crate::app::MergeAiApiFormat::Claude, &response).unwrap(),
+            "{\"suggestions\":[]}",
+        );
+        let structure =
+            merge_ai_response_structure(crate::app::MergeAiApiFormat::Claude, &response);
+        assert!(structure.contains("stop_reason=end_turn"));
+        assert!(structure.contains("content_types=thinking,text"));
+        assert!(structure.contains("input_tokens=120"));
+        assert!(structure.contains("output_tokens=30"));
+    }
+
+    #[test]
+    fn claude_compatible_endpoint_accepts_openai_response_envelope() {
+        let response = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": [{ "type": "text", "text": "{\"suggestions\":[]}" }]
+                }
+            }]
+        });
+
+        assert_eq!(
+            merge_ai_response_content(crate::app::MergeAiApiFormat::Claude, &response).unwrap(),
+            "{\"suggestions\":[]}",
+        );
+    }
+
+    #[test]
+    fn openai_function_call_returns_merge_suggestion_payload() {
+        let response = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": {
+                            "name": MERGE_AI_TOOL_NAME,
+                            "arguments": "{\"suggestions\":[{\"target_type\":\"conflict\",\"target_index\":0,\"choice\":\"manual\",\"reason_zh\":\"左右两边都很重要\",\"reason_en\":\"both sides matter\"}]}"
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let (payload, mode) =
+            merge_ai_response_payload(crate::app::MergeAiApiFormat::OpenAiCompatible, &response)
+                .unwrap();
+        assert_eq!(mode, "openai_function");
+        assert!(payload.contains("both sides matter"));
+        let structure =
+            merge_ai_response_structure(crate::app::MergeAiApiFormat::OpenAiCompatible, &response);
+        assert!(structure.contains("finish_reason=tool_calls"));
+        assert!(structure.contains("tool_names=submit_merge_suggestions"));
+    }
+
+    #[test]
+    fn anthropic_tool_use_returns_merge_suggestion_payload() {
+        let response = serde_json::json!({
+            "type": "message",
+            "stop_reason": "tool_use",
+            "content": [{
+                "type": "tool_use",
+                "name": MERGE_AI_TOOL_NAME,
+                "input": {
+                    "suggestions": [{
+                        "target_type": "deletion",
+                        "target_index": 17,
+                        "choice": "left",
+                        "reason_zh": "左边有意删除了这段内容",
+                        "reason_en": "the Left deletion is intentional"
+                    }]
+                }
+            }]
+        });
+
+        let (payload, mode) =
+            merge_ai_response_payload(crate::app::MergeAiApiFormat::Claude, &response).unwrap();
+        assert_eq!(mode, "anthropic_tool_use");
+        assert!(payload.contains("the Left deletion is intentional"));
+        let structure =
+            merge_ai_response_structure(crate::app::MergeAiApiFormat::Claude, &response);
+        assert!(structure.contains("stop_reason=tool_use"));
+        assert!(structure.contains("content_types=tool_use"));
+        assert!(structure.contains("tool_names=submit_merge_suggestions"));
+    }
+
+    #[test]
+    fn merge_suggestion_tool_schema_only_exposes_advisory_choices() {
+        let schema = merge_ai_suggestions_input_schema();
+        assert_eq!(
+            schema.pointer("/properties/suggestions/items/properties/choice/enum"),
+            Some(&serde_json::json!(["left", "right", "manual"])),
+        );
+        assert!(schema.to_string().contains("reason_zh"));
+        assert!(schema.to_string().contains("reason_en"));
+        assert!(!schema.to_string().contains("write_file"));
+        assert!(!schema.to_string().contains("git_commit"));
+    }
+
+    #[test]
+    fn ai_suggestion_keeps_both_languages_for_runtime_switching() {
+        let suggestion = MergeAiSuggestion {
+            target: MergeLineActionTarget::Conflict(0),
+            choice: MergeAiChoice::Manual,
+            reason_zh: "在中间手动组合左右两边的校验".to_owned(),
+            reason_en: "Combine validation from Left and Right in the Middle".to_owned(),
+        };
+
+        assert_eq!(
+            suggestion.reason(MergeLanguage::Chinese),
+            "在中间手动组合左右两边的校验"
+        );
+        assert_eq!(
+            suggestion.reason(MergeLanguage::English),
+            "Combine validation from Left and Right in the Middle"
+        );
+    }
+
+    #[test]
+    fn ai_card_uses_shadow_without_border_and_connects_to_action_buttons() {
+        let source = include_str!("merge_tool.rs");
+        let overlays = source
+            .split("fn merge_ai_suggestion_overlays")
+            .nth(1)
+            .and_then(|tail| tail.split("fn merge_ai_action_anchor").next())
+            .expect("AI overlay implementation");
+
+        assert!(overlays.contains(".stroke(egui::Stroke::NONE)"));
+        assert!(overlays.contains(".shadow(palette.shadow)"));
+        assert!(overlays.contains("paint_merge_ai_suggestion_connector"));
+        assert!(overlays.contains("suggestion.reason(language)"));
+        assert_eq!(overlays.matches("egui::Area::new").count(), 1);
+        assert!(overlays.contains("MergeAiCardPlacement::Middle"));
+        assert!(overlays.contains("vec![local, remote]"));
+        assert!(overlays.contains("MergeAiCardPlacement::Side(MergeSide::Local)"));
+        assert!(overlays.contains("MergeAiCardPlacement::Side(MergeSide::Remote)"));
+    }
+
+    #[test]
+    fn ai_connector_targets_nearest_card_edge_after_dragging() {
+        let card = Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(300.0, 220.0));
+        assert_eq!(
+            closest_rect_edge_point(card, Pos2::new(70.0, 150.0)),
+            Pos2::new(100.0, 150.0)
+        );
+        assert_eq!(
+            closest_rect_edge_point(card, Pos2::new(340.0, 180.0)),
+            Pos2::new(300.0, 180.0)
+        );
+        assert_eq!(
+            closest_rect_edge_point(card, Pos2::new(180.0, 70.0)),
+            Pos2::new(180.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn ai_card_can_move_to_any_visible_window_edge() {
+        let viewport = Rect::from_min_max(Pos2::ZERO, Pos2::new(1_200.0, 800.0));
+        let anchor = Pos2::new(500.0, 420.0);
+        let allowed = merge_ai_overlay_allowed_offset(viewport, anchor, Vec2::new(252.0, 120.0));
+
+        assert!(
+            allowed.min.y < -400.0,
+            "the card can move well above its row"
+        );
+        assert!(
+            allowed.max.y > 200.0,
+            "the card can also move below its row"
+        );
+        assert_eq!(allowed.min, Pos2::new(-492.0, -412.0));
+        assert_eq!(allowed.max, Pos2::new(440.0, 252.0));
+    }
+
+    #[test]
+    fn merge_requests_force_advisory_tool_calls_and_disable_claude_thinking() {
+        let source = include_str!("merge_tool.rs");
+        let request = source
+            .split("fn request_merge_ai_suggestions")
+            .nth(1)
+            .and_then(|tail| tail.split("fn merge_ai_url_for_log").next())
+            .expect("AI request implementation");
+
+        assert!(request.contains("\"thinking\": { \"type\": \"disabled\" }"));
+        assert!(request.contains("\"tools\""));
+        assert!(request.contains("MERGE_AI_TOOL_NAME"));
+        assert!(request.contains("\"tool_choice\""));
+        assert!(!request.contains("\"response_format\""));
+        assert!(request.contains("response.structure"));
+    }
+
+    #[test]
+    fn ai_suggestion_json_accepts_current_deletion_targets() {
+        let target = MergeLineActionTarget::BaseOnlyGroup(17);
+        let suggestions = parse_merge_ai_suggestions(
+            r#"{"suggestions":[
+                {"target_type":"deletion","target_index":17,"choice":"local","reason":"本地分支有意删除旧逻辑"},
+                {"target_type":"deletion","target_index":18,"choice":"remote","reason":"not current"}
+            ]}"#,
+            &HashSet::from([target]),
+            MergeLanguage::Chinese,
+        )
+        .unwrap();
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].target, target);
+        assert_eq!(
+            suggestions[0].reason(MergeLanguage::Chinese),
+            "本地分支有意删除旧逻辑"
+        );
+        assert_eq!(
+            suggestions[0].reason(MergeLanguage::English),
+            "本地分支有意删除旧逻辑"
+        );
+    }
+
+    #[test]
+    fn ai_prompt_includes_three_way_conflicts_history_and_related_files() {
+        let document = three_way_merge("value = base\n", "value = local\n", "value = remote\n");
+        let prompt = merge_ai_prompt(
+            &test_merge_args(),
+            &MergeSourceText {
+                base: "value = base\n".to_owned(),
+                local: "value = local\n".to_owned(),
+                remote: "value = remote\n".to_owned(),
+            },
+            &document,
+            &MergeAiContext {
+                history: "abc123 change validation".to_owned(),
+                related_files: "--- related file: settings.toml ---\nmode = strict\n".to_owned(),
+            },
+        );
+
+        assert!(prompt.contains("CONFLICTS:"));
+        assert!(prompt.contains("Simplified Chinese"));
+        assert!(prompt.contains("reason_en"));
+        assert!(prompt.contains("左边/中间/右边"));
+        assert!(prompt.contains("Left/Middle/Right"));
+        assert!(!prompt.contains("LOCAL FILE EXCERPT"));
+        assert!(!prompt.contains("REMOTE FILE EXCERPT"));
+        assert!(prompt.contains("value = local"));
+        assert!(prompt.contains("abc123 change validation"));
+        assert!(prompt.contains("related file: settings.toml"));
+        assert!(prompt.contains("submit_merge_suggestions"));
+        assert!(prompt.contains("advisory only"));
+    }
+
+    #[test]
+    fn accepting_ai_suggestion_updates_only_the_suggested_conflict() {
+        let document = navigation_matrix_document();
+        let mut app = MergeToolApp::new(test_merge_args(), document);
+        let target = MergeLineActionTarget::Conflict(0);
+        app.ai_suggestions.insert(
+            target,
+            MergeAiSuggestion {
+                target,
+                choice: MergeAiChoice::Local,
+                reason_zh: "左边行为是有意保留的".to_owned(),
+                reason_en: "The Left behavior is intentional".to_owned(),
+            },
+        );
+
+        app.apply_ai_suggestion(target);
+
+        assert!(!app.ai_suggestions.contains_key(&target));
+        assert!(app.result_text.contains("conflict-a = local"));
+        assert!(app.document.conflict_side_resolved(0, MergeSide::Local));
+        assert!(app.document.conflict_side_resolved(0, MergeSide::Remote));
+        assert_eq!(app.undo_stack.len(), 1);
+        assert_eq!(app.unresolved_conflict_count(), 2);
+
+        assert!(app.undo());
+        assert!(!app.document.conflict_side_resolved(0, MergeSide::Local));
+        assert!(!app.document.conflict_side_resolved(0, MergeSide::Remote));
+        assert_eq!(
+            app.ai_suggestions
+                .get(&target)
+                .map(|suggestion| suggestion.reason_zh.as_str()),
+            Some("左边行为是有意保留的")
+        );
+
+        assert!(app.redo());
+        assert!(app.document.conflict_side_resolved(0, MergeSide::Local));
+        assert!(app.document.conflict_side_resolved(0, MergeSide::Remote));
+        assert!(!app.ai_suggestions.contains_key(&target));
+    }
+
+    #[test]
+    fn resolved_conflict_side_rows_do_not_leave_change_backgrounds() {
+        let mut document = navigation_matrix_document();
+        document.apply_conflict(0, MergeSide::Local);
+        let palette = merge_palette(MergeTheme::Light);
+
+        for side in [MergeSide::Local, MergeSide::Remote] {
+            let rows = cached_merge_side_display_rows(&document, side);
+            let conflict_rows = rows
+                .iter()
+                .filter(|row| row.conflict_index == Some(0))
+                .collect::<Vec<_>>();
+
+            assert!(!conflict_rows.is_empty());
+            assert!(conflict_rows.iter().all(|row| row.side_resolved));
+            assert!(conflict_rows.iter().all(|row| {
+                row.tone == MergeSideLineTone::Unchanged
+                    && merge_side_row_fill(row, 0, MergeHighlightMode::Lines, palette).is_none()
+            }));
+        }
+    }
+
+    #[test]
+    fn ai_deletion_suggestion_resolves_the_base_only_group() {
+        let document = navigation_matrix_document();
+        let group = base_only_display_groups(&document)
+            .into_iter()
+            .find(|group| {
+                document.lines[group.line_index].base.as_deref() == Some("delete-from-local")
+            })
+            .expect("local deletion group");
+        assert_eq!(group.missing_side, MergeSide::Local);
+        let target = MergeLineActionTarget::BaseOnlyGroup(group.line_index);
+        let mut app = MergeToolApp::new(test_merge_args(), document);
+        app.ai_suggestions.insert(
+            target,
+            MergeAiSuggestion {
+                target,
+                choice: MergeAiChoice::Local,
+                reason_zh: "左边有意删除了过时行".to_owned(),
+                reason_en: "The Left pane intentionally removed the obsolete line".to_owned(),
+            },
+        );
+
+        app.apply_ai_suggestion(target);
+
+        assert!(!app.ai_suggestions.contains_key(&target));
+        assert!(
+            !base_only_display_groups(&app.document)
+                .iter()
+                .any(|candidate| candidate.line_index == group.line_index)
+        );
+        assert!(!app.result_text.contains("delete-from-local"));
     }
 
     #[test]
@@ -6007,6 +8534,31 @@ mod tests {
     }
 
     #[test]
+    fn connector_geometry_uses_fixed_viewport_x_after_horizontal_content_moves() {
+        let viewport = Rect::from_min_max(Pos2::new(400.0, 80.0), Pos2::new(700.0, 500.0));
+        for content_rect in [
+            Rect::from_min_max(Pos2::new(400.0, 120.0), Pos2::new(1_400.0, 138.0)),
+            Rect::from_min_max(Pos2::new(-240.0, 120.0), Pos2::new(760.0, 138.0)),
+        ] {
+            let mut geometry = MergePanelGeometry::default();
+            geometry.record_row(7, content_rect);
+            geometry.set_horizontal_bounds(viewport);
+
+            let span = geometry.span_rect(7, 1).expect("visible connector span");
+            assert_eq!(span.left(), viewport.left());
+            assert_eq!(span.right(), viewport.right());
+            assert_eq!(span.top(), content_rect.top());
+            assert_eq!(span.bottom(), content_rect.bottom());
+
+            let marker = geometry
+                .boundary_marker_rect(7, MERGE_BASE_ONLY_MARKER_HEIGHT)
+                .expect("visible connector boundary marker");
+            assert_eq!(marker.left(), viewport.left());
+            assert_eq!(marker.right(), viewport.right());
+        }
+    }
+
+    #[test]
     fn large_merge_cached_scroll_anchors_keep_conflict_rows_aligned() {
         let mut base = (0..6_000)
             .map(|index| format!("lock-entry-{index}: base"))
@@ -6263,6 +8815,51 @@ mod tests {
     }
 
     #[test]
+    fn shared_horizontal_scrollbar_reaches_both_ends() {
+        let track = Rect::from_min_size(Pos2::new(20.0, 8.0), Vec2::new(900.0, 10.0));
+        let thumb_width = 240.0;
+        let max_scroll_x = 720.0;
+
+        assert_eq!(
+            merge_horizontal_scroll_target(track, track.left(), thumb_width, max_scroll_x),
+            0.0,
+        );
+        assert_eq!(
+            merge_horizontal_scroll_target(track, track.right(), thumb_width, max_scroll_x),
+            max_scroll_x,
+        );
+    }
+
+    #[test]
+    fn shared_horizontal_offset_moves_all_code_areas_but_keeps_gutters_fixed() {
+        let row = Rect::from_min_size(Pos2::new(10.0, 30.0), Vec2::new(360.0, 18.0));
+        let scroll_x = 128.0;
+        let content_width = 800.0;
+        let (side_clip, side_content) = merge_scrolled_code_text_rects(
+            row,
+            MERGE_SIDE_CODE_GUTTER_WIDTH,
+            scroll_x,
+            content_width,
+        );
+        let (result_clip, result_content) = merge_scrolled_code_text_rects(
+            row,
+            MERGE_RESULT_CODE_GUTTER_WIDTH,
+            scroll_x,
+            content_width,
+        );
+
+        assert_eq!(side_clip.left(), row.left() + MERGE_SIDE_CODE_GUTTER_WIDTH);
+        assert_eq!(
+            result_clip.left(),
+            row.left() + MERGE_RESULT_CODE_GUTTER_WIDTH
+        );
+        assert_eq!(side_content.left(), side_clip.left() - scroll_x);
+        assert_eq!(result_content.left(), result_clip.left() - scroll_x);
+        assert_eq!(side_content.width(), content_width);
+        assert_eq!(result_content.width(), content_width);
+    }
+
+    #[test]
     fn minimap_side_markers_project_to_result_rows_after_deletions() {
         let document = navigation_matrix_document();
         let conflict = document.conflicts().last().expect("last conflict");
@@ -6423,6 +9020,39 @@ mod tests {
         assert_eq!(merge_clamp_scroll_offset(480.0, 180.0, 120.0), 60.0);
         assert_eq!(merge_clamp_scroll_offset(-12.0, 180.0, 120.0), 0.0);
         assert_eq!(merge_clamp_scroll_offset(42.0, 80.0, 120.0), 0.0);
+    }
+
+    #[test]
+    fn passive_short_side_clamp_cannot_pull_shared_scroll_back_from_bottom() {
+        let requested_side_scroll = 144.0;
+        let short_side_clamped_scroll = 72.0;
+
+        assert!(!merge_side_offset_changed_by_user(
+            false,
+            requested_side_scroll,
+            short_side_clamped_scroll,
+        ));
+        assert!(merge_side_offset_changed_by_user(
+            true,
+            requested_side_scroll,
+            short_side_clamped_scroll,
+        ));
+    }
+
+    #[test]
+    fn side_wheel_updates_canonical_result_scroll_and_reaches_the_bottom() {
+        let viewport_height = 540.0;
+        let content_height = 702.0;
+        let max_scroll = content_height - viewport_height;
+
+        assert_eq!(
+            merge_scroll_offset_after_input(126.0, -90.0, viewport_height, content_height),
+            max_scroll,
+        );
+        assert_eq!(
+            merge_scroll_offset_after_input(max_scroll, 54.0, viewport_height, content_height),
+            max_scroll - 54.0,
+        );
     }
 
     #[test]
@@ -6707,8 +9337,7 @@ mod tests {
                     false,
                     MergeHighlightMode::Words,
                     palette,
-                )
-                .is_some_and(|fill| fill.a() >= 200)
+                ) == Some(palette.conflict_fill)
         }));
 
         let cached_rows = cached_merge_side_display_rows(&document, MergeSide::Local);
@@ -6727,6 +9356,43 @@ mod tests {
                 palette,
             ),
             Some((palette.conflict_fill, 2))
+        );
+    }
+
+    #[test]
+    fn one_side_action_block_uses_one_background_even_when_line_tones_differ() {
+        let document = three_way_merge(
+            "start\n  if (isVip && total <= limit) {\n    return \"approve\";\n  }\nend\n",
+            "start\nend\n",
+            "start\n  if (isVip && total < limit) {\n    return \"approve\";\n  }\nend\n",
+        );
+        let palette = merge_palette(MergeTheme::Light);
+        let rows = cached_merge_side_display_rows(&document, MergeSide::Remote)
+            .into_iter()
+            .filter(|row| row.conflict_index == Some(0))
+            .collect::<Vec<_>>();
+        let distinct_tones = rows.iter().map(|row| row.tone).collect::<HashSet<_>>();
+        let expected_fill = palette.conflict_fill;
+
+        assert!(
+            distinct_tones.len() > 1,
+            "fixture must contain mixed line tones"
+        );
+        assert!(rows.iter().all(|row| {
+            merge_side_row_fill(row, usize::MAX, MergeHighlightMode::Lines, palette)
+                == Some(expected_fill)
+        }));
+        assert_eq!(
+            merge_side_background_run(
+                &rows,
+                0,
+                0,
+                rows.len(),
+                usize::MAX,
+                MergeHighlightMode::Lines,
+                palette,
+            ),
+            Some((expected_fill, rows.len())),
         );
     }
 
@@ -6896,7 +9562,10 @@ mod tests {
                 MergeHighlightMode::Lines,
                 palette,
             ),
-            Some((palette.conflict_fill, 2))
+            Some((
+                merge_result_row_fill(MergeSideLineTone::Replaced, false, palette),
+                2,
+            ))
         );
         assert_eq!(
             merge_result_background_run(
@@ -6926,7 +9595,10 @@ mod tests {
             .expect("result row source");
 
         assert!(result_panel.contains("merge_result_display_rows(&app.document)"));
-        assert!(row_painter.contains("MergeSideLineTone::BaseOnly => palette.base_only_fill"));
+        assert!(row_painter.contains("MergeSideLineTone::BaseOnly"));
+        assert!(row_painter.contains("paint_result_side_status_badges"));
+        assert!(row_painter.contains("MergeSideLineTone::LocalDeletedRemoteEdited"));
+        assert!(row_painter.contains("MergeSideLineTone::LocalEditedRemoteDeleted"));
         assert!(row_painter.contains("palette.active_conflict_fill"));
     }
 
@@ -7071,6 +9743,119 @@ mod tests {
     }
 
     #[test]
+    fn repeated_return_statements_stay_with_their_local_conflict_block() {
+        let document = three_way_merge(
+            "start\n  if (fraudSignals > allowedFraudSignalCount(policy)) {\n    return \"review\";\n  }\n  if (cartTotal > policy.manualReviewAbove) {\n    return \"review\";\n  }\n  if (isVip && cartTotal <= vipAutoApproveLimit(policy)) {\n    return \"approve\";\n  }\nend\n",
+            "start\n  if (fraudSignals >= allowedFraudSignalCount(policy)) {\n    return \"review\";\n  }\n  if (cartTotal > policy.manualReviewAbove) {\n    return \"review\";\n  }\nend\n",
+            "start\n  // Reject excessive fraud evidence.\n  if (fraudSignals > signalLimit) {\n    return \"reject\";\n  }\n  if (cartTotal > policy.manualReviewAbove || fraudSignals === signalLimit) {\n    return \"review\";\n  }\n  if (isVip && cartTotal < vipAutoApproveLimit(policy)) {\n    return \"approve\";\n  }\nend\n",
+        );
+
+        let conflict_index = document
+            .conflicts()
+            .iter()
+            .find(|conflict| {
+                conflict
+                    .base
+                    .iter()
+                    .any(|line| line.contains("fraudSignals > allowedFraudSignalCount"))
+            })
+            .map(|conflict| conflict.index)
+            .expect("fraud policy conflict");
+        let rows = merge_result_display_rows(&document)
+            .into_iter()
+            .filter(|row| row.conflict_index == Some(conflict_index))
+            .map(|row| (row.text, row.tone))
+            .collect::<Vec<_>>();
+        let fraud_condition = rows
+            .iter()
+            .position(|(text, _)| text.contains("fraudSignals > allowedFraudSignalCount"))
+            .expect("base fraud condition");
+
+        assert_eq!(rows[fraud_condition].1, MergeSideLineTone::Replaced);
+        assert_eq!(
+            rows[fraud_condition + 1],
+            ("    return \"review\";", MergeSideLineTone::Replaced),
+            "the later remote review return must not be matched to the replaced fraud branch"
+        );
+    }
+
+    #[test]
+    fn delete_versus_edit_marks_the_whole_conflict_block_as_mixed() {
+        let document = three_way_merge(
+            "start\n  if (isVip && cartTotal <= vipAutoApproveLimit(policy)) {\n    return \"approve\";\n  }\nend\n",
+            "start\nend\n",
+            "start\n  if (isVip && cartTotal < vipAutoApproveLimit(policy)) {\n    return \"approve\";\n  }\nend\n",
+        );
+
+        assert_eq!(document.conflicts().len(), 1);
+        let rows = merge_result_display_rows(&document)
+            .into_iter()
+            .filter(|row| row.conflict_index == Some(0))
+            .map(|row| (row.text, row.tone))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "  if (isVip && cartTotal <= vipAutoApproveLimit(policy)) {",
+                    MergeSideLineTone::LocalDeletedRemoteEdited,
+                ),
+                (
+                    "    return \"approve\";",
+                    MergeSideLineTone::LocalDeletedRemoteEdited,
+                ),
+                ("  }", MergeSideLineTone::LocalDeletedRemoteEdited),
+            ],
+        );
+    }
+
+    #[test]
+    fn edit_versus_delete_keeps_the_opposite_direction_for_status_badges() {
+        let document = three_way_merge(
+            "start\n  if (isVip && total <= limit) {\n    return \"approve\";\n  }\nend\n",
+            "start\n  if (isVip && total < limit) {\n    return \"approve\";\n  }\nend\n",
+            "start\nend\n",
+        );
+        let tones = merge_result_display_rows(&document)
+            .into_iter()
+            .filter(|row| row.conflict_index == Some(0))
+            .map(|row| row.tone)
+            .collect::<Vec<_>>();
+
+        assert!(
+            tones
+                .iter()
+                .all(|tone| *tone == MergeSideLineTone::LocalEditedRemoteDeleted)
+        );
+    }
+
+    #[test]
+    fn delete_edit_result_uses_directional_badges_without_changing_solid_fill() {
+        for theme in [MergeTheme::Light, MergeTheme::Dark] {
+            let palette = merge_palette(theme);
+            assert_eq!(
+                merge_result_row_fill(MergeSideLineTone::LocalDeletedRemoteEdited, false, palette,),
+                palette.conflict_fill,
+            );
+            assert_eq!(
+                result_side_status_pair(MergeSideLineTone::LocalDeletedRemoteEdited),
+                Some((
+                    MergeResultSideStatus::Deleted,
+                    MergeResultSideStatus::Edited,
+                )),
+            );
+            assert_eq!(
+                result_side_status_pair(MergeSideLineTone::LocalEditedRemoteDeleted),
+                Some((
+                    MergeResultSideStatus::Edited,
+                    MergeResultSideStatus::Deleted,
+                )),
+            );
+        }
+    }
+
+    #[test]
     fn unresolved_result_rows_keep_side_text_for_word_highlighting() {
         let document = three_way_merge(
             "keep\nruntime_mode = base\nendpoint = /v1/base\nend\n",
@@ -7176,9 +9961,9 @@ mod tests {
                 (".idea", MergeSideLineTone::Unchanged),
                 ("vite.config.mts.*.mjs", MergeSideLineTone::Unchanged),
                 ("nil", MergeSideLineTone::Unchanged),
-                ("claude.md", MergeSideLineTone::Replaced),
+                ("claude.md", MergeSideLineTone::LocalDeletedRemoteEdited,),
                 (".codegraph/*", MergeSideLineTone::Replaced),
-                (".mcp.json", MergeSideLineTone::Replaced),
+                (".mcp.json", MergeSideLineTone::LocalDeletedRemoteEdited,),
                 ("AGENTS.md", MergeSideLineTone::Replaced),
             ]
         );
@@ -7395,30 +10180,62 @@ mod tests {
     }
 
     #[test]
-    fn base_only_marker_bridge_connects_marker_edges_to_result_edges() {
+    fn connector_bridge_fills_panel_padding_and_slopes_only_between_columns() {
         let result_rect = Rect::from_min_max(Pos2::new(100.0, 40.0), Pos2::new(260.0, 76.0));
-        let marker_rect = Rect::from_min_max(Pos2::new(20.0, 50.0), Pos2::new(80.0, 53.0));
+        let local_marker = Rect::from_min_max(Pos2::new(20.0, 50.0), Pos2::new(80.0, 53.0));
+        let result_column = Rect::from_min_max(Pos2::new(95.0, 0.0), Pos2::new(265.0, 100.0));
+        let local_column = Rect::from_min_max(Pos2::new(10.0, 0.0), Pos2::new(85.0, 100.0));
 
         assert_eq!(
-            base_only_marker_bridge_points(result_rect, marker_rect, MergeSide::Local),
-            vec![
-                Pos2::new(100.0, 40.0),
-                Pos2::new(90.0, 40.0),
-                Pos2::new(80.0, 50.0),
-                Pos2::new(80.0, 53.0),
-                Pos2::new(90.0, 76.0),
-                Pos2::new(100.0, 76.0),
-            ]
+            connector_bridge_x_positions(
+                result_rect,
+                local_marker,
+                result_column,
+                local_column,
+                MergeSide::Local,
+            ),
+            (100.0, 85.0, 80.0, 80.0),
         );
         assert_eq!(
-            base_only_marker_bridge_points(result_rect, marker_rect, MergeSide::Remote),
+            connector_gap_points(
+                result_rect,
+                local_marker,
+                result_column,
+                local_column,
+                MergeSide::Local,
+            ),
             vec![
-                Pos2::new(260.0, 40.0),
-                Pos2::new(140.0, 40.0),
-                Pos2::new(20.0, 50.0),
-                Pos2::new(20.0, 53.0),
-                Pos2::new(140.0, 76.0),
-                Pos2::new(260.0, 76.0),
+                Pos2::new(85.0, 40.0),
+                Pos2::new(80.0, 50.0),
+                Pos2::new(80.0, 53.0),
+                Pos2::new(85.0, 76.0),
+            ]
+        );
+        let remote_marker = Rect::from_min_max(Pos2::new(280.0, 50.0), Pos2::new(340.0, 53.0));
+        let remote_column = Rect::from_min_max(Pos2::new(275.0, 0.0), Pos2::new(350.0, 100.0));
+        assert_eq!(
+            connector_bridge_x_positions(
+                result_rect,
+                remote_marker,
+                result_column,
+                remote_column,
+                MergeSide::Remote,
+            ),
+            (260.0, 275.0, 280.0, 280.0),
+        );
+        assert_eq!(
+            connector_gap_points(
+                result_rect,
+                remote_marker,
+                result_column,
+                remote_column,
+                MergeSide::Remote,
+            ),
+            vec![
+                Pos2::new(275.0, 40.0),
+                Pos2::new(280.0, 50.0),
+                Pos2::new(280.0, 53.0),
+                Pos2::new(275.0, 76.0),
             ]
         );
     }
@@ -7609,7 +10426,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_connects_final_rect_edges_without_late_side_offset() {
+    fn bridge_uses_inner_row_edges_and_outer_column_edges() {
         let source = include_str!("merge_tool.rs");
         let implementation = source
             .split("fn paint_side_block_bridge")
@@ -7617,8 +10434,9 @@ mod tests {
             .and_then(|tail| tail.split("fn merge_connector_color").next())
             .expect("bridge implementation");
 
-        assert!(implementation.contains("Pos2::new(side_x, side_rect.top())"));
-        assert!(implementation.contains("Pos2::new(side_x, side_rect.bottom())"));
+        assert!(implementation.contains("paint_connector_endpoint_extension"));
+        assert!(implementation.contains("Pos2::new(result_edge_x, result_rect.top())"));
+        assert!(implementation.contains("Pos2::new(side_edge_x, side_rect.top())"));
         assert!(!implementation.contains("fn merge_connector_side_y("));
         assert!(!implementation.contains("fn merge_connector_side_bottom_y("));
     }
@@ -7660,6 +10478,21 @@ mod tests {
         assert!(source.contains("include_str!(\"../config/merge-tool.toml\")"));
         assert!(source.contains("merge_build_config_bool(\"connector_guides\")"));
         assert!(!shortcuts.contains("Key::D"));
+    }
+
+    #[test]
+    fn connector_guides_outline_complete_result_and_side_rectangles() {
+        let source = include_str!("merge_tool.rs");
+        let implementation = source
+            .split("fn paint_side_block_debug")
+            .nth(1)
+            .and_then(|tail| tail.split("fn merge_connector_color").next())
+            .expect("connector debug painter");
+
+        assert_eq!(implementation.matches("painter.rect_stroke(").count(), 2);
+        assert!(implementation.contains("egui::StrokeKind::Inside"));
+        assert!(!implementation.contains("side_rect.left_top()"));
+        assert!(!implementation.contains("result_rect.left_bottom()"));
     }
 
     #[test]
@@ -7782,6 +10615,10 @@ mod tests {
         assert!(implementation.contains("&local_output.geometry"));
         assert!(implementation.contains("&result_output.geometry"));
         assert!(implementation.contains("&remote_output.geometry"));
+        assert!(implementation.contains("MergeConnectorColumns"));
+        assert!(implementation.contains("local: left"));
+        assert!(implementation.contains("result,"));
+        assert!(implementation.contains("remote: right"));
         assert!(implementation.contains("app.shared_scroll_y = next_shared_scroll_y;"));
     }
 }

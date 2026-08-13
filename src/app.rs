@@ -11,6 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use eframe::{
     App, CreationContext,
     egui::{
@@ -416,6 +421,14 @@ fn custom_title_drag_rect(rect: Rect, controls_width: f32) -> Rect {
     )
 }
 
+fn current_title_drag_rect(screen: Rect) -> Rect {
+    let title_row = Rect::from_min_max(
+        screen.left_top(),
+        Pos2::new(screen.right(), screen.top() + TITLE_BAR_HEIGHT),
+    );
+    custom_title_drag_rect(title_row, 128.0)
+}
+
 fn window_resize_direction(
     rect: Rect,
     pointer_pos: Pos2,
@@ -676,6 +689,11 @@ pub struct GitAgentApp {
     custom_action_name_input: String,
     custom_action_command_input: String,
     custom_action_error: Option<String>,
+    ai_models: Vec<LlmModelSettings>,
+    selected_ai_model: Option<String>,
+    ai_model_dialog: Option<AiModelDialog>,
+    pending_ai_model_delete: Option<usize>,
+    ai_secret_storage_error: Option<String>,
     ssh_client: SshClientKind,
     ssh_key_path: String,
     ssh_executable_path: String,
@@ -685,6 +703,8 @@ pub struct GitAgentApp {
     history_show_remote_refs: bool,
     history_show_branch_refs: bool,
     history_show_tag_refs: bool,
+    saved_window_size: Option<WindowSize>,
+    pending_window_size: Option<(WindowSize, Instant)>,
 }
 
 #[derive(Clone, Debug)]
@@ -919,9 +939,9 @@ fn repository_refresh_scheduler_loop(
             ctx.request_repaint();
             continue;
         }
-        let mut unavailable_keys = blocked_keys.clone();
-        unavailable_keys.extend(exclusive_keys.iter().cloned());
-        if let Some(index) = next_repository_refresh_request_index(&pending, &unavailable_keys) {
+        if let Some(index) =
+            next_repository_refresh_request_index(&pending, &blocked_keys, &exclusive_keys)
+        {
             let request = pending.swap_remove(index);
             let result = git::open_repository_core(request.path.clone());
             let _ = request.result_sender.send((request.path, result));
@@ -1039,12 +1059,17 @@ fn enqueue_repository_refresh(
 
 fn next_repository_refresh_request_index(
     pending: &[RepositoryRefreshRequest],
-    blocked_keys: &HashSet<String>,
+    background_blocked_keys: &HashSet<String>,
+    exclusive_keys: &HashSet<String>,
 ) -> Option<usize> {
     pending
         .iter()
         .enumerate()
-        .filter(|(_, request)| !blocked_keys.contains(&request.key))
+        .filter(|(_, request)| {
+            !exclusive_keys.contains(&request.key)
+                && (request.priority == RepositoryRefreshPriority::Foreground
+                    || !background_blocked_keys.contains(&request.key))
+        })
         .max_by_key(|(_, request)| request.priority)
         .map(|(index, _)| index)
 }
@@ -1263,6 +1288,7 @@ enum HistoryBranchScope {
 enum SettingsTab {
     General,
     Git,
+    Ai,
     CustomActions,
     Verification,
     Network,
@@ -2185,9 +2211,150 @@ struct AppSettings {
     inactive_repo_refresh_seconds: u64,
     remote_accounts: Vec<RemoteAccountSettings>,
     custom_actions: Vec<CustomGitActionSettings>,
+    #[serde(default)]
+    ai_models: Vec<LlmModelSettings>,
+    #[serde(default)]
+    selected_ai_model: Option<String>,
+    #[serde(default, skip_serializing)]
+    ai_openai: AiProviderSettings,
+    #[serde(default, skip_serializing)]
+    ai_claude: AiProviderSettings,
     ssh_client: SshClientKind,
     ssh_key_path: String,
     ssh_executable_path: String,
+    window_size: Option<WindowSize>,
+    #[serde(skip)]
+    secret_storage_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct WindowSize {
+    width: f32,
+    height: f32,
+}
+
+impl WindowSize {
+    fn valid(self) -> bool {
+        self.width.is_finite()
+            && self.height.is_finite()
+            && self.width >= 320.0
+            && self.height >= 240.0
+            && self.width <= 16_384.0
+            && self.height <= 16_384.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum AiProviderKind {
+    OpenAiCompatible,
+    Claude,
+}
+
+/// A narrow, decrypted snapshot for a short-lived assistant request in the standalone merge
+/// process. The main application remains the owner of persisted AI settings and secrets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MergeAiApiFormat {
+    OpenAiCompatible,
+    Claude,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeAiModelConfig {
+    pub name: String,
+    pub api_format: MergeAiApiFormat,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_id: String,
+}
+
+impl Default for AiProviderKind {
+    fn default() -> Self {
+        Self::OpenAiCompatible
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct AiProviderSettings {
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct LlmModelSettings {
+    name: String,
+    api_format: AiProviderKind,
+    base_url: String,
+    api_key: String,
+    model_id: String,
+}
+
+impl Default for LlmModelSettings {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            api_format: AiProviderKind::OpenAiCompatible,
+            base_url: "https://api.openai.com/v1".to_owned(),
+            api_key: String::new(),
+            model_id: String::new(),
+        }
+    }
+}
+
+impl AiProviderSettings {
+    fn openai_compatible() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_owned(),
+            api_key: String::new(),
+            model: "gpt-5-mini".to_owned(),
+        }
+    }
+
+    fn claude() -> Self {
+        Self {
+            base_url: "https://api.anthropic.com/v1".to_owned(),
+            api_key: String::new(),
+            model: "claude-sonnet-4-5".to_owned(),
+        }
+    }
+}
+
+impl Default for AiProviderSettings {
+    fn default() -> Self {
+        Self::openai_compatible()
+    }
+}
+
+struct AiModelDialog {
+    editing_index: Option<usize>,
+    settings: LlmModelSettings,
+    error: Option<String>,
+    test_task: Option<Receiver<Result<(), String>>>,
+    test_result: Option<Result<(), String>>,
+}
+
+impl AiModelDialog {
+    fn add() -> Self {
+        Self {
+            editing_index: None,
+            settings: LlmModelSettings::default(),
+            error: None,
+            test_task: None,
+            test_result: None,
+        }
+    }
+
+    fn edit(index: usize, settings: LlmModelSettings) -> Self {
+        Self {
+            editing_index: Some(index),
+            settings,
+            error: None,
+            test_task: None,
+            test_result: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2268,9 +2435,15 @@ impl Default for AppSettings {
             inactive_repo_refresh_seconds: DEFAULT_INACTIVE_REPO_REFRESH_SECONDS,
             remote_accounts: vec![RemoteAccountSettings::default()],
             custom_actions: Vec::new(),
+            ai_models: Vec::new(),
+            selected_ai_model: None,
+            ai_openai: AiProviderSettings::openai_compatible(),
+            ai_claude: AiProviderSettings::claude(),
             ssh_client: SshClientKind::default(),
             ssh_key_path: String::new(),
             ssh_executable_path: String::new(),
+            window_size: None,
+            secret_storage_error: None,
         }
     }
 }
@@ -2280,23 +2453,284 @@ impl AppSettings {
         let Some(path) = app_settings_path() else {
             return Self::default();
         };
-        fs::read_to_string(path)
+        let mut settings: Self = fs::read_to_string(path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        settings.migrate_legacy_ai_models();
+        if let Err(error) = local_secret_key().and_then(|_| settings.decrypt_ai_api_keys()) {
+            for model in &mut settings.ai_models {
+                model.api_key.clear();
+            }
+            settings.secret_storage_error = Some(error);
+        }
+        settings
     }
 
-    fn save(self) {
+    fn save(mut self) -> Result<(), String> {
+        self.encrypt_ai_api_keys()?;
         let Some(path) = app_settings_path() else {
-            return;
+            return Err("Unable to locate the local configuration directory".to_owned());
         };
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Unable to create configuration directory: {error}"))?;
         }
-        if let Ok(raw) = serde_json::to_string_pretty(&self) {
-            let _ = fs::write(path, raw);
+        let raw = serde_json::to_string_pretty(&self)
+            .map_err(|error| format!("Unable to serialize configuration: {error}"))?;
+        fs::write(path, raw).map_err(|error| format!("Unable to save configuration: {error}"))
+    }
+
+    fn encrypt_ai_api_keys(&mut self) -> Result<(), String> {
+        for model in &mut self.ai_models {
+            model.api_key = encrypt_local_secret(&model.api_key)?;
+        }
+        Ok(())
+    }
+
+    fn decrypt_ai_api_keys(&mut self) -> Result<(), String> {
+        for model in &mut self.ai_models {
+            model.api_key = decrypt_local_secret(&model.api_key)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_legacy_ai_models(&mut self) {
+        if !self.ai_models.is_empty() {
+            return;
+        }
+        let legacy = [
+            (
+                "OpenAI",
+                AiProviderKind::OpenAiCompatible,
+                self.ai_openai.clone(),
+            ),
+            ("Claude", AiProviderKind::Claude, self.ai_claude.clone()),
+        ];
+        for (name, api_format, settings) in legacy {
+            if settings.api_key.trim().is_empty() {
+                continue;
+            }
+            self.ai_models.push(LlmModelSettings {
+                name: name.to_owned(),
+                api_format,
+                base_url: settings.base_url,
+                api_key: settings.api_key,
+                model_id: settings.model,
+            });
+        }
+        self.selected_ai_model = self.ai_models.first().map(|model| model.name.clone());
+    }
+}
+
+/// Loads the AI model selected by the main app for the standalone merge assistant. The API key
+/// is decrypted only in the process that will make the request and is never passed as a command
+/// line argument.
+pub fn load_merge_ai_model_config(
+    requested_name: Option<&str>,
+) -> Result<MergeAiModelConfig, String> {
+    let settings = AppSettings::load();
+    if let Some(error) = settings.secret_storage_error {
+        return Err(error);
+    }
+    let selected_name = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or(settings.selected_ai_model.as_deref())
+        .ok_or_else(|| "No AI model is configured. Add one in Options > AI first.".to_owned())?;
+    let model = settings
+        .ai_models
+        .into_iter()
+        .find(|model| model.name == selected_name)
+        .ok_or_else(|| format!("AI model configuration '{selected_name}' was not found"))?;
+    if model.api_key.trim().is_empty() {
+        return Err(format!(
+            "AI model configuration '{selected_name}' has no API key"
+        ));
+    }
+    if model.model_id.trim().is_empty() || model.base_url.trim().is_empty() {
+        return Err(format!(
+            "AI model configuration '{selected_name}' is incomplete"
+        ));
+    }
+    Ok(MergeAiModelConfig {
+        name: model.name,
+        api_format: match model.api_format {
+            AiProviderKind::OpenAiCompatible => MergeAiApiFormat::OpenAiCompatible,
+            AiProviderKind::Claude => MergeAiApiFormat::Claude,
+        },
+        base_url: model.base_url,
+        api_key: model.api_key,
+        model_id: model.model_id,
+    })
+}
+
+const AI_SECRET_PREFIX: &str = "enc:v1:";
+const AI_SECRET_KEY_SERVICE: &str = "Git Agent";
+const AI_SECRET_KEY_ACCOUNT: &str = "ai-config-master-key";
+
+fn local_secret_key() -> Result<[u8; 32], String> {
+    let entry = keyring::Entry::new(AI_SECRET_KEY_SERVICE, AI_SECRET_KEY_ACCOUNT)
+        .map_err(|error| format!("Secure storage is unavailable: {error}"))?;
+    match entry.get_secret() {
+        Ok(secret) => secret
+            .try_into()
+            .map_err(|_| "Secure storage returned an invalid local encryption key".to_owned()),
+        Err(_) => {
+            let mut key = [0_u8; 32];
+            getrandom::getrandom(&mut key)
+                .map_err(|error| format!("Unable to generate a local encryption key: {error}"))?;
+            entry.set_secret(&key).map_err(|error| {
+                format!("Unable to save the local encryption key securely: {error}")
+            })?;
+            Ok(key)
         }
     }
+}
+
+fn encrypt_local_secret(plaintext: &str) -> Result<String, String> {
+    if plaintext.is_empty() {
+        return Ok(plaintext.to_owned());
+    }
+    let key = local_secret_key()?;
+    encrypt_secret_with_key(plaintext, &key)
+}
+
+fn encrypt_secret_with_key(plaintext: &str, key: &[u8; 32]) -> Result<String, String> {
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| "Unable to initialize local encryption".to_owned())?;
+    let mut nonce = [0_u8; 12];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| format!("Unable to create secure encryption nonce: {error}"))?;
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_bytes())
+        .map_err(|_| "Unable to encrypt the API key".to_owned())?;
+    let mut payload = nonce.to_vec();
+    payload.extend(ciphertext);
+    Ok(format!(
+        "{AI_SECRET_PREFIX}{}",
+        STANDARD_NO_PAD.encode(payload)
+    ))
+}
+
+fn decrypt_local_secret(value: &str) -> Result<String, String> {
+    let Some(encoded) = value.strip_prefix(AI_SECRET_PREFIX) else {
+        return Ok(value.to_owned());
+    };
+    let key = local_secret_key()?;
+    decrypt_secret_with_key(encoded, &key)
+}
+
+fn decrypt_secret_with_key(encoded: &str, key: &[u8; 32]) -> Result<String, String> {
+    let payload = STANDARD_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "Stored API key ciphertext is invalid".to_owned())?;
+    if payload.len() <= 12 {
+        return Err("Stored API key ciphertext is incomplete".to_owned());
+    }
+    let (nonce, ciphertext) = payload.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| "Unable to initialize local decryption".to_owned())?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| "Unable to decrypt the stored API key for this user".to_owned())?;
+    String::from_utf8(plaintext).map_err(|_| "Stored API key is not valid UTF-8".to_owned())
+}
+
+/// Returns the last user-selected inner size. Window position intentionally stays unmanaged.
+pub fn persisted_window_inner_size(default: [f32; 2], minimum: [f32; 2]) -> [f32; 2] {
+    let Some(size) = AppSettings::load().window_size.filter(|size| size.valid()) else {
+        return default;
+    };
+    [size.width.max(minimum[0]), size.height.max(minimum[1])]
+}
+
+fn normalized_ai_base_url(base_url: &str) -> Result<String, String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+        return Err("Base URL must start with http:// or https://".to_owned());
+    }
+    if base_url.len() <= "https://".len() {
+        return Err("Base URL is incomplete".to_owned());
+    }
+    Ok(base_url.to_owned())
+}
+
+fn ai_test_endpoint(provider: AiProviderKind, base_url: &str) -> Result<String, String> {
+    let base_url = normalized_ai_base_url(base_url)?;
+    let suffix = match provider {
+        AiProviderKind::OpenAiCompatible => "chat/completions",
+        // Providers usually accept a root URL (for example DeepSeek's `/anthropic`), while
+        // Anthropic itself is commonly configured with an already-versioned `/v1` URL.
+        AiProviderKind::Claude if base_url.ends_with("/v1") => "messages",
+        AiProviderKind::Claude => "v1/messages",
+    };
+    Ok(format!("{base_url}/{suffix}"))
+}
+
+fn test_ai_provider_settings(
+    provider: AiProviderKind,
+    settings: LlmModelSettings,
+) -> Result<(), String> {
+    if settings.api_key.trim().is_empty() {
+        return Err("API key is required".to_owned());
+    }
+    if settings.model_id.trim().is_empty() {
+        return Err("Model ID is required".to_owned());
+    }
+    let endpoint = ai_test_endpoint(provider, &settings.base_url)?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(12))
+        .build();
+    let request = match provider {
+        AiProviderKind::OpenAiCompatible => agent
+            .post(&endpoint)
+            .set(
+                "Authorization",
+                &format!("Bearer {}", settings.api_key.trim()),
+            )
+            .set("Content-Type", "application/json"),
+        AiProviderKind::Claude => agent
+            .post(&endpoint)
+            .set("x-api-key", settings.api_key.trim())
+            .set("anthropic-version", "2023-06-01")
+            .set("Content-Type", "application/json"),
+    };
+    let payload = match provider {
+        AiProviderKind::OpenAiCompatible => serde_json::json!({
+            "model": settings.model_id.trim(),
+            "messages": [{ "role": "user", "content": "Reply with OK." }],
+            "max_tokens": 1,
+            "temperature": 0,
+        }),
+        AiProviderKind::Claude => serde_json::json!({
+            "model": settings.model_id.trim(),
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "Reply with OK." }],
+        }),
+    };
+    let response = request.send_json(payload).map_err(|error| match error {
+        ureq::Error::Status(status, _) => format!("Server returned HTTP {status}"),
+        ureq::Error::Transport(error) => format!("Connection failed: {error}"),
+    })?;
+    let _: serde_json::Value = response
+        .into_json()
+        .map_err(|_| "Server returned an invalid model response".to_owned())?;
+    Ok(())
+}
+
+fn validate_llm_model_settings(settings: &LlmModelSettings) -> Result<(), String> {
+    if settings.name.trim().is_empty() {
+        return Err("Model configuration name is required".to_owned());
+    }
+    normalized_ai_base_url(&settings.base_url)?;
+    if settings.api_key.trim().is_empty() {
+        return Err("API key is required".to_owned());
+    }
+    if settings.model_id.trim().is_empty() {
+        return Err("Model ID is required".to_owned());
+    }
+    Ok(())
 }
 
 fn normalized_remote_accounts(accounts: &[RemoteAccountSettings]) -> Vec<RemoteAccountSettings> {
@@ -3094,6 +3528,11 @@ impl GitAgentApp {
             custom_action_name_input: String::new(),
             custom_action_command_input: String::new(),
             custom_action_error: None,
+            ai_models: app_settings.ai_models.clone(),
+            selected_ai_model: app_settings.selected_ai_model.clone(),
+            ai_model_dialog: None,
+            pending_ai_model_delete: None,
+            ai_secret_storage_error: app_settings.secret_storage_error.clone(),
             ssh_client: app_settings.ssh_client,
             ssh_key_path: app_settings.ssh_key_path.clone(),
             ssh_executable_path: app_settings.ssh_executable_path.clone(),
@@ -3109,6 +3548,8 @@ impl GitAgentApp {
             history_show_remote_refs: true,
             history_show_branch_refs: true,
             history_show_tag_refs: true,
+            saved_window_size: app_settings.window_size.filter(|size| size.valid()),
+            pending_window_size: None,
         };
 
         app.configure_git_ssh_client();
@@ -7766,8 +8207,11 @@ impl GitAgentApp {
         }
     }
 
-    fn save_app_settings(&self) {
-        AppSettings {
+    fn save_app_settings(&mut self) {
+        if self.ai_secret_storage_error.is_some() {
+            return;
+        }
+        let result = AppSettings {
             theme: self.theme_mode.into(),
             theme_accent: self.theme_accent.into(),
             language: self.language.into(),
@@ -7776,11 +8220,58 @@ impl GitAgentApp {
             inactive_repo_refresh_seconds: self.inactive_repo_refresh_seconds,
             remote_accounts: self.remote_accounts.clone(),
             custom_actions: self.custom_actions.clone(),
+            ai_models: self.ai_models.clone(),
+            selected_ai_model: self.selected_ai_model.clone(),
+            ai_openai: AiProviderSettings::openai_compatible(),
+            ai_claude: AiProviderSettings::claude(),
             ssh_client: self.ssh_client,
             ssh_key_path: self.ssh_key_path.clone(),
             ssh_executable_path: self.ssh_executable_path.clone(),
+            window_size: self
+                .pending_window_size
+                .map(|(size, _)| size)
+                .or(self.saved_window_size),
+            secret_storage_error: None,
         }
         .save();
+        self.ai_secret_storage_error = result.err();
+    }
+
+    fn remember_window_size(&mut self, ctx: &egui::Context, primary_down: bool) {
+        let Some(rect) = ctx.input(|input| input.viewport().inner_rect) else {
+            return;
+        };
+        let size = WindowSize {
+            width: rect.width(),
+            height: rect.height(),
+        };
+        if !size.valid() || self.saved_window_size == Some(size) {
+            return;
+        }
+
+        let now = Instant::now();
+        let pending_changed = self
+            .pending_window_size
+            .is_none_or(|(pending, _)| pending != size);
+        if pending_changed {
+            self.pending_window_size = Some((size, now));
+        }
+
+        let Some((pending, changed_at)) = self.pending_window_size else {
+            return;
+        };
+        // A drag request must reach the native window system in the same input frame.  Saving
+        // settings can encrypt credentials and access the OS key store, so never let a pending
+        // resize persistence write run while a primary-button gesture is beginning or active.
+        if !primary_down && now.duration_since(changed_at) >= Duration::from_millis(600) {
+            self.saved_window_size = Some(pending);
+            self.pending_window_size = None;
+            self.save_app_settings();
+        } else if !primary_down {
+            ctx.request_repaint_after(
+                Duration::from_millis(600).saturating_sub(now.duration_since(changed_at)),
+            );
+        }
     }
 
     fn active_repo_refresh_duration(&self) -> Duration {
@@ -8090,6 +8581,7 @@ impl App for GitAgentApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let primary_down = ctx.input(|input| input.pointer.primary_down());
+        self.remember_window_size(ctx, primary_down);
         let screen_size = ctx.screen_rect().size();
         diagnostics::record_window_size_probe(screen_size.x, screen_size.y);
         if !primary_down {
@@ -8159,6 +8651,8 @@ impl App for GitAgentApp {
         self.ssh_agent_status_modal(ctx);
         self.ssh_install_prompt_modal(ctx);
         self.settings_modal(ctx);
+        self.ai_model_settings_modal(ctx);
+        self.ai_model_delete_modal(ctx);
         self.repo_settings_modal(ctx);
         self.repo_remote_action_modal(ctx);
         self.repository_benchmark_progress_modal(ctx);
@@ -9001,14 +9495,7 @@ impl GitAgentApp {
             ctx.set_cursor_icon(resize_cursor_icon(direction));
             return;
         }
-        let screen = ctx.screen_rect();
-        let title_row = Rect::from_min_max(
-            screen.left_top(),
-            Pos2::new(screen.right(), screen.top() + TITLE_BAR_HEIGHT),
-        );
-        let drag_rect = self
-            .title_drag_layer
-            .unwrap_or_else(|| custom_title_drag_rect(title_row, 128.0));
+        let drag_rect = current_title_drag_rect(ctx.screen_rect());
         if drag_rect.contains(pointer_pos) {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
         }
@@ -9036,9 +9523,7 @@ impl GitAgentApp {
             screen.left_top(),
             Pos2::new(screen.right(), screen.top() + TITLE_BAR_HEIGHT),
         );
-        let drag_rect = self
-            .title_drag_layer
-            .unwrap_or_else(|| custom_title_drag_rect(title_row, 128.0));
+        let drag_rect = current_title_drag_rect(screen);
         if drag_rect.contains(pointer_pos) {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             diagnostics::record_window_drag_probe(pointer_pos.x, pointer_pos.y, 1);
@@ -12564,8 +13049,10 @@ impl GitAgentApp {
                 return;
             }
         };
+        let ai_model_name = self.selected_ai_model.clone();
 
-        let mut child = match Command::new(&merge_exe)
+        let mut command = Command::new(&merge_exe);
+        command
             .current_dir(&root)
             .arg("--base")
             .arg(&base_path)
@@ -12581,9 +13068,11 @@ impl GitAgentApp {
             .arg("--theme")
             .arg(merge_theme_arg(self.theme_mode))
             .arg("--language")
-            .arg(merge_language_arg(self.language))
-            .spawn()
-        {
+            .arg(merge_language_arg(self.language));
+        if let Some(ai_model_name) = ai_model_name.filter(|name| !name.trim().is_empty()) {
+            command.arg("--ai-model").arg(ai_model_name);
+        }
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 self.error = Some(format!("{}: {error}", merge_exe.display()));
@@ -18133,6 +18622,10 @@ impl GitAgentApp {
     fn global_settings_page(&mut self, ui: &mut Ui, content_max_height: f32) {
         global_settings_tab_strip(ui, &mut self.settings_tab, self.language);
         ui.add_space(12.0);
+        if self.settings_tab == SettingsTab::Ai {
+            self.global_ai_settings(ui);
+            return;
+        }
         ScrollArea::vertical()
             .id_salt("global_settings_content_scroll")
             .max_height(content_max_height)
@@ -18140,6 +18633,7 @@ impl GitAgentApp {
             .show(ui, |ui| match self.settings_tab {
                 SettingsTab::General => self.global_general_settings(ui),
                 SettingsTab::Git => self.global_git_settings(ui),
+                SettingsTab::Ai => self.global_ai_settings(ui),
                 SettingsTab::CustomActions => self.global_custom_actions_settings(ui),
                 SettingsTab::Verification => global_settings_empty_tab(
                     ui,
@@ -18221,6 +18715,369 @@ impl GitAgentApp {
         settings_section_title(ui, settings_tab_label(self.language, SettingsTab::Network));
         ui.add_space(12.0);
         self.global_remote_accounts_settings(ui);
+    }
+
+    fn global_ai_settings(&mut self, ui: &mut Ui) {
+        let language = self.language;
+        settings_section_title(ui, settings_tab_label(language, SettingsTab::Ai));
+        ui.add_space(6.0);
+        let selected_name = self
+            .selected_ai_model
+            .as_deref()
+            .filter(|name| self.ai_models.iter().any(|model| model.name == *name))
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| i18n::t(language, "settings.ai_model_none").to_owned());
+        let selected_before = self.selected_ai_model.clone();
+        settings_field(ui, i18n::t(language, "settings.ai_selected_model"), |ui| {
+            ui.scope(|ui| {
+                apply_menu_visuals(ui);
+                egui::ComboBox::from_id_salt("settings_ai_selected_model")
+                    .selected_text(&selected_name)
+                    .width(250.0)
+                    .show_ui(ui, |ui| {
+                        for model in &self.ai_models {
+                            ui.selectable_value(
+                                &mut self.selected_ai_model,
+                                Some(model.name.clone()),
+                                &model.name,
+                            );
+                        }
+                    });
+            });
+        });
+        if self.selected_ai_model != selected_before {
+            self.save_app_settings();
+        }
+        ui.add_space(8.0);
+        settings_field(ui, i18n::t(language, "settings.ai_model_pool"), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if self.ai_models.is_empty() {
+                    ui.label(
+                        RichText::new(i18n::t(language, "settings.ai_model_none"))
+                            .small()
+                            .color(theme::muted()),
+                    );
+                }
+                for index in 0..self.ai_models.len() {
+                    let name = self.ai_models[index].name.clone();
+                    soft_panel_frame(theme::panel_soft(), 5, 3)
+                        .stroke(Stroke::NONE)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.horizontal(|ui| {
+                                let edit = pointing_hand_cursor(
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&name).small())
+                                            .sense(Sense::click()),
+                                    ),
+                                );
+                                if edit.clicked() {
+                                    self.ai_model_dialog = Some(AiModelDialog::edit(
+                                        index,
+                                        self.ai_models[index].clone(),
+                                    ));
+                                }
+                                let delete = pointing_hand_cursor(
+                                    ui.add(
+                                        egui::Label::new(RichText::new("×").small())
+                                            .sense(Sense::click()),
+                                    ),
+                                );
+                                if delete.clicked() {
+                                    self.pending_ai_model_delete = Some(index);
+                                }
+                            });
+                        });
+                }
+            });
+        });
+        ui.add_space(10.0);
+        if let Some(error) = &self.ai_secret_storage_error {
+            ui.label(
+                RichText::new(format!(
+                    "{}: {error}",
+                    i18n::t(language, "settings.ai_secure_storage_unavailable")
+                ))
+                .small()
+                .color(theme::warning()),
+            );
+            ui.add_space(6.0);
+        }
+        if ui
+            .add_enabled(
+                self.ai_secret_storage_error.is_none(),
+                egui::Button::new(i18n::t(language, "settings.ai_add_model")),
+            )
+            .clicked()
+        {
+            self.ai_model_dialog = Some(AiModelDialog::add());
+        }
+    }
+
+    fn ai_model_settings_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.ai_model_dialog.take() else {
+            return;
+        };
+        let language = self.language;
+        if let Some(receiver) = dialog.test_task.take() {
+            match receiver.try_recv() {
+                Ok(result) => dialog.test_result = Some(result),
+                Err(mpsc::TryRecvError::Empty) => {
+                    dialog.test_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    dialog.test_result =
+                        Some(Err("Configuration test stopped unexpectedly".to_owned()));
+                }
+            }
+        }
+
+        let mut close_requested = false;
+        let mut save_requested = false;
+        let screen = ctx.screen_rect();
+        let rect = dialog::top_anchored_rect(
+            screen,
+            Vec2::new(
+                600.0_f32.min(screen.width() * 0.92),
+                430.0_f32.min(screen.height() * 0.9),
+            ),
+        );
+        let size = rect.size();
+        egui::Window::new(i18n::t(language, "settings.ai_model_dialog_title"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_rect(rect)
+            .frame(dialog_window_frame())
+            .show(ctx, |ui| {
+                settings_dialog_panel_frame().show(ui, |ui| {
+                    ui.set_width(size.x);
+                    settings_dialog_title_row(
+                        ui,
+                        if dialog.editing_index.is_some() {
+                            i18n::t(language, "settings.ai_edit_model")
+                        } else {
+                            i18n::t(language, "settings.ai_add_model")
+                        },
+                        size.x,
+                        |ui| {
+                            if window_control_button(ui, "\u{00d7}", true).clicked() {
+                                close_requested = true;
+                            }
+                        },
+                    );
+                    settings_dialog_body_frame().show(ui, |ui| {
+                        ui.set_width(size.x - 28.0);
+                        settings_field(ui, i18n::t(language, "settings.ai_name"), |ui| {
+                            themed_text_edit_selection(ui);
+                            ui.add_sized(
+                                [ui.available_width().clamp(270.0, 430.0), 24.0],
+                                themed_singleline_text_edit(
+                                    &mut dialog.settings.name,
+                                    i18n::t(language, "settings.ai_name_hint"),
+                                ),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        settings_field(ui, i18n::t(language, "settings.ai_api_format"), |ui| {
+                            if settings_choice_button(
+                                ui,
+                                dialog.settings.api_format == AiProviderKind::OpenAiCompatible,
+                                i18n::t(language, "settings.ai_openai_compatible"),
+                                146.0,
+                            )
+                            .clicked()
+                            {
+                                dialog.settings.api_format = AiProviderKind::OpenAiCompatible;
+                            }
+                            if settings_choice_button(
+                                ui,
+                                dialog.settings.api_format == AiProviderKind::Claude,
+                                i18n::t(language, "settings.ai_claude"),
+                                100.0,
+                            )
+                            .clicked()
+                            {
+                                dialog.settings.api_format = AiProviderKind::Claude;
+                            }
+                        });
+                        ui.add_space(8.0);
+                        settings_field(ui, i18n::t(language, "settings.ai_base_url"), |ui| {
+                            themed_text_edit_selection(ui);
+                            ui.add_sized(
+                                [ui.available_width().clamp(270.0, 430.0), 24.0],
+                                themed_singleline_text_edit(
+                                    &mut dialog.settings.base_url,
+                                    i18n::t(language, "settings.ai_base_url_hint"),
+                                ),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        settings_field(ui, i18n::t(language, "settings.ai_api_key"), |ui| {
+                            themed_text_edit_selection(ui);
+                            ui.add_sized(
+                                [ui.available_width().clamp(270.0, 430.0), 24.0],
+                                themed_singleline_secret_text_edit(
+                                    &mut dialog.settings.api_key,
+                                    i18n::t(language, "settings.ai_api_key_hint"),
+                                ),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        settings_field(ui, i18n::t(language, "settings.ai_model_id"), |ui| {
+                            themed_text_edit_selection(ui);
+                            ui.add_sized(
+                                [ui.available_width().clamp(270.0, 430.0), 24.0],
+                                themed_singleline_text_edit(
+                                    &mut dialog.settings.model_id,
+                                    i18n::t(language, "settings.ai_model_id_hint"),
+                                ),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        let testing = dialog.test_task.is_some();
+                        if ui
+                            .add_enabled(
+                                !testing && self.ai_secret_storage_error.is_none(),
+                                egui::Button::new(if testing {
+                                    i18n::t(language, "settings.ai_testing")
+                                } else {
+                                    i18n::t(language, "settings.ai_test")
+                                }),
+                            )
+                            .clicked()
+                        {
+                            let provider = dialog.settings.api_format;
+                            let settings = dialog.settings.clone();
+                            let (sender, receiver) = mpsc::channel();
+                            thread::spawn(move || {
+                                let _ = sender.send(test_ai_provider_settings(provider, settings));
+                            });
+                            dialog.test_result = None;
+                            dialog.test_task = Some(receiver);
+                        }
+                        if let Some(result) = &dialog.test_result {
+                            let text = match result {
+                                Ok(()) if language == Language::Chinese => {
+                                    "测试成功：模型已响应。".to_owned()
+                                }
+                                Ok(()) => "Connection successful: model responded.".to_owned(),
+                                Err(error) => error.clone(),
+                            };
+                            ui.label(RichText::new(text).small().color(if result.is_ok() {
+                                theme::info()
+                            } else {
+                                theme::warning()
+                            }));
+                        }
+                        if let Some(error) = &dialog.error {
+                            ui.label(RichText::new(error).small().color(theme::warning()));
+                        }
+                        ui.add_space(10.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    self.ai_secret_storage_error.is_none(),
+                                    egui::Button::new(i18n::t(language, "dialog.ok")),
+                                )
+                                .clicked()
+                            {
+                                save_requested = true;
+                            }
+                            if ui.button(i18n::t(language, "dialog.cancel")).clicked() {
+                                close_requested = true;
+                            }
+                        });
+                    });
+                });
+            });
+
+        if save_requested {
+            match validate_llm_model_settings(&dialog.settings) {
+                Ok(()) => {
+                    let duplicate = self.ai_models.iter().enumerate().any(|(index, model)| {
+                        Some(index) != dialog.editing_index
+                            && model.name.eq_ignore_ascii_case(dialog.settings.name.trim())
+                    });
+                    if duplicate {
+                        dialog.error =
+                            Some(i18n::t(language, "settings.ai_name_duplicate").to_owned());
+                    } else {
+                        dialog.settings.name = dialog.settings.name.trim().to_owned();
+                        let selected_name = dialog.settings.name.clone();
+                        if let Some(index) = dialog.editing_index {
+                            self.ai_models[index] = dialog.settings.clone();
+                        } else {
+                            self.ai_models.push(dialog.settings.clone());
+                        }
+                        self.selected_ai_model = Some(selected_name);
+                        self.save_app_settings();
+                        close_requested = true;
+                    }
+                }
+                Err(error) => dialog.error = Some(error),
+            }
+        }
+        if !close_requested {
+            self.ai_model_dialog = Some(dialog);
+        }
+    }
+
+    fn ai_model_delete_modal(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.pending_ai_model_delete else {
+            return;
+        };
+        let Some(model) = self.ai_models.get(index) else {
+            self.pending_ai_model_delete = None;
+            return;
+        };
+        let language = self.language;
+        let mut remove = false;
+        let mut cancel = false;
+        let rect = dialog::top_anchored_rect(ctx.screen_rect(), Vec2::new(380.0, 150.0));
+        egui::Window::new(i18n::t(language, "settings.ai_delete_model"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_rect(rect)
+            .frame(dialog_window_frame())
+            .show(ctx, |ui| {
+                settings_dialog_title_row(
+                    ui,
+                    i18n::t(language, "settings.ai_delete_model"),
+                    ui.available_width(),
+                    |_| {},
+                );
+                ui.add_space(12.0);
+                ui.label(format!(
+                    "{} {}?",
+                    i18n::t(language, "settings.ai_delete_confirm"),
+                    model.name
+                ));
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .button(i18n::t(language, "repo.settings.remove"))
+                        .clicked()
+                    {
+                        remove = true;
+                    }
+                    if ui.button(i18n::t(language, "dialog.cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if remove {
+            let removed = self.ai_models.remove(index);
+            if self.selected_ai_model.as_deref() == Some(removed.name.as_str()) {
+                self.selected_ai_model = self.ai_models.first().map(|model| model.name.clone());
+            }
+            self.save_app_settings();
+            self.pending_ai_model_delete = None;
+        } else if cancel {
+            self.pending_ai_model_delete = None;
+        }
     }
 
     fn global_git_settings(&mut self, ui: &mut Ui) {
@@ -20915,6 +21772,15 @@ fn themed_singleline_text_edit<'a>(
             .frame(false),
         inset_shadow: true,
     }
+}
+
+fn themed_singleline_secret_text_edit<'a>(
+    text: &'a mut String,
+    hint: &str,
+) -> ThemedSinglelineTextEdit<'a> {
+    let mut edit = themed_singleline_text_edit(text, hint);
+    edit.inner = edit.inner.password(true);
+    edit
 }
 
 fn commit_message_text_edit<'a>(message: &'a mut String, id: egui::Id, hint: &str) -> TextEdit<'a> {
@@ -25443,6 +26309,7 @@ fn global_settings_dialog_height(
             (280.0 + remote_account_count.saturating_sub(1).min(5) as f32 * 24.0).min(420.0)
         }
         SettingsTab::Git => 330.0,
+        SettingsTab::Ai => 410.0,
         SettingsTab::Verification => 240.0,
         _ => 300.0,
     }
@@ -25462,6 +26329,7 @@ fn settings_tab_label(language: Language, tab: SettingsTab) -> &'static str {
     match (language, tab) {
         (Language::Chinese, SettingsTab::General) => "\u{5e38}\u{89c4}",
         (Language::Chinese, SettingsTab::Git) => "Git",
+        (Language::Chinese, SettingsTab::Ai) => "AI",
         (Language::Chinese, SettingsTab::CustomActions) => {
             "\u{81ea}\u{5b9a}\u{4e49}\u{64cd}\u{4f5c}"
         }
@@ -25471,6 +26339,7 @@ fn settings_tab_label(language: Language, tab: SettingsTab) -> &'static str {
         (Language::Chinese, SettingsTab::RepoAdvanced) => "\u{9ad8}\u{7ea7}",
         (_, SettingsTab::General) => "General",
         (_, SettingsTab::Git) => "Git",
+        (_, SettingsTab::Ai) => "AI",
         (_, SettingsTab::CustomActions) => "Custom Actions",
         (_, SettingsTab::Verification) => "Verification",
         (_, SettingsTab::Network) => "Network",
@@ -25490,6 +26359,11 @@ fn global_settings_tab_strip(ui: &mut Ui, current: &mut SettingsTab, language: L
             SettingsTab::Git,
             UiIcon::Branch,
             settings_tab_label(language, SettingsTab::Git),
+        ),
+        (
+            SettingsTab::Ai,
+            UiIcon::Message,
+            settings_tab_label(language, SettingsTab::Ai),
         ),
         (
             SettingsTab::CustomActions,
@@ -33326,6 +34200,62 @@ mod ui_tests {
     }
 
     #[test]
+    fn ai_api_keys_are_authenticated_encrypted_before_config_is_written() {
+        let key = [7_u8; 32];
+        let encrypted = encrypt_secret_with_key("sk-example-secret", &key).unwrap();
+        assert!(encrypted.starts_with(AI_SECRET_PREFIX));
+        assert!(!encrypted.contains("sk-example-secret"));
+        assert_eq!(
+            decrypt_secret_with_key(encrypted.trim_start_matches(AI_SECRET_PREFIX), &key).unwrap(),
+            "sk-example-secret"
+        );
+
+        let mut tampered = encrypted.into_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert!(
+            decrypt_secret_with_key(tampered.trim_start_matches(AI_SECRET_PREFIX), &key).is_err()
+        );
+    }
+
+    #[test]
+    fn ai_test_endpoints_follow_the_selected_api_protocol() {
+        assert_eq!(
+            ai_test_endpoint(
+                AiProviderKind::OpenAiCompatible,
+                "https://api.openai.com/v1",
+            )
+            .unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            ai_test_endpoint(AiProviderKind::Claude, "https://api.anthropic.com/v1").unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            ai_test_endpoint(AiProviderKind::Claude, "https://api.deepseek.com/anthropic").unwrap(),
+            "https://api.deepseek.com/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn legacy_ai_provider_slots_migrate_to_the_model_pool() {
+        let mut settings = AppSettings::default();
+        settings.ai_openai.api_key = "openai-key".to_owned();
+        settings.ai_claude.api_key = "claude-key".to_owned();
+        settings.ai_claude.base_url = "https://api.anthropic.com/v1".to_owned();
+        settings.ai_claude.model = "claude-sonnet-4-5".to_owned();
+
+        settings.migrate_legacy_ai_models();
+
+        assert_eq!(settings.ai_models.len(), 2);
+        assert_eq!(settings.ai_models[0].name, "OpenAI");
+        assert_eq!(settings.ai_models[1].api_format, AiProviderKind::Claude);
+        assert_eq!(settings.selected_ai_model.as_deref(), Some("OpenAI"));
+    }
+
+    #[test]
     fn app_settings_are_json_and_dialog_window_has_no_outer_frame() {
         let settings = AppSettings {
             theme: SettingsThemeMode::Light,
@@ -33336,9 +34266,24 @@ mod ui_tests {
             inactive_repo_refresh_seconds: 90,
             remote_accounts: vec![RemoteAccountSettings::default()],
             custom_actions: Vec::new(),
+            ai_models: vec![LlmModelSettings {
+                name: "OpenAI".to_owned(),
+                api_format: AiProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".to_owned(),
+                api_key: "test-key".to_owned(),
+                model_id: "gpt-5-mini".to_owned(),
+            }],
+            selected_ai_model: Some("OpenAI".to_owned()),
+            ai_openai: AiProviderSettings::openai_compatible(),
+            ai_claude: AiProviderSettings::claude(),
             ssh_client: SshClientKind::OpenSsh,
             ssh_key_path: r"D:\Users\me\.ssh\id_ed25519".to_owned(),
             ssh_executable_path: r"C:\Windows\System32\OpenSSH\ssh.exe".to_owned(),
+            window_size: Some(WindowSize {
+                width: 1440.0,
+                height: 900.0,
+            }),
+            secret_storage_error: None,
         };
         let raw = serde_json::to_string(&settings).unwrap();
         assert!(raw.contains("\"theme\":\"Light\""));
@@ -35442,6 +36387,24 @@ mod ui_tests {
         assert!(implementation_source.contains("diagnostics::record_window_drag_probe("));
         assert!(implementation_source.contains("diagnostics::flush_window_drag_probe();"));
         assert!(update_source.contains("egui::CentralPanel::default()"));
+    }
+
+    #[test]
+    fn window_size_persistence_never_runs_during_a_primary_pointer_gesture() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let persistence_start = implementation_source
+            .find("fn remember_window_size(")
+            .unwrap();
+        let persistence_end = implementation_source[persistence_start..]
+            .find("fn active_repo_refresh_duration(")
+            .unwrap();
+        let persistence_source =
+            &implementation_source[persistence_start..persistence_start + persistence_end];
+
+        assert!(persistence_source.contains("if !primary_down && now.duration_since(changed_at)"));
+        assert!(!persistence_source.contains("if !primary_down || now.duration_since(changed_at)"));
+        assert!(persistence_source.contains("ctx.request_repaint_after("));
     }
 
     #[test]
@@ -42656,7 +43619,7 @@ diff --git a/file.txt b/file.txt
         assert!(refresh_source.contains("self.inactive_repo_refresh_duration()"));
         assert!(refresh_source.contains("ScheduledRepositoryRefresh"));
         assert!(refresh_source.contains("blocked_keys.insert(repo_state_key(root))"));
-        assert!(refresh_source.contains("self.repository_refresh_scheduler.update_schedule("));
+        assert!(refresh_source.contains(".update_schedule(schedule.clone())"));
         assert!(
             refresh_source
                 .contains("self.last_repository_refresh_schedule.as_ref() != Some(&schedule)")
@@ -42940,6 +43903,10 @@ diff --git a/file.txt b/file.txt
         assert!(implementation_source.contains("worktree_header_action_button("));
         assert!(implementation_source.contains("WorktreeMenuAction::ResolveConflict"));
         assert!(implementation_source.contains("fn open_conflict_merge_tool("));
+        assert!(implementation_source.contains("command.arg(\"--ai-model\").arg(ai_model_name)"));
+        assert!(
+            implementation_source.contains("let ai_model_name = self.selected_ai_model.clone();")
+        );
         assert!(
             implementation_source
                 .contains("merge_tool_task: Option<Receiver<MergeToolTaskResult>>")
@@ -43515,12 +44482,55 @@ diff --git a/file.txt b/file.txt
 
         assert_eq!(pending.len(), 2);
         let blocked = HashSet::new();
-        let selected = next_repository_refresh_request_index(&pending, &blocked).unwrap();
+        let exclusive = HashSet::new();
+        let selected =
+            next_repository_refresh_request_index(&pending, &blocked, &exclusive).unwrap();
         assert_eq!(
             pending[selected].priority,
             RepositoryRefreshPriority::Foreground
         );
         assert_eq!(pending[0].priority, RepositoryRefreshPriority::Foreground);
+    }
+
+    #[test]
+    fn foreground_refresh_waits_for_exclusive_then_bypasses_background_pause() {
+        let (result_sender, _result_receiver) = mpsc::channel::<RepoTaskResult>();
+        let repository_key = "repository-after-checkout".to_owned();
+        let pending = vec![RepositoryRefreshRequest {
+            path: PathBuf::from(&repository_key),
+            key: repository_key.clone(),
+            priority: RepositoryRefreshPriority::Foreground,
+            result_sender: result_sender.clone(),
+        }];
+        let background_blocked = HashSet::from([repository_key.clone()]);
+        let exclusive = HashSet::from([repository_key.clone()]);
+
+        assert_eq!(
+            next_repository_refresh_request_index(&pending, &background_blocked, &exclusive,),
+            None,
+            "the post-checkout reload must not race the Git mutation"
+        );
+        assert_eq!(
+            next_repository_refresh_request_index(&pending, &background_blocked, &HashSet::new(),),
+            Some(0),
+            "the foreground reload must run after exclusive access is released"
+        );
+
+        let background_pending = vec![RepositoryRefreshRequest {
+            path: PathBuf::from(&repository_key),
+            key: repository_key,
+            priority: RepositoryRefreshPriority::Background,
+            result_sender,
+        }];
+        assert_eq!(
+            next_repository_refresh_request_index(
+                &background_pending,
+                &background_blocked,
+                &HashSet::new(),
+            ),
+            None,
+            "automatic refresh must remain paused while the repository is transitioning"
+        );
     }
 
     #[test]

@@ -181,6 +181,25 @@ pub fn window_drag_log_path() -> PathBuf {
     daily_log_path("window-drag")
 }
 
+pub fn merge_ai_log_path() -> PathBuf {
+    daily_log_path("merge-ai")
+}
+
+/// Append one sanitized, single-line event for the standalone merge assistant. Callers must never
+/// include credentials. Keeping this separate from the process lifecycle log makes an AI request
+/// trace easy to inspect without exposing the API key passed only in memory.
+pub fn merge_ai_trace(event: &str, fields: &str) {
+    let _guard = write_lock();
+    let path = merge_ai_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let fields = fields.replace(['\r', '\n'], "\\n");
+        let _ = writeln!(file, "[{}] {event} {fields}", epoch_ms());
+    }
+}
+
 pub fn daily_log_path(stem: &str) -> PathBuf {
     log_directory().join(format!("{stem}-{}.log", utc_date_stamp(SystemTime::now())))
 }

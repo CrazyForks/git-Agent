@@ -18,6 +18,10 @@ fn main() -> eframe::Result<()> {
             .unwrap_or_else(|error| format!("<current_dir error: {error}>"))
     ));
 
+    let initial_window_size = git_agent::app::persisted_window_inner_size(
+        [MAIN_WINDOW_INITIAL_WIDTH, MAIN_WINDOW_INITIAL_HEIGHT],
+        [MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT],
+    );
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Git Agent")
@@ -25,7 +29,7 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true)
-            .with_inner_size([MAIN_WINDOW_INITIAL_WIDTH, MAIN_WINDOW_INITIAL_HEIGHT])
+            .with_inner_size(initial_window_size)
             .with_min_inner_size([MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT]),
         ..Default::default()
     };
@@ -299,5 +303,6 @@ mod tests {
             source.contains("with_min_inner_size([MAIN_WINDOW_MIN_WIDTH, MAIN_WINDOW_MIN_HEIGHT])")
         );
         assert!(source.contains("with_resizable(true)"));
+        assert!(source.contains("persisted_window_inner_size("));
     }
 }

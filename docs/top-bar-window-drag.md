@@ -53,7 +53,7 @@
 
 ```rust
 const TITLE_MENU_RESERVED_WIDTH: f32 = 500.0;
-const TITLE_DRAG_TOP_INSET: f32 = 4.0;
+const TITLE_DRAG_TOP_INSET: f32 = WINDOW_RESIZE_BORDER + 1.0;
 
 fn custom_title_drag_rect(rect: Rect, controls_width: f32) -> Rect {
     Rect::from_min_max(
@@ -67,9 +67,9 @@ fn custom_title_drag_rect(rect: Rect, controls_width: f32) -> Rect {
 菜单保留宽度需覆盖英文文案，不能只按中文的旧宽度估算。后续的 egui 空白区交互只服务于
 双击等应用内判定；原生移动已在帧开始发出，因此不会被菜单、标签或完整页面布局延后。
 
-透明拖拽层在 egui 中不能“只渲染一次后继续接收事件”，因为 egui 是即时模式；对应实现是缓存
-其边界矩形。标题栏布局仅在矩形改变时更新缓存，下一次鼠标按下时即可在 `update` 开始直接命中
-该缓存，而不用等待本帧标题栏重新布局。
+透明拖拽层在 egui 中不能“只渲染一次后继续接收事件”，因为 egui 是即时模式；它的绘制交互可缓存
+边界矩形，但原生 `StartDrag` 与悬停光标必须从**当前** `screen_rect` 直接推导。窗口缩放会改变右边界，
+若原生判定复用上一帧缓存，缩放后的首次按下会命中旧区域，表现为新增空白处拖不动或热区错位。
 
 ## 本次根因与禁止回退
 
@@ -88,6 +88,12 @@ fn custom_title_drag_rect(rect: Rect, controls_width: f32) -> Rect {
   `BeginResize`。最小尺寸只约束成功开始后的拖动结果，不能替代边缘命中处理。
 - “有时能拖、有时不能”通常不是 Windows 随机失效，而是命令晚于按下事件或空白热区与交互控件
   重叠。应调整安全边界；绝不能通过覆盖菜单、标签或窗口按钮来扩大拖动区。
+- 缩放后不得以 `title_drag_layer` 作为原生拖动或光标判定的来源；它只服务标题栏绘制。原生判定应使用
+  `current_title_drag_rect(ctx.screen_rect())`，使每次按下均使用当前窗口宽度。
+- 窗口尺寸持久化不得在主鼠标按下或按住期间同步保存。曾有实现以
+  `!primary_down || elapsed >= 600ms` 作为保存条件；尺寸变更停留 600ms 后，下一次按下标题栏会在
+  `StartDrag` 之前触发配置序列化、加密和系统密钥库访问，造成拖动迟钝甚至错过原生拖动时机。只可在
+  鼠标松开且静默期结束后保存，并用 `request_repaint_after` 等待该时刻。
 
 ## 修改后的验收
 
