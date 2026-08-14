@@ -1,6 +1,6 @@
 [package]
 name = "git-agent"
-version = "1.2.0-alpha.1"
+version = "1.2.0"
 edition = "2024"
 
 [dependencies]
@@ -21,3 +21,13 @@ ureq = { version = "2.12", features = ["json"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+
+# The desktop UI is large enough that completely unoptimized egui/font layout makes the
+# development binary visibly lag while scrolling or moving the native window. Keep local app
+# code lightly optimized for reasonable incremental builds and optimize dependencies more fully.
+# Release and installer profiles are unaffected.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

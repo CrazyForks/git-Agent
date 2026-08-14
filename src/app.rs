@@ -68,7 +68,6 @@ const MIN_REPO_REFRESH_SECONDS: u64 = 1;
 const MAX_REPO_REFRESH_SECONDS: u64 = 3600;
 const REPOSITORY_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TOOLBAR_BACKGROUND_STATUS_GRACE: Duration = Duration::from_millis(450);
-const TOOLBAR_BACKGROUND_STATUS_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 // Windows can transiently fail to start git.exe while the system is under memory pressure.
 // Retry from the UI scheduler after the worker has exited and released the snapshot gate.
 const REPOSITORY_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -160,7 +159,7 @@ const RESOURCE_TABLE_HEADER_HEIGHT: f32 = 24.0;
 const SETTINGS_DIALOG_WIDTH: f32 = 640.0;
 const SETTINGS_DIALOG_HEIGHT: f32 = 600.0;
 const REPO_SETTINGS_DIALOG_WIDTH: f32 = 700.0;
-const REPO_SETTINGS_DIALOG_HEIGHT: f32 = 460.0;
+const REPO_SETTINGS_DIALOG_HEIGHT: f32 = 650.0;
 const REPO_SETTINGS_REMOTE_DIALOG_WIDTH: f32 = 520.0;
 const SETTINGS_DIALOG_TITLE_HEIGHT: f32 = 32.0;
 const SETTINGS_DIALOG_TITLE_SIZE: f32 = 18.0;
@@ -464,20 +463,6 @@ fn resize_cursor_icon(direction: egui::viewport::ResizeDirection) -> egui::Curso
     }
 }
 
-fn resize_probe_area(direction: egui::viewport::ResizeDirection) -> u8 {
-    use egui::viewport::ResizeDirection;
-    match direction {
-        ResizeDirection::North => 3,
-        ResizeDirection::South => 4,
-        ResizeDirection::East => 5,
-        ResizeDirection::West => 6,
-        ResizeDirection::NorthEast => 7,
-        ResizeDirection::SouthEast => 8,
-        ResizeDirection::NorthWest => 9,
-        ResizeDirection::SouthWest => 10,
-    }
-}
-
 fn layout_debug_enabled() -> bool {
     env::var("GIT_AGENT_LAYOUT_DEBUG")
         .map(|value| {
@@ -533,6 +518,7 @@ pub struct GitAgentApp {
     source_tab_open: bool,
     repo_source_tab: RepoSourceTab,
     snapshot: Option<RepositorySnapshot>,
+    sidebar_branch_cache: SidebarBranchCache,
     repository_transition_focus_clear_pending: bool,
     snapshot_cache: HashMap<String, RepositorySnapshot>,
     layout: GraphLayout,
@@ -3368,6 +3354,7 @@ impl GitAgentApp {
             source_tab_open: tabs_state.source_tab_open,
             repo_source_tab: RepoSourceTab::Local,
             snapshot: None,
+            sidebar_branch_cache: SidebarBranchCache::default(),
             repository_transition_focus_clear_pending: false,
             snapshot_cache: HashMap::new(),
             layout: GraphLayout::default(),
@@ -3999,6 +3986,7 @@ impl GitAgentApp {
 
         if self.repo_tabs.is_empty() {
             self.snapshot = None;
+            self.sidebar_branch_cache = SidebarBranchCache::default();
             self.source_tab_open = true;
             self.active_repo_tab = None;
             self.commit_message.clear();
@@ -4109,6 +4097,7 @@ impl GitAgentApp {
 
     fn clear_repository_snapshot_view(&mut self) {
         self.snapshot = None;
+        self.sidebar_branch_cache = SidebarBranchCache::default();
         self.layout = GraphLayout::default();
         self.selected_commit = None;
         self.search_selected_commit = None;
@@ -4192,6 +4181,7 @@ impl GitAgentApp {
         self.apply_sidebar_tree_state_for_repo(&snapshot.root);
         self.apply_merge_commit_message_default(&snapshot);
         self.maybe_prepare_rewritten_history_prompt(&snapshot);
+        self.sidebar_branch_cache = SidebarBranchCache::from_snapshot(&snapshot);
         self.snapshot = Some(snapshot);
         self.details_cache.clear();
         self.diff_cache.clear();
@@ -6892,17 +6882,13 @@ impl GitAgentApp {
         if !self.repo_tasks.is_empty() || !repo_results.is_empty() {
             repository_load_activity = true;
             let mut disconnected_repo_keys = Vec::new();
-            let mut waiting_for_repo = false;
             self.repo_tasks
                 .retain(|key, receiver| match receiver.try_recv() {
                     Ok(result) => {
                         repo_results.push(result);
                         false
                     }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        waiting_for_repo = true;
-                        true
-                    }
+                    Err(mpsc::TryRecvError::Empty) => true,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         disconnected_repo_keys.push(key.clone());
                         false
@@ -7052,10 +7038,6 @@ impl GitAgentApp {
                     self.error = Some("Repository loader stopped unexpectedly".to_owned());
                 }
                 ctx.request_repaint();
-            }
-
-            if waiting_for_repo {
-                ctx.request_repaint_after(REPOSITORY_TASK_POLL_INTERVAL);
             }
         }
 
@@ -8582,12 +8564,6 @@ impl App for GitAgentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let primary_down = ctx.input(|input| input.pointer.primary_down());
         self.remember_window_size(ctx, primary_down);
-        let screen_size = ctx.screen_rect().size();
-        diagnostics::record_window_size_probe(screen_size.x, screen_size.y);
-        if !primary_down {
-            diagnostics::flush_window_drag_probe();
-            diagnostics::flush_window_size_probe();
-        }
         if !self.request_native_window_resize_on_pointer_down(ctx) {
             self.request_native_title_drag_on_pointer_down(ctx);
         }
@@ -9320,8 +9296,9 @@ impl GitAgentApp {
     fn main_layout(&mut self, ui: &mut Ui) {
         let full = ui.available_rect_before_wrap();
         let workspace_repo_drawer_rect = (self.show_workspace_repositories
-            && !self.repository_source_active())
-        .then(|| workspace_repositories_drawer_rect(full));
+            && !self.repository_source_active()
+            && !self.repo_settings_open)
+            .then(|| workspace_repositories_drawer_rect(full));
         let details_visible = view_uses_side_details(self.active_view);
         self.layout_prefs.clamp();
         let layout = main_layout_rects(
@@ -9475,11 +9452,6 @@ impl GitAgentApp {
             return false;
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-        diagnostics::record_window_drag_probe(
-            pointer_pos.x,
-            pointer_pos.y,
-            resize_probe_area(direction),
-        );
         true
     }
 
@@ -9526,7 +9498,6 @@ impl GitAgentApp {
         let drag_rect = current_title_drag_rect(screen);
         if drag_rect.contains(pointer_pos) {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            diagnostics::record_window_drag_probe(pointer_pos.x, pointer_pos.y, 1);
             return;
         }
 
@@ -9542,13 +9513,8 @@ impl GitAgentApp {
             );
             if title_gap_drag_rect.contains(pointer_pos) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                diagnostics::record_window_drag_probe(pointer_pos.x, pointer_pos.y, 2);
                 return;
             }
-        }
-
-        if title_row.contains(pointer_pos) {
-            diagnostics::record_window_drag_probe(pointer_pos.x, pointer_pos.y, 0);
         }
     }
 
@@ -10737,7 +10703,6 @@ impl GitAgentApp {
                 }
             });
         });
-
         if let Some(tool_content_row) = tool_content_row {
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tool_content_row), |ui| {
                 let repo_toolbar_loading = self.repo_toolbar_loading_busy();
@@ -10849,7 +10814,7 @@ impl GitAgentApp {
                             });
                         });
                     if let Some(status) = repo_toolbar_background_status {
-                        repo_toolbar_background_indicator(ui, ctx, &status);
+                        repo_toolbar_background_indicator(ui, &status);
                     }
                 }
             });
@@ -11121,17 +11086,20 @@ impl GitAgentApp {
                             .to_lowercase()
                             .contains(&query))
             })
-            .cloned()
+            .map(|repository| {
+                (
+                    repository.clone(),
+                    self.workspace_repository_has_unstaged(&repository.root),
+                )
+            })
             .collect::<Vec<_>>();
         repositories.sort_by(|left, right| {
-            workspace_repository_display_order(
-                left,
-                self.workspace_repository_has_unstaged(&left.root),
-                right,
-                self.workspace_repository_has_unstaged(&right.root),
-            )
+            workspace_repository_display_order(&left.0, left.1, &right.0, right.1)
         });
         repositories
+            .into_iter()
+            .map(|(repository, _)| repository)
+            .collect()
     }
 
     fn workspace_repository_snapshot_for(&self, root: &Path) -> Option<&RepositorySnapshot> {
@@ -11369,17 +11337,9 @@ impl GitAgentApp {
         if let Some(snapshot) = &self.snapshot {
             ui.add_space(8.0);
 
-            let remote_branch_names = snapshot
-                .branches
-                .iter()
-                .filter(|branch| branch.remote)
-                .map(|branch| branch.name.clone())
-                .collect::<Vec<_>>();
-            let remote_names = snapshot
-                .remotes
-                .iter()
-                .map(|remote| remote.name.clone())
-                .collect::<Vec<_>>();
+            let branch_cache = &self.sidebar_branch_cache;
+            let remote_branch_names = &branch_cache.remote_branch_names;
+            let remote_names = &branch_cache.remote_names;
             let mut branch_action = None;
             let mut tag_action = None;
             let mut stash_action = None;
@@ -11403,24 +11363,16 @@ impl GitAgentApp {
                 sidebar_state_changed = true;
             }
             if branches_visible {
-                let local_branches = snapshot
-                    .branches
-                    .iter()
-                    .filter(|branch| !branch.remote)
-                    .collect::<Vec<_>>();
-                let local_branches_by_name = local_branches
-                    .iter()
-                    .map(|branch| (branch.name.as_str(), *branch))
-                    .collect::<HashMap<_, _>>();
-                for node in local_branch_tree(&local_branches).iter().take(18) {
+                for node in branch_cache.local_tree.iter().take(18) {
                     local_branch_tree_rows(
                         ui,
                         node,
                         0,
-                        &local_branches_by_name,
+                        &snapshot.branches,
+                        &branch_cache.local_branch_indices,
                         pending_branch_checkout.as_deref(),
-                        &remote_branch_names,
-                        &remote_names,
+                        remote_branch_names,
+                        remote_names,
                         self.language,
                         &mut self.local_branch_collapsed_groups,
                         branch_actions_enabled,
@@ -11466,15 +11418,10 @@ impl GitAgentApp {
                 sidebar_state_changed = true;
             }
             if remotes_visible {
-                let remote_branches = snapshot
-                    .branches
-                    .iter()
-                    .filter(|branch| branch.remote)
-                    .collect::<Vec<_>>();
-                if remote_branches.is_empty() {
+                if branch_cache.remote_tree.is_empty() {
                     tree_empty(ui, remote_empty_label(self.language, snapshot));
                 } else {
-                    for node in remote_branch_tree(&remote_branches).iter().take(8) {
+                    for node in branch_cache.remote_tree.iter().take(8) {
                         remote_branch_tree_rows(
                             ui,
                             node,
@@ -19847,13 +19794,11 @@ fn repo_settings_readonly_text(ui: &mut Ui, label: &str, value: &str) {
 }
 
 fn repo_settings_commit_links_panel(ui: &mut Ui, language: Language) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 78.0), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(5), theme::panel());
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 82.0), Sense::hover());
+    let content_rect = rect.shrink2(Vec2::new(10.0, 9.0));
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
             ui.horizontal(|ui| {
-                ui.add_space(8.0);
                 ui.add_enabled(
                     false,
                     egui::Button::new(i18n::t(language, "repo.settings.add")),
@@ -19869,6 +19814,7 @@ fn repo_settings_commit_links_panel(ui: &mut Ui, language: Language) {
             });
         });
     });
+    paint_recessed_control_shadow(ui, rect);
 }
 
 #[derive(Clone, Debug)]
@@ -21682,7 +21628,7 @@ fn repo_toolbar_loading_indicator(ui: &mut Ui, label: &str) {
     );
 }
 
-fn repo_toolbar_background_indicator(ui: &mut Ui, ctx: &egui::Context, label: &str) {
+fn repo_toolbar_background_indicator(ui: &mut Ui, label: &str) {
     let rect = ui.max_rect();
     ui.allocate_new_ui(
         egui::UiBuilder::new()
@@ -21692,10 +21638,13 @@ fn repo_toolbar_background_indicator(ui: &mut Ui, ctx: &egui::Context, label: &s
             ui.add_space(16.0);
             ui.label(RichText::new(label).small().color(theme::muted()));
             ui.add_space(6.0);
-            ui.add(egui::Spinner::new().size(14.0).color(theme::muted()));
+            ui.add(
+                egui::Image::new(icon_source(UiIcon::Loading))
+                    .fit_to_exact_size(Vec2::splat(14.0))
+                    .tint(theme::muted()),
+            );
         },
     );
-    ctx.request_repaint_after(TOOLBAR_BACKGROUND_STATUS_FRAME_INTERVAL);
 }
 
 fn themed_text_edit_selection(ui: &mut Ui) {
@@ -25940,22 +25889,22 @@ fn workspace_repository_unstaged_badge_line(ui: &Ui, rect: Rect, name: &str, cou
     let badge_gap = 5.0;
     let badge_text = workspace_repository_unstaged_badge_text(count);
     let badge_width = workspace_repository_unstaged_badge_width(ui, count);
-    let badge_reserve = if badge_text.is_some() {
-        badge_width + badge_gap
+    let name_rect = if badge_text.is_some() {
+        Rect::from_min_max(
+            rect.min,
+            Pos2::new(
+                (rect.right() - badge_width - badge_gap).max(rect.left()),
+                rect.bottom(),
+            ),
+        )
     } else {
-        0.0
+        rect
     };
-    let name_max_width = (rect.width() - badge_reserve).max(0.0);
-    let name_text = elide_end_to_width(ui, name, name_max_width, name_font.clone(), name_color);
-    let name_width = text_width(ui, &name_text, name_font.clone(), name_color);
-    let name_rect =
-        Rect::from_min_max(rect.min, Pos2::new(rect.left() + name_width, rect.bottom()));
-    workspace_repository_text_line(ui, name_rect, &name_text, name_font, name_color);
+    workspace_repository_text_line(ui, name_rect, name, name_font, name_color);
 
     if let Some(badge_text) = badge_text {
-        let badge_left = (name_rect.right() + badge_gap).min(rect.right());
         let badge_rect = Rect::from_min_max(
-            Pos2::new(badge_left, rect.top()),
+            Pos2::new((rect.right() - badge_width).max(rect.left()), rect.top()),
             Pos2::new(rect.right(), rect.bottom()),
         );
         workspace_repository_unstaged_badge(ui, badge_rect, &badge_text);
@@ -26003,24 +25952,22 @@ fn workspace_repository_branch_sync_line(
     let badge_gap = 6.0;
     let badges = workspace_repository_branch_badges(counts);
     let badges_width = text_width(ui, &badges, font.clone(), color);
-    let badge_reserve = if badges.is_empty() {
-        0.0
+    let branch_rect = if badges.is_empty() {
+        rect
     } else {
-        badges_width + badge_gap
+        Rect::from_min_max(
+            rect.min,
+            Pos2::new(
+                (rect.right() - badges_width - badge_gap).max(rect.left()),
+                rect.bottom(),
+            ),
+        )
     };
-    let branch_max_width = (rect.width() - badge_reserve).max(0.0);
-    let branch_text = elide_end_to_width(ui, branch, branch_max_width, font.clone(), color);
-    let branch_width = text_width(ui, &branch_text, font.clone(), color);
-    let branch_rect = Rect::from_min_max(
-        rect.min,
-        Pos2::new(rect.left() + branch_width, rect.bottom()),
-    );
-    workspace_repository_text_line(ui, branch_rect, &branch_text, font.clone(), color);
+    workspace_repository_text_line(ui, branch_rect, branch, font.clone(), color);
 
     if !badges.is_empty() {
-        let badges_left = (branch_rect.right() + badge_gap).min(rect.right());
         let badges_rect = Rect::from_min_max(
-            Pos2::new(badges_left, rect.top()),
+            Pos2::new((rect.right() - badges_width).max(rect.left()), rect.top()),
             Pos2::new(rect.right(), rect.bottom()),
         );
         workspace_repository_text_line(ui, badges_rect, &badges, font, color);
@@ -26141,8 +26088,7 @@ fn workspace_repository_path_text_line(
     font: FontId,
     color: Color32,
 ) {
-    let text = elide_end_to_width(ui, text, rect.width().max(0.0), font.clone(), color);
-    workspace_repository_text_line(ui, rect, &text, font, color);
+    workspace_repository_text_line(ui, rect, text, font, color);
 }
 
 fn elide_end_to_width(ui: &Ui, text: &str, max_width: f32, font: FontId, color: Color32) -> String {
@@ -26390,14 +26336,15 @@ fn global_settings_empty_tab(ui: &mut Ui, title: &str, language: Language) {
 }
 
 fn repo_settings_card(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui)) {
-    soft_panel_frame(theme::panel_soft(), 12, 10)
+    let response = soft_panel_frame(Color32::TRANSPARENT, 12, 10)
         .stroke(Stroke::NONE)
-        .shadow(panel_shadow())
+        .shadow(egui::epaint::Shadow::NONE)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             settings_section_title(ui, title);
             content(ui);
         });
+    paint_recessed_control_shadow(ui, response.response.rect);
 }
 
 fn repo_settings_content_width(dialog_width: f32) -> f32 {
@@ -26415,7 +26362,7 @@ fn repo_settings_dialog_height(tab: SettingsTab) -> f32 {
 fn repo_settings_content_max_height(tab: SettingsTab) -> f32 {
     match tab {
         SettingsTab::RepoRemotes => 190.0,
-        SettingsTab::RepoAdvanced => 320.0,
+        SettingsTab::RepoAdvanced => 500.0,
         _ => 190.0,
     }
 }
@@ -28001,7 +27948,11 @@ fn branch_row(
     enabled: bool,
     action: &mut Option<BranchMenuAction>,
 ) -> egui::Response {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let (rect, allocation_response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return allocation_response;
+    }
     let row_rect = rect.shrink2(Vec2::new(2.0, 1.0));
     if current {
         ui.painter()
@@ -28240,6 +28191,50 @@ struct BranchTreeNode {
     children: BTreeMap<String, BranchTreeNode>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SidebarBranchCache {
+    local_tree: Vec<BranchTreeNode>,
+    remote_tree: Vec<BranchTreeNode>,
+    local_branch_indices: HashMap<String, usize>,
+    remote_branch_names: Vec<String>,
+    remote_names: Vec<String>,
+}
+
+impl SidebarBranchCache {
+    fn from_snapshot(snapshot: &RepositorySnapshot) -> Self {
+        let local_branches = snapshot
+            .branches
+            .iter()
+            .filter(|branch| !branch.remote)
+            .collect::<Vec<_>>();
+        let remote_branches = snapshot
+            .branches
+            .iter()
+            .filter(|branch| branch.remote)
+            .collect::<Vec<_>>();
+        Self {
+            local_tree: local_branch_tree(&local_branches),
+            remote_tree: remote_branch_tree(&remote_branches),
+            local_branch_indices: snapshot
+                .branches
+                .iter()
+                .enumerate()
+                .filter(|(_, branch)| !branch.remote)
+                .map(|(index, branch)| (branch.name.clone(), index))
+                .collect(),
+            remote_branch_names: remote_branches
+                .iter()
+                .map(|branch| branch.name.clone())
+                .collect(),
+            remote_names: snapshot
+                .remotes
+                .iter()
+                .map(|remote| remote.name.clone())
+                .collect(),
+        }
+    }
+}
+
 impl BranchTreeNode {
     fn new(name: String, path: String) -> Self {
         Self {
@@ -28311,7 +28306,8 @@ fn local_branch_tree_rows(
     ui: &mut Ui,
     node: &BranchTreeNode,
     depth: usize,
-    branches_by_name: &HashMap<&str, &git::Branch>,
+    branches: &[git::Branch],
+    branch_indices: &HashMap<String, usize>,
     pending_checkout: Option<&str>,
     remote_branch_names: &[String],
     remotes: &[String],
@@ -28322,7 +28318,9 @@ fn local_branch_tree_rows(
 ) {
     if node.children.is_empty() {
         if let Some(full_name) = &node.full_name
-            && let Some(branch) = branches_by_name.get(full_name.as_str())
+            && let Some(branch) = branch_indices
+                .get(full_name)
+                .and_then(|index| branches.get(*index))
         {
             let row_depth = local_branch_leaf_row_depth(depth);
             branch_row(
@@ -28357,7 +28355,9 @@ fn local_branch_tree_rows(
     }
     if !collapsed {
         if let Some(full_name) = &node.full_name
-            && let Some(branch) = branches_by_name.get(full_name.as_str())
+            && let Some(branch) = branch_indices
+                .get(full_name)
+                .and_then(|index| branches.get(*index))
         {
             let row_depth = local_branch_leaf_row_depth(depth + 1);
             branch_row(
@@ -28384,7 +28384,8 @@ fn local_branch_tree_rows(
                 ui,
                 child,
                 depth + 1,
-                branches_by_name,
+                branches,
+                branch_indices,
                 pending_checkout,
                 remote_branch_names,
                 remotes,
@@ -28446,10 +28447,13 @@ fn remote_branch_group_row(
     depth: usize,
     collapsed: bool,
 ) -> egui::Response {
-    let (rect, _) = ui.allocate_exact_size(
+    let (rect, allocation_response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), TREE_GROUP_ROW_HEIGHT),
         Sense::hover(),
     );
+    if !ui.is_rect_visible(rect) {
+        return allocation_response;
+    }
     if row_rect_hovered(ui, rect) {
         ui.painter().rect_filled(
             rect.shrink2(Vec2::new(2.0, 1.0)),
@@ -28483,7 +28487,11 @@ fn remote_branch_row(
     enabled: bool,
     action: &mut Option<BranchMenuAction>,
 ) -> egui::Response {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let (rect, allocation_response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return allocation_response;
+    }
     if enabled && row_rect_hovered(ui, rect) {
         ui.painter().rect_filled(
             rect.shrink2(Vec2::new(2.0, 1.0)),
@@ -36384,8 +36392,8 @@ mod ui_tests {
                 .unwrap()
                 < update_source.find("theme::apply_if_needed(").unwrap()
         );
-        assert!(implementation_source.contains("diagnostics::record_window_drag_probe("));
-        assert!(implementation_source.contains("diagnostics::flush_window_drag_probe();"));
+        assert!(!implementation_source.contains("diagnostics::record_window_drag_probe("));
+        assert!(!implementation_source.contains("diagnostics::flush_window_drag_probe();"));
         assert!(update_source.contains("egui::CentralPanel::default()"));
     }
 
@@ -36639,6 +36647,7 @@ mod ui_tests {
         assert!(app_source.contains("next_workspace_repo_status_load_at: Instant"));
         assert!(layout_source.contains("workspace_repositories_panel("));
         assert!(layout_source.contains("workspace_repositories_drawer_rect(full)"));
+        assert!(layout_source.contains("&& !self.repo_settings_open"));
         assert!(layout_source.contains("workspace_repositories_drawer_should_close("));
         assert!(layout_source.contains("workspace_repositories_drawer_at_rect("));
         assert!(implementation_source.contains("fn workspace_repositories_drawer_shadow("));
@@ -40179,8 +40188,13 @@ mod ui_tests {
             .unwrap();
         let filter_source = &source[filter_start..filter_start + filter_end];
         assert!(filter_source.contains("repositories.sort_by("));
-        assert!(filter_source.contains("self.workspace_repository_has_unstaged(&left.root)"));
-        assert!(filter_source.contains("self.workspace_repository_has_unstaged(&right.root)"));
+        assert!(filter_source.contains("self.workspace_repository_has_unstaged(&repository.root)"));
+        let sort_start = filter_source.find("repositories.sort_by(").unwrap();
+        let sort_end = filter_source[sort_start..]
+            .find("repositories\n            .into_iter()")
+            .unwrap();
+        let sort_source = &filter_source[sort_start..sort_start + sort_end];
+        assert!(!sort_source.contains("workspace_repository_has_unstaged"));
     }
 
     #[test]
@@ -42140,7 +42154,7 @@ diff --git a/file.txt b/file.txt
             &toolbar_source[loading_branch_start..loading_branch_start + loading_branch_end];
         assert!(!loading_branch.contains("toolbar_button("));
         assert!(loading_branch.contains("repo_toolbar_loading_label"));
-        assert!(toolbar_source.contains("repo_toolbar_background_indicator(ui, ctx, &status);"));
+        assert!(toolbar_source.contains("repo_toolbar_background_indicator(ui, &status);"));
 
         let background_start = implementation_source
             .find("fn repo_toolbar_background_status_label(")
@@ -42181,8 +42195,9 @@ diff --git a/file.txt b/file.txt
             .unwrap();
         let background_indicator_source = &implementation_source
             [background_indicator_start..background_indicator_start + background_indicator_end];
-        assert!(background_indicator_source.contains("egui::Spinner::new()"));
-        assert!(background_indicator_source.contains("TOOLBAR_BACKGROUND_STATUS_FRAME_INTERVAL"));
+        assert!(background_indicator_source.contains("UiIcon::Loading"));
+        assert!(!background_indicator_source.contains("egui::Spinner::new()"));
+        assert!(!background_indicator_source.contains("request_repaint"));
     }
 
     #[test]
@@ -44706,7 +44721,7 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
-    fn repo_settings_uses_shadow_gap_cards_for_remote_and_advanced_pages() {
+    fn repo_settings_uses_recessed_transparent_cards_for_remote_and_advanced_pages() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let modal_start = implementation_source
@@ -44745,7 +44760,7 @@ diff --git a/file.txt b/file.txt
             .unwrap();
         let tabs_source = &implementation_source[tabs_start..tabs_start + tabs_end];
 
-        assert!(REPO_SETTINGS_DIALOG_HEIGHT <= 460.0);
+        assert!(REPO_SETTINGS_DIALOG_HEIGHT >= 620.0);
         assert!(REPO_SETTINGS_TABS_HEIGHT <= 42.0);
         assert!(REPO_SETTINGS_TAB_HEIGHT <= 38.0);
         assert!(modal_source.contains("repo_settings_dialog_height(self.repo_settings_tab)"));
@@ -44755,7 +44770,9 @@ diff --git a/file.txt b/file.txt
         assert!(tabs_source.contains("allocate_ui_with_layout"));
         assert!(tabs_source.contains("REPO_SETTINGS_TABS_HEIGHT"));
         assert!(!tabs_source.contains("horizontal_centered"));
-        assert!(card_source.contains(".shadow(panel_shadow())"));
+        assert!(card_source.contains("soft_panel_frame(Color32::TRANSPARENT"));
+        assert!(card_source.contains(".shadow(egui::epaint::Shadow::NONE)"));
+        assert!(card_source.contains("paint_recessed_control_shadow("));
         assert!(card_source.contains(".stroke(Stroke::NONE)"));
         assert!(remotes_source.contains("repo_settings_card("));
         assert!(remotes_source.contains("remote_settings_table("));
@@ -44764,11 +44781,77 @@ diff --git a/file.txt b/file.txt
         assert!(advanced_source.contains("snapshot.config"));
         assert!(advanced_source.contains("repo_settings_readonly_text("));
         assert!(advanced_source.contains("repo_settings_commit_links_panel("));
+        assert_eq!(
+            repo_settings_dialog_height(SettingsTab::RepoAdvanced),
+            REPO_SETTINGS_DIALOG_HEIGHT
+        );
+        assert!(repo_settings_content_max_height(SettingsTab::RepoAdvanced) >= 480.0);
+        assert!(
+            implementation_source
+                .contains("let content_rect = rect.shrink2(Vec2::new(10.0, 9.0));")
+        );
         assert!(advanced_source.contains("settings_checkbox_row("));
         assert!(modal_source.contains("open_repo_config_file()"));
         assert_eq!(
             settings_tab_label(Language::Chinese, SettingsTab::RepoAdvanced),
             "\u{9ad8}\u{7ea7}"
         );
+    }
+
+    #[test]
+    fn sidebar_branch_trees_are_rebuilt_with_snapshots_not_render_frames() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let sidebar_start = implementation_source
+            .find("fn sidebar_content(&mut self")
+            .unwrap();
+        let sidebar_end = implementation_source[sidebar_start..]
+            .find("fn workspace_view(")
+            .unwrap();
+        let sidebar_source = &implementation_source[sidebar_start..sidebar_start + sidebar_end];
+        let apply_start = implementation_source
+            .find("fn apply_repository_snapshot(&mut self")
+            .unwrap();
+        let apply_end = implementation_source[apply_start..]
+            .find("fn clear_focus_after_repository_transition(")
+            .unwrap();
+        let apply_source = &implementation_source[apply_start..apply_start + apply_end];
+
+        assert!(apply_source.contains("SidebarBranchCache::from_snapshot(&snapshot)"));
+        assert!(sidebar_source.contains("branch_cache.local_tree.iter()"));
+        assert!(sidebar_source.contains("branch_cache.remote_tree.iter()"));
+        assert!(!sidebar_source.contains("local_branch_tree(&local_branches)"));
+        assert!(!sidebar_source.contains("remote_branch_tree(&remote_branches)"));
+        assert!(
+            implementation_source
+                .matches("if !ui.is_rect_visible(rect)")
+                .count()
+                >= 3,
+            "off-screen branch rows must skip text, badge, and menu layout"
+        );
+    }
+
+    #[test]
+    fn scheduler_owned_repository_loads_do_not_poll_the_ui_frame() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let scheduler_start = implementation_source
+            .find("fn repository_refresh_scheduler_loop(")
+            .unwrap();
+        let scheduler_end = implementation_source[scheduler_start..]
+            .find("fn apply_repository_refresh_scheduler_command(")
+            .unwrap();
+        let scheduler_source =
+            &implementation_source[scheduler_start..scheduler_start + scheduler_end];
+        let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
+        let history_start = implementation_source[poll_start..]
+            .find("if !self.repo_history_tasks.is_empty()")
+            .unwrap();
+        let repository_poll_source = &implementation_source[poll_start..poll_start + history_start];
+
+        assert!(scheduler_source.contains("ctx.request_repaint();"));
+        assert!(repository_poll_source.contains("self.repo_tasks"));
+        assert!(!repository_poll_source.contains("REPOSITORY_TASK_POLL_INTERVAL"));
+        assert!(!repository_poll_source.contains("waiting_for_repo"));
     }
 }

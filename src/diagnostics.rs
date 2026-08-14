@@ -16,15 +16,6 @@ static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_TRACE_ID: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_EXPIRES_MS: AtomicU64 = AtomicU64::new(0);
-static WINDOW_DRAG_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static WINDOW_DRAG_PROBE_FLUSHED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static WINDOW_DRAG_PROBE_X_BITS: AtomicU64 = AtomicU64::new(0);
-static WINDOW_DRAG_PROBE_Y_BITS: AtomicU64 = AtomicU64::new(0);
-static WINDOW_DRAG_PROBE_AREA: AtomicU64 = AtomicU64::new(0);
-static WINDOW_SIZE_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static WINDOW_SIZE_PROBE_FLUSHED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static WINDOW_SIZE_PROBE_WIDTH_BITS: AtomicU64 = AtomicU64::new(0);
-static WINDOW_SIZE_PROBE_HEIGHT_BITS: AtomicU64 = AtomicU64::new(0);
 
 pub struct TraceSpan {
     event: &'static str,
@@ -97,90 +88,6 @@ pub fn branch_switch_log_path() -> PathBuf {
     daily_log_path("branch-switch")
 }
 
-/// Temporary drag diagnostics. The press path writes only atomics after dispatching the native
-/// command; formatting, locking, and file I/O are delayed until the button has been released.
-pub fn record_window_drag_probe(x: f32, y: f32, area: u8) {
-    WINDOW_DRAG_PROBE_X_BITS.store(x.to_bits() as u64, Ordering::Relaxed);
-    WINDOW_DRAG_PROBE_Y_BITS.store(y.to_bits() as u64, Ordering::Relaxed);
-    WINDOW_DRAG_PROBE_AREA.store(area as u64, Ordering::Release);
-    WINDOW_DRAG_PROBE_SEQUENCE.fetch_add(1, Ordering::Release);
-}
-
-pub fn flush_window_drag_probe() {
-    let sequence = WINDOW_DRAG_PROBE_SEQUENCE.load(Ordering::Acquire);
-    let flushed = WINDOW_DRAG_PROBE_FLUSHED_SEQUENCE.load(Ordering::Acquire);
-    if sequence == flushed {
-        return;
-    }
-    WINDOW_DRAG_PROBE_FLUSHED_SEQUENCE.store(sequence, Ordering::Release);
-
-    let x = f32::from_bits(WINDOW_DRAG_PROBE_X_BITS.load(Ordering::Acquire) as u32);
-    let y = f32::from_bits(WINDOW_DRAG_PROBE_Y_BITS.load(Ordering::Acquire) as u32);
-    let area = match WINDOW_DRAG_PROBE_AREA.load(Ordering::Acquire) {
-        1 => "title-layer",
-        2 => "source-gap",
-        3 => "resize-north",
-        4 => "resize-south",
-        5 => "resize-east",
-        6 => "resize-west",
-        7 => "resize-north-east",
-        8 => "resize-south-east",
-        9 => "resize-north-west",
-        10 => "resize-south-west",
-        _ => "title-other",
-    };
-    let line = format!(
-        "epoch_ms={} pid={} sequence={} event=window_drag.pointer_press x={x:.1} y={y:.1} area={area}\n",
-        epoch_ms(),
-        std::process::id(),
-        sequence,
-    );
-    let _guard = write_lock();
-    let path = window_drag_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = file.write_all(line.as_bytes());
-    }
-}
-
-/// Records the most recent client-area size without performing file I/O in the
-/// resize path. The value is written after the mouse is released together with
-/// the drag probe, making failed native resize hit tests distinguishable from a
-/// resize that is clamped by the configured minimum size.
-pub fn record_window_size_probe(width: f32, height: f32) {
-    let width_bits = width.to_bits() as u64;
-    let height_bits = height.to_bits() as u64;
-    let previous_width = WINDOW_SIZE_PROBE_WIDTH_BITS.swap(width_bits, Ordering::Relaxed);
-    let previous_height = WINDOW_SIZE_PROBE_HEIGHT_BITS.swap(height_bits, Ordering::Relaxed);
-    if previous_width != width_bits || previous_height != height_bits {
-        WINDOW_SIZE_PROBE_SEQUENCE.fetch_add(1, Ordering::Release);
-    }
-}
-
-pub fn flush_window_size_probe() {
-    let sequence = WINDOW_SIZE_PROBE_SEQUENCE.load(Ordering::Acquire);
-    let flushed = WINDOW_SIZE_PROBE_FLUSHED_SEQUENCE.load(Ordering::Acquire);
-    if sequence == flushed {
-        return;
-    }
-    WINDOW_SIZE_PROBE_FLUSHED_SEQUENCE.store(sequence, Ordering::Release);
-
-    let width = f32::from_bits(WINDOW_SIZE_PROBE_WIDTH_BITS.load(Ordering::Acquire) as u32);
-    let height = f32::from_bits(WINDOW_SIZE_PROBE_HEIGHT_BITS.load(Ordering::Acquire) as u32);
-    append_window_drag_line(format!(
-        "epoch_ms={} pid={} sequence={} event=window_resize.observed width={width:.1} height={height:.1}\n",
-        epoch_ms(),
-        std::process::id(),
-        sequence,
-    ));
-}
-
-pub fn window_drag_log_path() -> PathBuf {
-    daily_log_path("window-drag")
-}
-
 pub fn merge_ai_log_path() -> PathBuf {
     daily_log_path("merge-ai")
 }
@@ -202,17 +109,6 @@ pub fn merge_ai_trace(event: &str, fields: &str) {
 
 pub fn daily_log_path(stem: &str) -> PathBuf {
     log_directory().join(format!("{stem}-{}.log", utc_date_stamp(SystemTime::now())))
-}
-
-fn append_window_drag_line(line: String) {
-    let _guard = write_lock();
-    let path = window_drag_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = file.write_all(line.as_bytes());
-    }
 }
 
 fn log_directory() -> PathBuf {
