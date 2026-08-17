@@ -11,6 +11,25 @@ use std::{
 
 const TRACE_WINDOW_MS: u64 = 10 * 60 * 1_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogLevel {
+    Trace,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Trace => "TRACE",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
 static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_TRACE_ID: AtomicU64 = AtomicU64::new(0);
@@ -101,6 +120,26 @@ pub fn branch_switch_log_path() -> PathBuf {
     daily_log_path("branch-switch")
 }
 
+pub fn app_info(event: &str, fields: &str) {
+    write_domain_event("app", LogLevel::Info, event, fields);
+}
+
+pub fn app_error(event: &str, fields: &str) {
+    write_domain_event("app", LogLevel::Error, event, fields);
+}
+
+pub fn merge_tool_info(event: &str, fields: &str) {
+    write_domain_event("merge-tool", LogLevel::Info, event, fields);
+}
+
+pub fn merge_tool_error(event: &str, fields: &str) {
+    write_domain_event("merge-tool", LogLevel::Error, event, fields);
+}
+
+pub fn error_log_path() -> PathBuf {
+    daily_log_path("error")
+}
+
 /// Temporary title-bar diagnostics requested for interactive validation. The press path performs
 /// atomic stores only. Formatting, locking, and file I/O happen after the primary button is up.
 #[allow(clippy::too_many_arguments)]
@@ -160,9 +199,9 @@ pub fn flush_window_drag_probe() {
     let start_y = float(&WINDOW_DRAG_START_OUTER_Y_BITS);
     let release_x = float(&WINDOW_DRAG_RELEASE_OUTER_X_BITS);
     let release_y = float(&WINDOW_DRAG_RELEASE_OUTER_Y_BITS);
+    let now = epoch_ms();
     let line = format!(
-        "epoch_ms={} pid={} sequence={} event=window_drag decision={} hold_ms={} press_x={:.1} press_y={:.1} screen_width={:.1} menu_controls_right={:.1} window_controls_left={:.1} moved_x={:.1} moved_y={:.1}\n",
-        epoch_ms(),
+        "[{now}] [TRACE] event=window_drag pid={} sequence={} decision={} hold_ms={} press_x={:.1} press_y={:.1} screen_width={:.1} menu_controls_right={:.1} window_controls_left={:.1} moved_x={:.1} moved_y={:.1}\n",
         std::process::id(),
         sequence,
         decision,
@@ -198,14 +237,19 @@ pub fn repository_refresh_log_path() -> PathBuf {
 }
 
 pub fn repository_refresh_trace(event: &str, fields: &str) {
-    let _guard = write_lock();
-    let path = repository_refresh_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let fields = fields.replace(['\r', '\n'], "\\n");
-        let _ = writeln!(file, "[{}] {event} {fields}", epoch_ms());
+    write_domain_event(
+        "repository-refresh",
+        repository_refresh_level(fields),
+        event,
+        fields,
+    );
+}
+
+fn repository_refresh_level(fields: &str) -> LogLevel {
+    if fields.contains("outcome=error") || fields.contains("outcome=probe-error") {
+        LogLevel::Error
+    } else {
+        LogLevel::Trace
     }
 }
 
@@ -213,15 +257,53 @@ pub fn repository_refresh_trace(event: &str, fields: &str) {
 /// include credentials. Keeping this separate from the process lifecycle log makes an AI request
 /// trace easy to inspect without exposing the API key passed only in memory.
 pub fn merge_ai_trace(event: &str, fields: &str) {
+    write_domain_event("merge-ai", merge_ai_level(event), event, fields);
+}
+
+fn merge_ai_level(event: &str) -> LogLevel {
+    if event.ends_with(".failed") || event.ends_with(".error") {
+        LogLevel::Error
+    } else if event.ends_with(".skipped")
+        || event.ends_with(".rejected")
+        || event.ends_with(".anchor_missing")
+    {
+        LogLevel::Warn
+    } else {
+        LogLevel::Trace
+    }
+}
+
+fn write_domain_event(stem: &str, level: LogLevel, event: &str, fields: &str) {
     let _guard = write_lock();
-    let path = merge_ai_log_path();
+    let now = epoch_ms();
+    append_domain_event(daily_log_path(stem), now, level, event, fields);
+    if level == LogLevel::Error {
+        append_domain_event(
+            error_log_path(),
+            now,
+            level,
+            event,
+            &format!("source={} {}", clean(stem), clean(fields)),
+        );
+    }
+}
+
+fn append_domain_event(path: PathBuf, now: u64, level: LogLevel, event: &str, fields: &str) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let fields = fields.replace(['\r', '\n'], "\\n");
-        let _ = writeln!(file, "[{}] {event} {fields}", epoch_ms());
+        let _ = file.write_all(format_domain_event(now, level, event, fields).as_bytes());
     }
+}
+
+fn format_domain_event(now: u64, level: LogLevel, event: &str, fields: &str) -> String {
+    format!(
+        "[{now}] [{}] event={} {}\n",
+        level.label(),
+        clean(event),
+        clean(fields)
+    )
 }
 
 pub fn daily_log_path(stem: &str) -> PathBuf {
@@ -261,7 +343,7 @@ fn civil_date_from_unix_days(days: i64) -> (i64, u32, u32) {
 fn append_line(trace_id: u64, now: u64, event: &str, fields: &str) {
     let started = ACTIVE_STARTED_MS.load(Ordering::Acquire);
     let line = format!(
-        "epoch_ms={now} elapsed_ms={} trace={} pid={} thread={:?} event={} {}\n",
+        "[{now}] [TRACE] elapsed_ms={} trace={} pid={} thread={:?} event={} {}\n",
         now.saturating_sub(started),
         trace_id,
         std::process::id(),
@@ -303,12 +385,39 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::civil_date_from_unix_days;
+    use super::{
+        LogLevel, civil_date_from_unix_days, format_domain_event, merge_ai_level,
+        repository_refresh_level,
+    };
 
     #[test]
     fn unix_day_conversion_generates_stable_daily_log_dates() {
         assert_eq!(civil_date_from_unix_days(0), (1970, 1, 1));
         assert_eq!(civil_date_from_unix_days(20_312), (2025, 8, 12));
         assert_eq!(civil_date_from_unix_days(20_677), (2026, 8, 12));
+    }
+
+    #[test]
+    fn log_levels_have_stable_uppercase_labels() {
+        assert_eq!(LogLevel::Trace.label(), "TRACE");
+        assert_eq!(LogLevel::Info.label(), "INFO");
+        assert_eq!(LogLevel::Warn.label(), "WARN");
+        assert_eq!(LogLevel::Error.label(), "ERROR");
+    }
+
+    #[test]
+    fn structured_logs_classify_failures_and_sanitize_multiline_fields() {
+        assert_eq!(merge_ai_level("request.failed"), LogLevel::Error);
+        assert_eq!(merge_ai_level("parse.rejected"), LogLevel::Warn);
+        assert_eq!(merge_ai_level("request.finished"), LogLevel::Trace);
+        assert_eq!(
+            repository_refresh_level("outcome=probe-error"),
+            LogLevel::Error
+        );
+        assert_eq!(repository_refresh_level("outcome=success"), LogLevel::Trace);
+        assert_eq!(
+            format_domain_event(42, LogLevel::Error, "request.failed", "a\nb"),
+            "[42] [ERROR] event=request.failed a b\n"
+        );
     }
 }

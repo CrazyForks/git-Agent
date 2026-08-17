@@ -7,16 +7,19 @@ const MAIN_WINDOW_MIN_HEIGHT: f32 = MAIN_WINDOW_MIN_WIDTH * 9.0 / 16.0;
 
 fn main() -> eframe::Result<()> {
     install_panic_logger();
-    append_app_log(format!(
-        "process start pid={} exe={} cwd={}",
-        std::process::id(),
-        std::env::current_exe()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|error| format!("<current_exe error: {error}>")),
-        std::env::current_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|error| format!("<current_dir error: {error}>"))
-    ));
+    git_agent::diagnostics::app_info(
+        "process.start",
+        &format!(
+            "pid={} exe={} cwd={}",
+            std::process::id(),
+            std::env::current_exe()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|error| format!("<current_exe error: {error}>")),
+            std::env::current_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|error| format!("<current_dir error: {error}>"))
+        ),
+    );
 
     let initial_window_size = git_agent::app::persisted_window_inner_size(
         [MAIN_WINDOW_INITIAL_WIDTH, MAIN_WINDOW_INITIAL_HEIGHT],
@@ -42,13 +45,10 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(git_agent::app::GitAgentApp::new(cc)))
         }),
     );
-    append_app_log(format!(
-        "run_native returned {}",
-        match &result {
-            Ok(()) => "ok".to_owned(),
-            Err(error) => format!("error: {error}"),
-        }
-    ));
+    match &result {
+        Ok(()) => git_agent::diagnostics::app_info("process.exit", "outcome=ok"),
+        Err(error) => git_agent::diagnostics::app_error("process.exit", &format!("error={error}")),
+    }
     result
 }
 
@@ -83,31 +83,8 @@ fn prefer_rounded_window_corners(_: &eframe::CreationContext<'_>) {}
 
 fn install_panic_logger() {
     std::panic::set_hook(Box::new(|info| {
-        append_app_log(format!("panic: {info}"));
+        git_agent::diagnostics::app_error("panic", &info.to_string());
     }));
-}
-
-fn append_app_log(message: impl AsRef<str>) {
-    let Some(path) = app_log_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "time-before-epoch".to_owned());
-    let line = format!("[{timestamp}] {}\n", message.as_ref());
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
-}
-
-fn app_log_path() -> Option<std::path::PathBuf> {
-    Some(git_agent::diagnostics::daily_log_path("app"))
 }
 
 fn app_icon_data() -> eframe::egui::IconData {
@@ -284,12 +261,12 @@ mod tests {
     fn main_installs_file_logging_for_startup_and_panics() {
         let source = include_str!("main.rs");
 
-        assert!(source.contains("fn app_log_path()"));
-        assert!(source.contains("daily_log_path(\"app\")"));
+        assert!(source.contains("diagnostics::app_info("));
+        assert!(source.contains("diagnostics::app_error("));
         assert!(source.contains("std::panic::set_hook"));
-        assert!(source.contains("process start"));
-        assert!(source.contains("panic:"));
-        assert!(source.contains("run_native returned"));
+        assert!(source.contains("\"process.start\""));
+        assert!(source.contains("\"panic\""));
+        assert!(source.contains("\"process.exit\""));
     }
 
     #[test]

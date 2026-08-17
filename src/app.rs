@@ -577,7 +577,7 @@ pub struct GitAgentApp {
     repo_source_tab: RepoSourceTab,
     snapshot: Option<RepositorySnapshot>,
     sidebar_branch_cache: SidebarBranchCache,
-    repository_transition_focus_clear_pending: bool,
+    repository_snapshot_focus_clear_pending: bool,
     snapshot_cache: HashMap<String, RepositorySnapshot>,
     layout: GraphLayout,
     title_bar_hit_map: Option<TitleBarHitMap>,
@@ -3504,7 +3504,7 @@ impl GitAgentApp {
             repo_source_tab: RepoSourceTab::Local,
             snapshot: None,
             sidebar_branch_cache: SidebarBranchCache::default(),
-            repository_transition_focus_clear_pending: false,
+            repository_snapshot_focus_clear_pending: false,
             snapshot_cache: HashMap::new(),
             layout: GraphLayout::default(),
             title_bar_hit_map: None,
@@ -4263,6 +4263,7 @@ impl GitAgentApp {
     }
 
     fn clear_repository_snapshot_view(&mut self) {
+        self.repository_snapshot_focus_clear_pending |= self.snapshot.is_some();
         self.snapshot = None;
         self.sidebar_branch_cache = SidebarBranchCache::default();
         self.layout = GraphLayout::default();
@@ -4322,6 +4323,10 @@ impl GitAgentApp {
     }
 
     fn apply_repository_snapshot(&mut self, mut snapshot: RepositorySnapshot) {
+        // Replacing an existing snapshot also rebuilds worktree/history controls and clears
+        // their selections below. A focused control can therefore disappear even when the
+        // repository and branch themselves did not change (for example after auto refresh).
+        let replaces_existing_snapshot = self.snapshot.is_some();
         let outgoing_branch = self.snapshot.as_ref().and_then(|current| {
             (paths_equal(&current.root, &snapshot.root) && current.branch != snapshot.branch)
                 .then(|| current.branch.clone())
@@ -4336,7 +4341,7 @@ impl GitAgentApp {
             self.commit_message.clear();
             self.invalidate_branch_sensitive_tasks(&snapshot.root);
         }
-        self.repository_transition_focus_clear_pending |= repository_transition;
+        self.repository_snapshot_focus_clear_pending |= replaces_existing_snapshot;
         self.apply_history_sort_order_to_snapshot(&mut snapshot);
         self.layout = graph::layout(&snapshot.commits);
         self.selected_commit = (!snapshot.commits.is_empty()).then_some(0);
@@ -4370,10 +4375,10 @@ impl GitAgentApp {
         self.request_selected_details();
     }
 
-    /// A branch or repository transition can remove the focused widget in the same frame.
-    /// Clear egui's focus before AccessKit rebuilds its accessibility tree from that new UI.
-    fn clear_focus_after_repository_transition(&mut self, ctx: &egui::Context) {
-        if !std::mem::take(&mut self.repository_transition_focus_clear_pending) {
+    /// Applying a repository snapshot can remove the focused widget in the same frame.
+    /// Clear egui's focus before rebuilding the UI and AccessKit accessibility tree.
+    fn clear_focus_before_repository_snapshot_ui(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.repository_snapshot_focus_clear_pending) {
             return;
         }
         ctx.memory_mut(|memory| {
@@ -8759,6 +8764,7 @@ impl App for GitAgentApp {
         self.update_window_resize_cursor(ctx);
         theme::apply_if_needed(ctx, self.theme_mode, self.theme_accent);
         self.poll_tasks(ctx);
+        self.clear_focus_before_repository_snapshot_ui(ctx);
         if self.exit_after_update_launch {
             self.exit_after_update_launch = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -8823,7 +8829,6 @@ impl App for GitAgentApp {
         self.repository_benchmark_progress_modal(ctx);
         self.error_modal(ctx);
         self.toast_overlay(ctx);
-        self.clear_focus_after_repository_transition(ctx);
     }
 }
 
@@ -43285,7 +43290,7 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
-    fn repository_transition_clears_stale_accessibility_focus_before_frame_end() {
+    fn repository_snapshot_clears_stale_accessibility_focus_before_ui_rebuild() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
@@ -43296,11 +43301,25 @@ diff --git a/file.txt b/file.txt
             .find("fn apply_repository_history(")
             .unwrap();
         let apply_source = &implementation_source[apply_start..apply_start + apply_end];
-        assert!(apply_source.contains("current.branch != snapshot.branch"));
-        assert!(apply_source.contains("repository_transition_focus_clear_pending"));
+        assert!(apply_source.contains("let replaces_existing_snapshot = self.snapshot.is_some()"));
+        assert!(apply_source.contains("repository_snapshot_focus_clear_pending"));
+
+        let clear_view_start = implementation_source
+            .find("fn clear_repository_snapshot_view(")
+            .unwrap();
+        let clear_view_end = implementation_source[clear_view_start..]
+            .find("fn invalidate_branch_sensitive_tasks(")
+            .unwrap();
+        let clear_view_source =
+            &implementation_source[clear_view_start..clear_view_start + clear_view_end];
+        assert!(
+            clear_view_source.contains(
+                "self.repository_snapshot_focus_clear_pending |= self.snapshot.is_some()"
+            )
+        );
 
         let focus_start = implementation_source
-            .find("fn clear_focus_after_repository_transition(")
+            .find("fn clear_focus_before_repository_snapshot_ui(")
             .unwrap();
         let focus_end = implementation_source[focus_start..]
             .find("fn apply_repository_history(")
@@ -43314,7 +43333,15 @@ diff --git a/file.txt b/file.txt
             .find("\n}\n\nimpl GitAgentApp")
             .unwrap();
         let update_source = &implementation_source[update_start..update_start + update_end];
-        assert!(update_source.contains("self.clear_focus_after_repository_transition(ctx);"));
+        let poll_index = update_source.find("self.poll_tasks(ctx);").unwrap();
+        let clear_index = update_source
+            .find("self.clear_focus_before_repository_snapshot_ui(ctx);")
+            .unwrap();
+        let top_bar_index = update_source
+            .find("egui::TopBottomPanel::top(\"top_bar\")")
+            .unwrap();
+        assert!(poll_index < clear_index);
+        assert!(clear_index < top_bar_index);
     }
 
     #[test]
@@ -45414,7 +45441,7 @@ diff --git a/file.txt b/file.txt
             .find("fn apply_repository_snapshot(&mut self")
             .unwrap();
         let apply_end = implementation_source[apply_start..]
-            .find("fn clear_focus_after_repository_transition(")
+            .find("fn clear_focus_before_repository_snapshot_ui(")
             .unwrap();
         let apply_source = &implementation_source[apply_start..apply_start + apply_end];
 

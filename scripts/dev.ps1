@@ -1,5 +1,8 @@
 param(
     [int]$DebounceMs = 700,
+    [int]$CrashRestartLimit = 3,
+    [int]$CrashRestartWindowSeconds = 30,
+    [int]$CrashRestartDelayMs = 750,
     [switch]$KeepExisting,
     [switch]$LayoutDebug
 )
@@ -12,8 +15,9 @@ Set-Location $root
 
 $stateDir = Join-Path $root "target\dev-watch"
 $pidFile = Join-Path $stateDir "runner.pid"
-$stdoutLog = Join-Path $stateDir "dev-watch.out.log"
-$stderrLog = Join-Path $stateDir "dev-watch.err.log"
+$logDate = Get-Date -Format "yyyy-MM-dd"
+$stdoutLog = Join-Path $stateDir "dev-watch.$logDate.out.log"
+$stderrLog = Join-Path $stateDir "dev-watch.$logDate.err.log"
 $mainExe = Join-Path $root "target\debug\git-agent.exe"
 $mergeExe = Join-Path $root "target\debug\git-agent-merge.exe"
 $diffExe = Join-Path $root "target\debug\git-agent-diff.exe"
@@ -21,10 +25,17 @@ $diffExe = Join-Path $root "target\debug\git-agent-diff.exe"
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 
 function Write-DevLog {
-    param([string]$Message)
-    $line = "[dev] $(Get-Date -Format o) $Message"
+    param(
+        [string]$Message,
+        [ValidateSet("INFO", "WARN", "ERROR")]
+        [string]$Level = "INFO"
+    )
+    $line = "[dev] $(Get-Date -Format o) [$Level] $Message"
     Write-Host $line
     $line | Add-Content -Path $stdoutLog
+    if ($Level -eq "ERROR") {
+        $line | Add-Content -Path $stderrLog
+    }
 }
 
 function Stop-ProcessTree {
@@ -93,9 +104,7 @@ function Build-Bins {
     }
 
     if ($buildExitCode -ne 0) {
-        $line = "[dev] $(Get-Date -Format o) build failed: exit $buildExitCode"
-        Write-Host $line -ForegroundColor Red
-        $line | Add-Content -Path $stderrLog
+        Write-DevLog "build failed: exit $buildExitCode" -Level "ERROR"
         return $false
     }
 
@@ -107,7 +116,7 @@ function Build-Bins {
 
 function Start-MainWindow {
     if (-not (Test-Path $mainExe)) {
-        Write-DevLog "main exe missing; skip start"
+        Write-DevLog "main exe missing; skip start" -Level "WARN"
         return $null
     }
 
@@ -140,11 +149,38 @@ function Test-MainWindowExit {
     }
 
     $exitCode = $script:mainProcess.ExitCode
-    Write-DevLog "git-agent exited pid=$processId exit=$exitCode"
+    if ($exitCode -eq 0) {
+        Write-DevLog "git-agent exited pid=$processId exit=$exitCode"
+    }
+    else {
+        Write-DevLog "git-agent exited pid=$processId exit=$exitCode" -Level "ERROR"
+    }
     $script:mainProcess = $null
+
+    if ($exitCode -eq 0) {
+        return
+    }
+
+    $now = Get-Date
+    $script:crashRestartTimes = @(
+        $script:crashRestartTimes | Where-Object {
+            ($now - $_).TotalSeconds -lt $CrashRestartWindowSeconds
+        }
+    )
+    if ($script:crashRestartTimes.Count -ge $CrashRestartLimit) {
+        Write-DevLog "crash restart suppressed after $CrashRestartLimit failures in ${CrashRestartWindowSeconds}s" -Level "ERROR"
+        return
+    }
+
+    $script:crashRestartTimes += $now
+    $attempt = $script:crashRestartTimes.Count
+    Write-DevLog "restart git-agent after crash attempt=$attempt/$CrashRestartLimit delay_ms=$CrashRestartDelayMs" -Level "WARN"
+    Start-Sleep -Milliseconds $CrashRestartDelayMs
+    $script:mainProcess = Start-MainWindow
 }
 
 function Restart-DevApp {
+    $script:crashRestartTimes = @()
     Stop-DevBinaries
     if (Build-Bins) {
         $script:mainProcess = Start-MainWindow
@@ -162,6 +198,7 @@ $watcher.Filter = "*.*"
 
 $lastRestart = Get-Date "2000-01-01"
 $script:mainProcess = $null
+$script:crashRestartTimes = @()
 
 try {
     Restart-DevApp

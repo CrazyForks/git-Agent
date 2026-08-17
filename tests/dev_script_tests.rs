@@ -88,3 +88,39 @@ fn dev_script_logs_started_app_pid_and_exit_code() {
     let loop_body = &script[loop_start..];
     assert!(loop_body.contains("Test-MainWindowExit"));
 }
+
+#[test]
+fn dev_script_restarts_crashes_with_a_bounded_backoff() {
+    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev.ps1");
+    let script = fs::read_to_string(script_path).expect("dev.ps1 should be readable");
+    let exit_start = script
+        .find("function Test-MainWindowExit")
+        .expect("Test-MainWindowExit should exist");
+    let exit_end = script[exit_start..]
+        .find("function Restart-DevApp")
+        .expect("Test-MainWindowExit should end before Restart-DevApp")
+        + exit_start;
+    let exit_body = &script[exit_start..exit_end];
+
+    assert!(exit_body.contains("if ($exitCode -eq 0)"));
+    assert!(exit_body.contains("$CrashRestartWindowSeconds"));
+    assert!(exit_body.contains("$CrashRestartLimit"));
+    assert!(exit_body.contains("Start-Sleep -Milliseconds $CrashRestartDelayMs"));
+    assert!(exit_body.contains("$script:mainProcess = Start-MainWindow"));
+    assert!(exit_body.contains("crash restart suppressed"));
+    assert!(exit_body.contains("-Level \"ERROR\""));
+    assert!(exit_body.contains("-Level \"WARN\""));
+}
+
+#[test]
+fn dev_script_uses_daily_files_and_explicit_log_levels() {
+    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev.ps1");
+    let script = fs::read_to_string(script_path).expect("dev.ps1 should be readable");
+
+    assert!(script.contains("Get-Date -Format \"yyyy-MM-dd\""));
+    assert!(script.contains("dev-watch.$logDate.out.log"));
+    assert!(script.contains("dev-watch.$logDate.err.log"));
+    assert!(script.contains("[ValidateSet(\"INFO\", \"WARN\", \"ERROR\")]"));
+    assert!(script.contains("[$Level] $Message"));
+    assert!(script.contains("if ($Level -eq \"ERROR\")"));
+}
