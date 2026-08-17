@@ -130,6 +130,18 @@ pub struct UpstreamStatus {
     pub behind: usize,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RepositoryRefreshFingerprint {
+    pub branch: String,
+    pub status: Vec<String>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub unstaged_count: usize,
+    /// Filesystem state for paths that are already staged, modified, or untracked.
+    /// `git status` alone is unchanged when an already-modified file is edited again.
+    pub worktree_signature: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StashEntry {
     pub selector: String,
@@ -221,6 +233,8 @@ pub struct RepositorySnapshot {
     pub stashes: Vec<StashEntry>,
     pub tags: Vec<Tag>,
     pub status: Vec<String>,
+    #[serde(default)]
+    pub refresh_worktree_signature: Vec<String>,
     pub staged: Vec<WorktreeFile>,
     pub unstaged: Vec<WorktreeFile>,
     #[serde(default)]
@@ -362,24 +376,15 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
         );
         discover_root(&requested_path)?
     };
-    let _branch_span = diagnostics::span("snapshot.branch", format!("root={}", root.display()));
-    let branch = git_output(&root, &["branch", "--show-current"])
-        .unwrap_or_else(|_| "HEAD".to_owned())
-        .trim()
-        .to_owned();
-    let branch = if branch.is_empty() {
+    let status_span = diagnostics::span("snapshot.status", format!("root={}", root.display()));
+    let refresh_fingerprint = repository_refresh_fingerprint(&root).unwrap_or_default();
+    let branch = if refresh_fingerprint.branch.is_empty() {
         "HEAD".to_owned()
     } else {
-        branch
+        refresh_fingerprint.branch.clone()
     };
-    drop(_branch_span);
-
-    let status_span = diagnostics::span("snapshot.status", format!("root={}", root.display()));
-    let status = git_output(&root, &["status", "--short", "--untracked-files=all"])
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let refresh_worktree_signature = refresh_fingerprint.worktree_signature;
+    let status = refresh_fingerprint.status;
     drop(status_span);
     diagnostics::trace(
         "snapshot.status.count",
@@ -420,6 +425,7 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
         stashes,
         tags,
         status,
+        refresh_worktree_signature,
         staged,
         unstaged,
         conflicts,
@@ -434,6 +440,116 @@ pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot
         config,
         git_flow_config,
     })
+}
+
+pub fn repository_refresh_fingerprint(
+    root: impl AsRef<Path>,
+) -> Result<RepositoryRefreshFingerprint> {
+    let root = root.as_ref();
+    let output = git_output(
+        root,
+        &["status", "--short", "--branch", "--untracked-files=all"],
+    )?;
+    let mut fingerprint = parse_repository_refresh_fingerprint(&output);
+    fingerprint.worktree_signature = repository_worktree_signature(root, &fingerprint.status);
+    Ok(fingerprint)
+}
+
+pub fn repository_snapshot_refresh_fingerprint(
+    snapshot: &RepositorySnapshot,
+) -> RepositoryRefreshFingerprint {
+    let sync = snapshot.upstream.as_ref();
+    RepositoryRefreshFingerprint {
+        branch: snapshot.branch.clone(),
+        status: snapshot.status.clone(),
+        ahead: sync.map_or(0, |upstream| upstream.ahead),
+        behind: sync.map_or(0, |upstream| upstream.behind),
+        unstaged_count: snapshot.unstaged.len(),
+        worktree_signature: snapshot.refresh_worktree_signature.clone(),
+    }
+}
+
+fn parse_repository_refresh_fingerprint(output: &str) -> RepositoryRefreshFingerprint {
+    let mut lines = output.lines();
+    let header = lines.next().filter(|line| line.starts_with("## "));
+    let status = if header.is_some() {
+        lines.map(str::to_owned).collect::<Vec<_>>()
+    } else {
+        output.lines().map(str::to_owned).collect::<Vec<_>>()
+    };
+    let (branch, ahead, behind) = header
+        .map(parse_short_branch_status_header)
+        .unwrap_or_else(|| ("HEAD".to_owned(), 0, 0));
+    let (_, unstaged) = parse_status_entries(&status);
+    RepositoryRefreshFingerprint {
+        branch,
+        status,
+        ahead,
+        behind,
+        unstaged_count: unstaged.len(),
+        worktree_signature: Vec::new(),
+    }
+}
+
+fn repository_worktree_signature(root: &Path, status: &[String]) -> Vec<String> {
+    let signature = status
+        .iter()
+        .filter_map(|line| parse_status_entry(line))
+        .map(|file| {
+            let path = root.join(&file.path);
+            format!("worktree:{}:{}", file.path, filesystem_state(&path))
+        })
+        .collect::<Vec<_>>();
+
+    signature
+}
+
+fn filesystem_state(path: &Path) -> String {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return "missing".to_owned();
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok());
+    format!(
+        "{}:{}:{}",
+        metadata.len(),
+        modified.map_or(0, |value| value.as_secs()),
+        modified.map_or(0, |value| value.subsec_nanos())
+    )
+}
+
+fn parse_short_branch_status_header(header: &str) -> (String, usize, usize) {
+    let body = header.strip_prefix("## ").unwrap_or(header).trim();
+    let (branch_part, sync_part) = body
+        .rsplit_once(" [")
+        .filter(|(_, sync)| sync.ends_with(']'))
+        .map_or((body, ""), |(branch, sync)| {
+            (branch, sync.trim_end_matches(']'))
+        });
+    let branch = branch_part
+        .strip_prefix("No commits yet on ")
+        .or_else(|| branch_part.strip_prefix("Initial commit on "))
+        .unwrap_or(branch_part)
+        .split("...")
+        .next()
+        .unwrap_or("HEAD")
+        .split_whitespace()
+        .next()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or("HEAD")
+        .to_owned();
+    let mut ahead = 0;
+    let mut behind = 0;
+    for part in sync_part.split(',').map(str::trim) {
+        if let Some(count) = part.strip_prefix("ahead ") {
+            ahead = count.parse().unwrap_or(0);
+        } else if let Some(count) = part.strip_prefix("behind ") {
+            behind = count.parse().unwrap_or(0);
+        }
+    }
+    (branch, ahead, behind)
 }
 
 fn collect_worktree_conflicts(
@@ -3788,6 +3904,45 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_COMMIT_PATCH_REPO: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn refresh_fingerprint_uses_one_branch_status_payload() {
+        let fingerprint = parse_repository_refresh_fingerprint(
+            "## feature/work...origin/feature/work [ahead 2, behind 3]\n M src/app.rs\n?? note.txt\n",
+        );
+
+        assert_eq!(fingerprint.branch, "feature/work");
+        assert_eq!(fingerprint.ahead, 2);
+        assert_eq!(fingerprint.behind, 3);
+        assert_eq!(fingerprint.unstaged_count, 2);
+        assert_eq!(fingerprint.status, [" M src/app.rs", "?? note.txt"]);
+
+        let initial = parse_repository_refresh_fingerprint("## No commits yet on main\n");
+        assert_eq!(initial.branch, "main");
+        assert!(initial.status.is_empty());
+    }
+
+    #[test]
+    fn refresh_fingerprint_detects_edits_to_an_already_modified_file() -> Result<()> {
+        let nonce = NEXT_COMMIT_PATCH_REPO.fetch_add(1, Ordering::Relaxed);
+        let root = env::temp_dir().join(format!(
+            "git-agent-refresh-fingerprint-{}-{nonce}",
+            std::process::id()
+        ));
+        let file = root.join("src").join("already-modified.rs");
+        fs::create_dir_all(file.parent().unwrap())?;
+        fs::write(&file, "first edit")?;
+        let status = vec![" M src/already-modified.rs".to_owned()];
+        let first = repository_worktree_signature(&root, &status);
+
+        // The porcelain status line is identical, but the underlying file changed.
+        fs::write(&file, "second edit is longer")?;
+        let second = repository_worktree_signature(&root, &status);
+
+        assert_ne!(first, second);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
 
     #[test]
     fn ssh_command_config_sets_explicit_executable_and_variant() {

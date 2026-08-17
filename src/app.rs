@@ -45,11 +45,9 @@ use crate::{
 };
 
 const TITLE_BAR_HEIGHT: f32 = 32.0;
-// English menu labels need more room than the former Chinese-only estimate. Keep the native
-// drag rect entirely to their right so a late drag-region hit target never competes with a menu.
 const WINDOW_RESIZE_BORDER: f32 = 8.0;
-const TITLE_MENU_RESERVED_WIDTH: f32 = 500.0;
 const TITLE_DRAG_TOP_INSET: f32 = WINDOW_RESIZE_BORDER + 1.0;
+const TITLE_CONTROL_EXCLUSION_PADDING: f32 = 3.0;
 const WINDOW_CORNER_RADIUS: u8 = 6;
 const INTERACTIVE_REBASE_TABLE_CONTROL_WIDTH: f32 = 220.0;
 const HISTORY_BRANCH_SCOPE_CONTROL_WIDTH: f32 = 132.0;
@@ -408,24 +406,84 @@ fn top_island_rect(full: Rect, title_row: Rect, tool_row: Rect, source_active: b
     )
 }
 
-fn custom_title_drag_rect(rect: Rect, controls_width: f32) -> Rect {
-    let drag_left =
-        (rect.left() + TITLE_MENU_RESERVED_WIDTH).min(rect.right() - controls_width - 24.0);
+fn title_drag_candidate_rect(rect: Rect) -> Rect {
     Rect::from_min_max(
         Pos2::new(
-            drag_left,
+            rect.left(),
             (rect.top() + TITLE_DRAG_TOP_INSET).min(rect.bottom()),
         ),
-        Pos2::new(rect.right() - controls_width, rect.bottom()),
+        rect.right_bottom(),
     )
 }
 
-fn current_title_drag_rect(screen: Rect) -> Rect {
-    let title_row = Rect::from_min_max(
+fn title_row_rect(screen: Rect) -> Rect {
+    Rect::from_min_max(
         screen.left_top(),
         Pos2::new(screen.right(), screen.top() + TITLE_BAR_HEIGHT),
-    );
-    custom_title_drag_rect(title_row, 128.0)
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TitleBarDragHit {
+    Drag,
+    MenuControls,
+    WindowControls,
+    StaleMap,
+}
+
+impl TitleBarDragHit {
+    fn probe_code(self) -> u8 {
+        match self {
+            Self::Drag => 1,
+            Self::MenuControls => 2,
+            Self::WindowControls => 3,
+            Self::StaleMap => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TitleBarHitMap {
+    screen: Rect,
+    pixels_per_point: f32,
+    language: Language,
+    candidate: Rect,
+    menu_controls: Rect,
+    window_controls: Rect,
+}
+
+impl TitleBarHitMap {
+    fn valid_for(self, screen: Rect, pixels_per_point: f32, language: Language) -> bool {
+        self.screen == screen
+            && self.pixels_per_point == pixels_per_point
+            && self.language == language
+    }
+
+    fn hit(
+        self,
+        screen: Rect,
+        pixels_per_point: f32,
+        language: Language,
+        pos: Pos2,
+    ) -> TitleBarDragHit {
+        if !self.valid_for(screen, pixels_per_point, language) {
+            return TitleBarDragHit::StaleMap;
+        }
+        if self.menu_controls.contains(pos) {
+            return TitleBarDragHit::MenuControls;
+        }
+        if self.window_controls.contains(pos) {
+            return TitleBarDragHit::WindowControls;
+        }
+        TitleBarDragHit::Drag
+    }
+}
+
+fn include_rect(bounds: &mut Option<Rect>, rect: Rect) {
+    *bounds = Some(match *bounds {
+        Some(bounds) => bounds.union(rect),
+        None => rect,
+    });
 }
 
 fn window_resize_direction(
@@ -522,7 +580,7 @@ pub struct GitAgentApp {
     repository_transition_focus_clear_pending: bool,
     snapshot_cache: HashMap<String, RepositorySnapshot>,
     layout: GraphLayout,
-    title_drag_layer: Option<Rect>,
+    title_bar_hit_map: Option<TitleBarHitMap>,
     selected_commit: Option<usize>,
     error: Option<String>,
     search: String,
@@ -538,6 +596,10 @@ pub struct GitAgentApp {
     show_workspace_repositories: bool,
     workspace_repository_search: String,
     next_workspace_repo_status_load_at: Instant,
+    workspace_repository_statuses: HashMap<String, git::RepositoryRefreshFingerprint>,
+    workspace_repository_status_attempted: HashSet<String>,
+    workspace_repository_status_task:
+        Option<Receiver<(PathBuf, anyhow::Result<git::RepositoryRefreshFingerprint>)>>,
     clone_url: String,
     clone_destination: String,
     create_repo_path: String,
@@ -642,6 +704,7 @@ pub struct GitAgentApp {
     commit_message_drafts: HashMap<String, String>,
     commit_state: RepoCommitState,
     focus_commit_message: bool,
+    commit_message_ime_composing: bool,
     language: Language,
     pending_stash_action: Option<StashActionDialog>,
     pending_branch_action: Option<BranchActionDialog>,
@@ -753,6 +816,7 @@ struct RepositoryRefreshRequest {
     path: PathBuf,
     key: String,
     priority: RepositoryRefreshPriority,
+    probe_before_full_refresh: bool,
     result_sender: Sender<RepoTaskResult>,
 }
 
@@ -761,6 +825,7 @@ struct ScheduledRepositoryRefresh {
     path: PathBuf,
     key: String,
     active: bool,
+    fingerprint: Option<git::RepositoryRefreshFingerprint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -929,9 +994,73 @@ fn repository_refresh_scheduler_loop(
             next_repository_refresh_request_index(&pending, &blocked_keys, &exclusive_keys)
         {
             let request = pending.swap_remove(index);
-            let result = git::open_repository_core(request.path.clone());
-            let _ = request.result_sender.send((request.path, result));
-            ctx.request_repaint();
+            let probe_started = Instant::now();
+            let probe = request
+                .probe_before_full_refresh
+                .then(|| git::repository_refresh_fingerprint(&request.path));
+            let probe_matches = probe.as_ref().is_some_and(|probe| {
+                probe.as_ref().is_ok_and(|fingerprint| {
+                    scheduled.get(&request.key).is_some_and(|state| {
+                        state
+                            .repository
+                            .fingerprint
+                            .as_ref()
+                            .map_or(!state.repository.active, |known| known == fingerprint)
+                    })
+                })
+            });
+            if request.probe_before_full_refresh {
+                let outcome = match &probe {
+                    Some(Ok(_)) if probe_matches => "unchanged",
+                    Some(Ok(_)) => "changed",
+                    Some(Err(_)) => "probe-error",
+                    None => "not-run",
+                };
+                diagnostics::repository_refresh_trace(
+                    "refresh.probe",
+                    &format!(
+                        "root={} outcome={outcome} elapsed_ms={}",
+                        request.path.display(),
+                        probe_started.elapsed().as_millis()
+                    ),
+                );
+            }
+            // A changed probe is only a candidate. Do not advance the known
+            // fingerprint until the corresponding full snapshot succeeds;
+            // otherwise one failed refresh would make stale UI permanent.
+            if probe_matches
+                && let Some(Ok(fingerprint)) = probe.as_ref()
+                && let Some(state) = scheduled.get_mut(&request.key)
+            {
+                state.repository.fingerprint = Some(fingerprint.clone());
+            }
+            if !probe_matches {
+                let full_started = Instant::now();
+                let result = git::open_repository_core(request.path.clone());
+                if request.probe_before_full_refresh {
+                    diagnostics::repository_refresh_trace(
+                        "refresh.full",
+                        &format!(
+                            "root={} outcome={} elapsed_ms={}",
+                            request.path.display(),
+                            if result.is_ok() { "success" } else { "error" },
+                            full_started.elapsed().as_millis()
+                        ),
+                    );
+                }
+                let completed_fingerprint = result
+                    .as_ref()
+                    .ok()
+                    .map(git::repository_snapshot_refresh_fingerprint);
+                let delivered = request.result_sender.send((request.path, result)).is_ok();
+                if delivered
+                    && let Some(fingerprint) = completed_fingerprint
+                    && let Some(state) = scheduled.get_mut(&request.key)
+                {
+                    state.repository.fingerprint = Some(fingerprint);
+                }
+                ctx.request_repaint();
+            }
         }
     }
 }
@@ -962,21 +1091,40 @@ fn apply_repository_refresh_scheduler_command(
                 .collect::<HashSet<_>>();
             scheduled.retain(|key, _| repository_keys.contains(key));
             let now = Instant::now();
+            let inactive_count = repositories
+                .iter()
+                .filter(|repository| !repository.active)
+                .count();
+            let mut inactive_position = 0_u32;
             for repository in repositories {
                 let interval = if repository.active {
                     *active_interval
                 } else {
                     *inactive_interval
                 };
+                let initial_delay = if repository.active || inactive_count == 0 {
+                    interval
+                } else {
+                    inactive_position += 1;
+                    interval.mul_f64((inactive_position as f64 - 0.5) / inactive_count as f64)
+                };
                 scheduled
                     .entry(repository.key.clone())
                     .and_modify(|state| {
+                        // The scheduler may hold a richer live filesystem signature than
+                        // the last UI snapshot. Never replace it with stale schedule input.
+                        let fingerprint = state
+                            .repository
+                            .fingerprint
+                            .clone()
+                            .or_else(|| repository.fingerprint.clone());
                         state.repository = repository.clone();
+                        state.repository.fingerprint = fingerprint;
                         state.next_refresh_at = state.next_refresh_at.min(now + interval);
                     })
                     .or_insert(RepositoryRefreshScheduleState {
                         repository,
-                        next_refresh_at: now + interval,
+                        next_refresh_at: now + initial_delay,
                     });
             }
         }
@@ -1024,6 +1172,7 @@ fn enqueue_due_repository_refreshes(
                 path: state.repository.path.clone(),
                 key: state.repository.key.clone(),
                 priority: RepositoryRefreshPriority::Background,
+                probe_before_full_refresh: true,
                 result_sender: automatic_result_sender.clone(),
             },
         );
@@ -3358,7 +3507,7 @@ impl GitAgentApp {
             repository_transition_focus_clear_pending: false,
             snapshot_cache: HashMap::new(),
             layout: GraphLayout::default(),
-            title_drag_layer: None,
+            title_bar_hit_map: None,
             selected_commit: None,
             error: None,
             search: String::new(),
@@ -3374,6 +3523,9 @@ impl GitAgentApp {
             show_workspace_repositories: true,
             workspace_repository_search: String::new(),
             next_workspace_repo_status_load_at: Instant::now(),
+            workspace_repository_statuses: HashMap::new(),
+            workspace_repository_status_attempted: HashSet::new(),
+            workspace_repository_status_task: None,
             clone_url: String::new(),
             clone_destination: String::new(),
             create_repo_path: String::new(),
@@ -3478,6 +3630,7 @@ impl GitAgentApp {
             commit_message_drafts: HashMap::new(),
             commit_state: RepoCommitState::default(),
             focus_commit_message: false,
+            commit_message_ime_composing: false,
             language: app_settings.language.into(),
             pending_stash_action: None,
             pending_branch_action: None,
@@ -3623,6 +3776,7 @@ impl GitAgentApp {
                 path,
                 key: repo_task_key,
                 priority,
+                probe_before_full_refresh: false,
                 result_sender: sender,
             });
     }
@@ -3798,6 +3952,9 @@ impl GitAgentApp {
                 path: tab.root.clone(),
                 key: repo_state_key(&tab.root),
                 active: self.active_repo_tab == Some(index),
+                fingerprint: self
+                    .workspace_repository_snapshot_for(&tab.root)
+                    .map(git::repository_snapshot_refresh_fingerprint),
             })
             .collect();
         let mut blocked_keys = self
@@ -3822,6 +3979,16 @@ impl GitAgentApp {
             blocked_keys,
         };
         if self.last_repository_refresh_schedule.as_ref() != Some(&schedule) {
+            diagnostics::repository_refresh_trace(
+                "schedule.update",
+                &format!(
+                    "repositories={} active_interval_s={} inactive_interval_s={} blocked={}",
+                    schedule.repositories.len(),
+                    schedule.active_interval.as_secs(),
+                    schedule.inactive_interval.as_secs(),
+                    schedule.blocked_keys.len()
+                ),
+            );
             self.repository_refresh_scheduler
                 .update_schedule(schedule.clone());
             self.last_repository_refresh_schedule = Some(schedule);
@@ -6875,6 +7042,21 @@ impl GitAgentApp {
 
     fn poll_tasks(&mut self, ctx: &egui::Context) {
         let mut repository_load_activity = false;
+        if let Some(receiver) = self.workspace_repository_status_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(status))) => {
+                    self.workspace_repository_statuses
+                        .insert(repo_state_key(&root), status);
+                    ctx.request_repaint();
+                }
+                Ok((_, Err(_))) | Err(mpsc::TryRecvError::Disconnected) => {
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.workspace_repository_status_task = Some(receiver);
+                }
+            }
+        }
         let mut repo_results = Vec::new();
         while let Ok(result) = self.automatic_repository_refresh_results.try_recv() {
             repo_results.push(result);
@@ -8563,9 +8745,16 @@ impl App for GitAgentApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let primary_down = ctx.input(|input| input.pointer.primary_down());
-        self.remember_window_size(ctx, primary_down);
         if !self.request_native_window_resize_on_pointer_down(ctx) {
             self.request_native_title_drag_on_pointer_down(ctx);
+        }
+        self.remember_window_size(ctx, primary_down);
+        if !primary_down {
+            let outer_min = ctx
+                .input(|input| input.viewport().outer_rect.map(|rect| rect.min))
+                .unwrap_or(Pos2::ZERO);
+            diagnostics::record_window_drag_release_position(outer_min.x, outer_min.y);
+            diagnostics::flush_window_drag_probe();
         }
         self.update_window_resize_cursor(ctx);
         theme::apply_if_needed(ctx, self.theme_mode, self.theme_accent);
@@ -9467,8 +9656,13 @@ impl GitAgentApp {
             ctx.set_cursor_icon(resize_cursor_icon(direction));
             return;
         }
-        let drag_rect = current_title_drag_rect(ctx.screen_rect());
-        if drag_rect.contains(pointer_pos) {
+        let screen = ctx.screen_rect();
+        let pixels_per_point = ctx.pixels_per_point();
+        if self.title_bar_hit_map.is_some_and(|hit_map| {
+            hit_map.candidate.contains(pointer_pos)
+                && hit_map.hit(screen, pixels_per_point, self.language, pointer_pos)
+                    == TitleBarDragHit::Drag
+        }) {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
         }
     }
@@ -9491,13 +9685,40 @@ impl GitAgentApp {
         };
 
         let screen = ctx.screen_rect();
-        let title_row = Rect::from_min_max(
-            screen.left_top(),
-            Pos2::new(screen.right(), screen.top() + TITLE_BAR_HEIGHT),
-        );
-        let drag_rect = current_title_drag_rect(screen);
-        if drag_rect.contains(pointer_pos) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        let title_row = title_row_rect(screen);
+        let candidate = title_drag_candidate_rect(title_row);
+        if candidate.contains(pointer_pos) {
+            let hit = self
+                .title_bar_hit_map
+                .map(|hit_map| {
+                    hit_map.hit(screen, ctx.pixels_per_point(), self.language, pointer_pos)
+                })
+                .unwrap_or(TitleBarDragHit::StaleMap);
+            let outer_min = ctx
+                .input(|input| input.viewport().outer_rect.map(|rect| rect.min))
+                .unwrap_or(Pos2::ZERO);
+            let (menu_controls_right, window_controls_left) = self
+                .title_bar_hit_map
+                .map(|hit_map| {
+                    (
+                        hit_map.menu_controls.right(),
+                        hit_map.window_controls.left(),
+                    )
+                })
+                .unwrap_or((candidate.left(), candidate.right()));
+            diagnostics::record_window_drag_probe(
+                pointer_pos.x,
+                pointer_pos.y,
+                hit.probe_code(),
+                screen.width(),
+                menu_controls_right,
+                window_controls_left,
+                outer_min.x,
+                outer_min.y,
+            );
+            if hit == TitleBarDragHit::Drag {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
             return;
         }
 
@@ -9512,6 +9733,19 @@ impl GitAgentApp {
                 Pos2::new(screen.right(), tab_strip_row.top()),
             );
             if title_gap_drag_rect.contains(pointer_pos) {
+                let outer_min = ctx
+                    .input(|input| input.viewport().outer_rect.map(|rect| rect.min))
+                    .unwrap_or(Pos2::ZERO);
+                diagnostics::record_window_drag_probe(
+                    pointer_pos.x,
+                    pointer_pos.y,
+                    5,
+                    screen.width(),
+                    title_gap_drag_rect.left(),
+                    title_gap_drag_rect.right(),
+                    outer_min.x,
+                    outer_min.y,
+                );
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 return;
             }
@@ -9529,50 +9763,83 @@ impl GitAgentApp {
         ui.painter()
             .rect_filled(rect, window_top_corner_radius(ctx), theme::panel());
 
-        let controls_width = 128.0;
+        // The whole title row is the retained drag candidate. Foreground controls are registered
+        // afterwards and are also captured into the native hit map used at the start of the next
+        // frame, before any expensive layout work can delay StartDrag.
+        let drag_rect = title_drag_candidate_rect(rect);
+        let drag_response = self.top_bar_drag_region(ui, drag_rect, "custom_title_drag_region");
+        let mut menu_control_rects = None;
+        let mut window_control_rects = None;
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.horizontal_centered(|ui| {
                 ui.add_space(8.0);
                 app_title_logo(ui);
-                self.desktop_menu_bar(ui, has_repo, has_remote);
+                if let Some(menu_rect) = self.desktop_menu_bar(ui, has_repo, has_remote) {
+                    include_rect(&mut menu_control_rects, menu_rect);
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(8.0);
-                    if window_control_button(ui, "\u{00d7}", true).clicked() {
+                    let close = window_control_button(ui, "\u{00d7}", true);
+                    include_rect(&mut window_control_rects, close.rect);
+                    if close.clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-                    if window_control_button(
+                    let maximize = window_control_button(
                         ui,
                         if maximized { "\u{2750}" } else { "\u{25a1}" },
                         false,
-                    )
-                    .clicked()
-                    {
+                    );
+                    include_rect(&mut window_control_rects, maximize.rect);
+                    if maximize.clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                     }
-                    if window_control_button(ui, "\u{2212}", false).clicked() {
+                    let minimize = window_control_button(ui, "\u{2212}", false);
+                    include_rect(&mut window_control_rects, minimize.rect);
+                    if minimize.clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
                 });
             });
         });
 
-        // Register the blank title-space interaction after its child controls. Egui resolves
-        // overlapping hit targets by paint order; this keeps the empty space reliably draggable
-        // while the larger menu reservation prevents it from covering menu buttons.
-        let drag_rect = custom_title_drag_rect(rect, controls_width);
-        if self.title_drag_layer != Some(drag_rect) {
-            self.title_drag_layer = Some(drag_rect);
-        }
-        let drag_response = self.top_bar_drag_region(ui, drag_rect, "custom_title_drag_region");
+        let menu_controls = menu_control_rects.unwrap_or(Rect::from_min_max(
+            Pos2::new(rect.left(), rect.top()),
+            Pos2::new(rect.left(), rect.bottom()),
+        ));
+        let menu_controls = Rect::from_min_max(
+            Pos2::new(
+                (menu_controls.left() - TITLE_CONTROL_EXCLUSION_PADDING).max(rect.left()),
+                rect.top(),
+            ),
+            Pos2::new(
+                (menu_controls.right() + TITLE_CONTROL_EXCLUSION_PADDING).min(rect.right()),
+                rect.bottom(),
+            ),
+        );
+        let window_controls_left = window_control_rects
+            .map(|controls: Rect| controls.left() - TITLE_CONTROL_EXCLUSION_PADDING)
+            .unwrap_or(rect.right());
+        self.title_bar_hit_map = Some(TitleBarHitMap {
+            screen: ctx.screen_rect(),
+            pixels_per_point: ctx.pixels_per_point(),
+            language: self.language,
+            candidate: drag_rect,
+            menu_controls,
+            window_controls: Rect::from_min_max(
+                Pos2::new(window_controls_left.max(rect.left()), rect.top()),
+                rect.right_bottom(),
+            ),
+        });
         if drag_response.double_clicked() {
             let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
         }
     }
 
-    fn desktop_menu_bar(&mut self, ui: &mut Ui, has_repo: bool, has_remote: bool) {
+    fn desktop_menu_bar(&mut self, ui: &mut Ui, has_repo: bool, has_remote: bool) -> Option<Rect> {
         let requested_top_menu = self.requested_top_menu.take();
+        let mut menu_rect = None;
         let repo_action_busy = self.loading_repo || self.remote_git_busy();
         let repo_action_enabled = !repo_action_busy && has_repo;
         let remote_action_enabled = repo_action_enabled && has_remote;
@@ -9592,6 +9859,7 @@ impl GitAgentApp {
             ui.add_space(8.0);
             top_menu_button(
                 ui,
+                &mut menu_rect,
                 menu_label(self.language, "file"),
                 requested_top_menu == Some(TopMenu::File),
                 |ui| {
@@ -9609,6 +9877,7 @@ impl GitAgentApp {
             );
             top_menu_button(
                 ui,
+                &mut menu_rect,
                 menu_label(self.language, "view"),
                 requested_top_menu == Some(TopMenu::View),
                 |ui| {
@@ -9698,6 +9967,7 @@ impl GitAgentApp {
             );
             top_menu_button(
                 ui,
+                &mut menu_rect,
                 menu_label(self.language, "repo"),
                 requested_top_menu == Some(TopMenu::Repository),
                 |ui| {
@@ -10055,6 +10325,7 @@ impl GitAgentApp {
             );
             top_menu_button(
                 ui,
+                &mut menu_rect,
                 menu_label(self.language, "actions"),
                 requested_top_menu == Some(TopMenu::Actions),
                 |ui| {
@@ -10331,6 +10602,7 @@ impl GitAgentApp {
             );
             top_menu_button(
                 ui,
+                &mut menu_rect,
                 menu_label(self.language, "tools"),
                 requested_top_menu == Some(TopMenu::Tools),
                 |ui| {
@@ -10370,6 +10642,7 @@ impl GitAgentApp {
             );
             top_menu_button(
                 ui,
+                &mut menu_rect,
                 menu_label(self.language, "help"),
                 requested_top_menu == Some(TopMenu::Help),
                 |ui| {
@@ -10391,6 +10664,7 @@ impl GitAgentApp {
                 },
             );
         });
+        menu_rect
     }
 
     fn top_bar_panel(&mut self, ctx: &egui::Context, ui: &mut Ui) {
@@ -11040,11 +11314,15 @@ impl GitAgentApp {
                         );
                         let repository = &repositories[index];
                         let snapshot = self.workspace_repository_snapshot_for(&repository.root);
+                        let quick_status = self
+                            .workspace_repository_statuses
+                            .get(&repo_state_key(&repository.root));
                         if workspace_repository_status_row(
                             ui,
                             row_rect,
                             repository,
                             snapshot,
+                            quick_status,
                             self.language,
                         )
                         .clicked()
@@ -11117,7 +11395,13 @@ impl GitAgentApp {
 
     fn workspace_repository_has_unstaged(&self, root: &Path) -> bool {
         self.workspace_repository_snapshot_for(root)
-            .is_some_and(|snapshot| !snapshot.unstaged.is_empty())
+            .map(|snapshot| !snapshot.unstaged.is_empty())
+            .or_else(|| {
+                self.workspace_repository_statuses
+                    .get(&repo_state_key(root))
+                    .map(|status| status.unstaged_count > 0)
+            })
+            .unwrap_or(false)
     }
 
     fn maybe_start_workspace_repository_status_load(
@@ -11125,7 +11409,9 @@ impl GitAgentApp {
         repositories: &[KnownRepository],
     ) -> bool {
         let now = Instant::now();
-        if now < self.next_workspace_repo_status_load_at || !self.repo_tasks.is_empty() {
+        if now < self.next_workspace_repo_status_load_at
+            || self.workspace_repository_status_task.is_some()
+        {
             return false;
         }
         let path = repositories
@@ -11133,14 +11419,27 @@ impl GitAgentApp {
             .filter(|repository| {
                 self.workspace_repository_snapshot_for(&repository.root)
                     .is_none()
+                    && !self
+                        .workspace_repository_statuses
+                        .contains_key(&repo_state_key(&repository.root))
+                    && !self
+                        .workspace_repository_status_attempted
+                        .contains(&repo_state_key(&repository.root))
             })
             .map(|repository| repository.root.clone())
-            .find(|path| !self.repo_tasks.contains_key(&repo_state_key(path)));
+            .next();
         let Some(path) = path else {
             return false;
         };
         self.next_workspace_repo_status_load_at = now + Duration::from_millis(250);
-        self.start_repository_snapshot_load(path);
+        self.workspace_repository_status_attempted
+            .insert(repo_state_key(&path));
+        let (sender, receiver) = mpsc::channel();
+        self.workspace_repository_status_task = Some(receiver);
+        thread::spawn(move || {
+            let result = git::repository_refresh_fingerprint(&path);
+            let _ = sender.send((path, result));
+        });
         true
     }
 
@@ -11501,6 +11800,14 @@ impl GitAgentApp {
 
         ui.horizontal(|ui| {
             ui.add_space(12.0);
+            let (display_toggle_icon, display_toggle_label) = match self.worktree_display_mode {
+                WorktreeDisplayMode::Flat => (UiIcon::TreeView, self.tr("worktree.view_tree")),
+                WorktreeDisplayMode::Tree => (UiIcon::FullPath, self.tr("worktree.view_flat")),
+            };
+            if worktree_display_mode_button(ui, display_toggle_icon, display_toggle_label).clicked()
+            {
+                self.worktree_display_mode = self.worktree_display_mode.toggle();
+            }
             ui.label(
                 RichText::new(self.tr("worktree.title"))
                     .size(WORKSPACE_HEADER_TITLE_SIZE)
@@ -11513,13 +11820,6 @@ impl GitAgentApp {
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(12.0);
-                let display_toggle_label = match self.worktree_display_mode {
-                    WorktreeDisplayMode::Flat => self.tr("worktree.view_tree"),
-                    WorktreeDisplayMode::Tree => self.tr("worktree.view_flat"),
-                };
-                if worktree_header_action_button(ui, None, display_toggle_label, true).clicked() {
-                    self.worktree_display_mode = self.worktree_display_mode.toggle();
-                }
                 if let Some(conflict_file) = selected_or_first_conflict(
                     &conflict_files,
                     self.selected_worktree_file.as_ref(),
@@ -13308,6 +13608,11 @@ impl GitAgentApp {
                 let message_hint = placeholder_for_label(self.language, self.tr("commit.message"));
                 let message_height = commit_message_editor_height(ui.available_height());
                 let commit_message_input = ui.make_persistent_id("commit_message_input");
+                guard_commit_message_ime_enter(
+                    ui,
+                    commit_message_input,
+                    &mut self.commit_message_ime_composing,
+                );
                 let message_response = commit_message_editor_ui(
                     ui,
                     &mut self.commit_message,
@@ -20824,6 +21129,10 @@ enum UiIcon {
     Tag,
     Stash,
     Folder,
+    FolderClosed,
+    FolderOpen,
+    TreeView,
+    FullPath,
     Refresh,
     Settings,
     Plus,
@@ -21740,6 +22049,54 @@ fn commit_message_text_edit<'a>(message: &'a mut String, id: egui::Id, hint: &st
         .frame(false)
 }
 
+fn guard_commit_message_ime_enter(ui: &mut Ui, editor_id: egui::Id, ime_composing: &mut bool) {
+    if !ui.memory(|memory| memory.has_focus(editor_id)) {
+        *ime_composing = false;
+        return;
+    }
+
+    ui.input_mut(|input| {
+        filter_plain_enter_during_ime(&mut input.events, ime_composing);
+    });
+}
+
+fn filter_plain_enter_during_ime(events: &mut Vec<egui::Event>, ime_composing: &mut bool) {
+    let was_composing = *ime_composing;
+    let frame_has_composition = events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Ime(egui::ImeEvent::Preedit(_) | egui::ImeEvent::Commit(_))
+        )
+    });
+
+    for event in events.iter() {
+        match event {
+            egui::Event::Ime(egui::ImeEvent::Preedit(_)) => *ime_composing = true,
+            egui::Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => {
+                *ime_composing = false;
+            }
+            _ => {}
+        }
+    }
+
+    // Windows can deliver the Enter key event used to confirm an IME composition
+    // in the same input batch as (or just before) the IME commit event. egui 0.31's
+    // multiline TextEdit otherwise treats that Enter as a newline, replacing the
+    // preedit selection before the committed text is applied.
+    if was_composing || frame_has_composition {
+        events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    modifiers: egui::Modifiers::NONE,
+                    ..
+                }
+            )
+        });
+    }
+}
+
 fn commit_message_editor_ui(
     ui: &mut Ui,
     message: &mut String,
@@ -22030,6 +22387,10 @@ fn icon_source(icon: UiIcon) -> egui::ImageSource<'static> {
         UiIcon::Tag => egui::include_image!("../assets/icons/tag.svg"),
         UiIcon::Stash => egui::include_image!("../assets/icons/stash.svg"),
         UiIcon::Folder => egui::include_image!("../assets/icons/folder.svg"),
+        UiIcon::FolderClosed => egui::include_image!("../assets/icons/folder-closed.svg"),
+        UiIcon::FolderOpen => egui::include_image!("../assets/icons/folder-open.svg"),
+        UiIcon::TreeView => egui::include_image!("../assets/icons/tree-view.svg"),
+        UiIcon::FullPath => egui::include_image!("../assets/icons/full-path.svg"),
         UiIcon::Refresh => egui::include_image!("../assets/icons/refresh.svg"),
         UiIcon::Settings => egui::include_image!("../assets/icons/settings.svg"),
         UiIcon::Plus => egui::include_image!("../assets/icons/plus.svg"),
@@ -22120,6 +22481,7 @@ fn top_menu_accelerator_pressed(ctx: &egui::Context) -> Option<TopMenu> {
 
 fn top_menu_button(
     ui: &mut Ui,
+    menu_rect: &mut Option<Rect>,
     label: &'static str,
     force_open: bool,
     add_contents: impl FnOnce(&mut Ui),
@@ -22146,6 +22508,7 @@ fn top_menu_button(
                 .corner_radius(CornerRadius::same(4)),
         );
         let response = pointing_hand_cursor(response);
+        include_rect(menu_rect, response.rect);
         if response.clicked() {
             ui.memory_mut(|memory| memory.toggle_popup(popup_id));
         }
@@ -25758,6 +26121,7 @@ fn workspace_repository_status_row(
     rect: Rect,
     repository: &KnownRepository,
     snapshot: Option<&RepositorySnapshot>,
+    quick_status: Option<&git::RepositoryRefreshFingerprint>,
     language: Language,
 ) -> egui::Response {
     let response = ui.interact(
@@ -25829,6 +26193,22 @@ fn workspace_repository_status_row(
             branch_rect,
             &snapshot.branch,
             upstream_sync_counts(Some(snapshot)),
+        );
+    } else if let Some(status) = quick_status {
+        workspace_repository_unstaged_badge_line(
+            ui,
+            name_rect,
+            &repository.name,
+            status.unstaged_count,
+        );
+        workspace_repository_branch_sync_line(
+            ui,
+            branch_rect,
+            &status.branch,
+            UpstreamSyncCounts {
+                ahead: status.ahead,
+                behind: status.behind,
+            },
         );
     } else {
         workspace_repository_path_text_line(
@@ -26986,6 +27366,38 @@ fn worktree_header_action_button(
     } else {
         response
     }
+}
+
+fn worktree_display_mode_button(ui: &mut Ui, icon: UiIcon, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    let raised = response.hovered() && !response.is_pointer_button_down_on();
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(4),
+        if raised {
+            theme::panel()
+        } else {
+            theme::panel_recessed()
+        },
+    );
+    if raised {
+        ui.painter().rect_filled(
+            rect.shrink(2.0),
+            CornerRadius::same(3),
+            theme::accent_soft(),
+        );
+        paint_text_button_hover_shadow(ui, rect);
+    } else {
+        paint_recessed_control_shadow(ui, rect);
+    }
+    // Optical alignment: these line icons sit slightly high inside their viewBox.
+    // Move the glyph down while keeping the hit target aligned with the title row.
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(rect.center().x, rect.center().y + 1.5),
+        Vec2::splat(14.0),
+    );
+    paint_ui_icon(ui, icon_rect, icon, theme::text());
+    pointing_hand_cursor(response).on_hover_text(tooltip)
 }
 
 fn conflict_resolution_dialog_background() -> Color32 {
@@ -28871,14 +29283,19 @@ fn worktree_directory_row(
         );
     }
     let indent = FILE_ROW_LEFT_INSET + depth as f32 * 16.0;
-    draw_clipped_cell(
+    let folder_rect = Rect::from_center_size(
+        Pos2::new(rect.left() + indent + 7.0, rect.center().y),
+        Vec2::splat(14.0),
+    );
+    paint_ui_icon(
         ui,
-        rect.left() + indent,
-        rect.center().y,
-        14.0,
-        if collapsed { ">" } else { "v" },
+        folder_rect,
+        if collapsed {
+            UiIcon::FolderClosed
+        } else {
+            UiIcon::FolderOpen
+        },
         theme::muted(),
-        true,
     );
     draw_clipped_cell(
         ui,
@@ -33619,10 +34036,13 @@ mod ui_tests {
             .unwrap();
         let title_bar_source = &source[title_bar_start..title_bar_start + title_bar_end];
         assert!(title_bar_source.contains("app_title_logo(ui);"));
-        assert!(title_bar_source.contains("self.desktop_menu_bar(ui, has_repo, has_remote);"));
-        assert!(title_bar_source.contains("custom_title_drag_rect(rect, controls_width)"));
+        assert!(title_bar_source.contains("self.desktop_menu_bar(ui, has_repo, has_remote)"));
+        assert!(title_bar_source.contains("title_drag_candidate_rect(rect)"));
+        assert!(title_bar_source.contains("self.title_bar_hit_map = Some(TitleBarHitMap"));
         assert!(title_bar_source.contains("window_top_corner_radius(ctx)"));
-        assert!(source.contains("TITLE_MENU_RESERVED_WIDTH"));
+        assert!(
+            !source[..source.find("#[cfg(test)]").unwrap()].contains("TITLE_MENU_RESERVED_WIDTH")
+        );
         assert!(!title_bar_source.contains("RichText::new(\"Git Agent\")"));
         assert!(top_bar_source.contains("let tool_row_panel_rect = (!source_active).then(|| {"));
         assert!(top_bar_source.contains("Rect::from_min_max("));
@@ -34041,6 +34461,45 @@ mod ui_tests {
         assert!(implementation_source.contains("WorktreeSelectionState"));
         assert!(implementation_source.contains("input.modifiers.ctrl"));
         assert!(implementation_source.contains("input.modifiers.shift"));
+    }
+
+    #[test]
+    fn worktree_view_toggle_is_icon_only_and_tree_directories_use_folder_states() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let workspace_start = implementation_source.find("fn workspace_view(").unwrap();
+        let workspace_end = implementation_source[workspace_start..]
+            .find("fn workspace_main_panel(")
+            .unwrap();
+        let workspace_source =
+            &implementation_source[workspace_start..workspace_start + workspace_end];
+        let directory_start = implementation_source
+            .find("fn worktree_directory_row(")
+            .unwrap();
+        let directory_end = implementation_source[directory_start..]
+            .find("fn worktree_file_row(")
+            .unwrap();
+        let directory_source =
+            &implementation_source[directory_start..directory_start + directory_end];
+
+        assert!(workspace_source.contains("UiIcon::TreeView"));
+        assert!(workspace_source.contains("UiIcon::FullPath"));
+        assert!(workspace_source.contains("worktree_display_mode_button("));
+        assert!(directory_source.contains("UiIcon::FolderClosed"));
+        assert!(directory_source.contains("UiIcon::FolderOpen"));
+        assert!(!directory_source.contains("if collapsed { \">\" } else { \"v\" }"));
+        let toggle_start = implementation_source
+            .find("fn worktree_display_mode_button(")
+            .unwrap();
+        let toggle_end = implementation_source[toggle_start..]
+            .find("fn conflict_resolution_dialog_background(")
+            .unwrap();
+        let toggle_source = &implementation_source[toggle_start..toggle_start + toggle_end];
+        assert!(toggle_source.contains("theme::panel_recessed()"));
+        assert!(toggle_source.contains("paint_recessed_control_shadow(ui, rect)"));
+        assert!(toggle_source.contains("paint_text_button_hover_shadow(ui, rect)"));
+        assert!(toggle_source.contains("!response.is_pointer_button_down_on()"));
+        assert!(toggle_source.contains("rect.center().y + 1.5"));
     }
 
     #[test]
@@ -36268,18 +36727,53 @@ mod ui_tests {
     }
 
     #[test]
-    fn title_drag_rect_reserves_menu_and_resize_edge() {
+    fn title_drag_candidate_covers_the_row_below_resize_edge_and_hit_map_excludes_controls() {
         let title_bar =
             Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(900.0, TITLE_BAR_HEIGHT));
-        let drag = custom_title_drag_rect(title_bar, 128.0);
+        let drag = title_drag_candidate_rect(title_bar);
 
-        assert_eq!(TITLE_MENU_RESERVED_WIDTH, 500.0);
         assert_eq!(TITLE_DRAG_TOP_INSET, WINDOW_RESIZE_BORDER + 1.0);
-        assert_eq!(drag.left(), title_bar.left() + TITLE_MENU_RESERVED_WIDTH);
-        assert_eq!(drag.right(), title_bar.right() - 128.0);
+        assert_eq!(drag.left(), title_bar.left());
+        assert_eq!(drag.right(), title_bar.right());
         assert_eq!(drag.bottom(), title_bar.bottom());
         assert_eq!(drag.top(), title_bar.top() + TITLE_DRAG_TOP_INSET);
         assert!(!drag.contains(title_bar.left_top()));
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let hit_map = TitleBarHitMap {
+            screen,
+            pixels_per_point: 1.25,
+            language: Language::Chinese,
+            candidate: title_drag_candidate_rect(title_row_rect(screen)),
+            menu_controls: Rect::from_min_max(
+                Pos2::new(80.0, 0.0),
+                Pos2::new(390.0, TITLE_BAR_HEIGHT),
+            ),
+            window_controls: Rect::from_min_max(
+                Pos2::new(770.0, 0.0),
+                Pos2::new(900.0, TITLE_BAR_HEIGHT),
+            ),
+        };
+        assert_eq!(
+            hit_map.hit(screen, 1.25, Language::Chinese, Pos2::new(30.0, 20.0)),
+            TitleBarDragHit::Drag
+        );
+        assert_eq!(
+            hit_map.hit(screen, 1.25, Language::Chinese, Pos2::new(100.0, 20.0)),
+            TitleBarDragHit::MenuControls
+        );
+        assert_eq!(
+            hit_map.hit(screen, 1.25, Language::Chinese, Pos2::new(500.0, 20.0)),
+            TitleBarDragHit::Drag
+        );
+        assert_eq!(
+            hit_map.hit(screen, 1.25, Language::Chinese, Pos2::new(850.0, 20.0)),
+            TitleBarDragHit::WindowControls
+        );
+        assert_eq!(
+            hit_map.hit(screen, 1.5, Language::Chinese, Pos2::new(500.0, 20.0)),
+            TitleBarDragHit::StaleMap
+        );
     }
 
     #[test]
@@ -36312,7 +36806,7 @@ mod ui_tests {
         assert!(!top_bar_source.contains("tab_left.contains(pos)"));
         assert!(!top_bar_source.contains("tab_right.contains(pos)"));
         assert!(!drag_source.contains("drag-region"));
-        assert!(implementation_source.contains("fn custom_title_drag_rect("));
+        assert!(implementation_source.contains("fn title_drag_candidate_rect("));
         assert!(implementation_source.contains("TITLE_DRAG_TOP_INSET"));
         assert!(!implementation_source.contains("fn top_bar_press_drag_region("));
         assert!(top_bar_source.contains("source_title_gap_drag_region"));
@@ -36323,13 +36817,13 @@ mod ui_tests {
         );
         assert!(title_bar_source.contains("max_rect(rect)"));
         assert!(
-            title_bar_source.find("ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect)")
-                < title_bar_source
-                    .find("top_bar_drag_region(ui, drag_rect, \"custom_title_drag_region\")")
+            title_bar_source
+                .find("top_bar_drag_region(ui, drag_rect, \"custom_title_drag_region\")")
+                < title_bar_source.find("ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect)")
         );
-        assert!(!implementation_source.contains("diagnostics::window_drag_probe("));
-        assert!(!implementation_source.contains("diagnostics::flush_window_drag_probes("));
-        assert!(implementation_source.contains("title_drag_layer: Option<Rect>"));
+        assert!(implementation_source.contains("diagnostics::record_window_drag_probe("));
+        assert!(implementation_source.contains("diagnostics::flush_window_drag_probe();"));
+        assert!(implementation_source.contains("title_bar_hit_map: Option<TitleBarHitMap>"));
         assert!(top_bar_source.contains("top_bar_drag_region("));
         assert!(!top_bar_source.contains("top_bar_press_drag_region("));
     }
@@ -36383,7 +36877,7 @@ mod ui_tests {
 
         assert!(drag_source.contains("ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);"));
         assert!(drag_source.contains(".primary_pressed()"));
-        assert!(implementation_source.contains("title_drag_layer: Option<Rect>"));
+        assert!(implementation_source.contains("title_bar_hit_map: Option<TitleBarHitMap>"));
         assert!(drag_source.contains("drag_rect.contains(pointer_pos)"));
         assert!(!update_source.contains("if self.window_drag_requested_this_frame"));
         assert!(
@@ -36392,8 +36886,8 @@ mod ui_tests {
                 .unwrap()
                 < update_source.find("theme::apply_if_needed(").unwrap()
         );
-        assert!(!implementation_source.contains("diagnostics::record_window_drag_probe("));
-        assert!(!implementation_source.contains("diagnostics::flush_window_drag_probe();"));
+        assert!(implementation_source.contains("diagnostics::record_window_drag_probe("));
+        assert!(implementation_source.contains("diagnostics::flush_window_drag_probe();"));
         assert!(update_source.contains("egui::CentralPanel::default()"));
     }
 
@@ -37066,6 +37560,53 @@ mod ui_tests {
         assert!(panel_source.contains("self.commit_current_message(staged_count)"));
         assert!(panel_source.contains("toggle_push_immediately"));
         assert!(panel_source.contains("toggle_amend"));
+    }
+
+    #[test]
+    fn commit_message_ime_confirmation_does_not_become_a_newline() {
+        let mut composing = false;
+        let mut preedit_events = vec![egui::Event::Ime(egui::ImeEvent::Preedit("d".to_owned()))];
+        filter_plain_enter_during_ime(&mut preedit_events, &mut composing);
+        assert!(composing);
+
+        let mut confirmation_events = vec![
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Ime(egui::ImeEvent::Commit("d".to_owned())),
+        ];
+        filter_plain_enter_during_ime(&mut confirmation_events, &mut composing);
+
+        assert!(!composing);
+        assert_eq!(
+            confirmation_events,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("d".to_owned()))]
+        );
+    }
+
+    #[test]
+    fn commit_message_ime_guard_preserves_regular_and_shortcut_enter() {
+        let enter = |modifiers| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+
+        let mut composing = false;
+        let mut regular_events = vec![enter(egui::Modifiers::NONE)];
+        filter_plain_enter_during_ime(&mut regular_events, &mut composing);
+        assert_eq!(regular_events.len(), 1);
+
+        composing = true;
+        let mut shortcut_events = vec![enter(egui::Modifiers::CTRL)];
+        filter_plain_enter_during_ime(&mut shortcut_events, &mut composing);
+        assert_eq!(shortcut_events.len(), 1);
     }
 
     #[test]
@@ -44453,6 +44994,9 @@ diff --git a/file.txt b/file.txt
         assert!(implementation_source.contains("RepositoryRefreshPriority::Background"));
         assert!(implementation_source.contains("RepositoryRefreshPriority::Foreground"));
         assert!(implementation_source.contains("next_repository_refresh_request_index"));
+        assert!(implementation_source.contains("probe_before_full_refresh: true"));
+        assert!(implementation_source.contains("git::repository_refresh_fingerprint"));
+        assert!(implementation_source.contains("interval.mul_f64("));
         assert!(refresh_source.contains("self.remote_git_root.as_deref()"));
         assert!(refresh_source.contains("self.branch_checkout_root.as_deref()"));
         assert!(!refresh_source.contains("self.start_foreground_repository_snapshot_load"));
@@ -44473,6 +45017,7 @@ diff --git a/file.txt b/file.txt
                 path: PathBuf::from("background-repository"),
                 key: "background-repository".to_owned(),
                 priority: RepositoryRefreshPriority::Background,
+                probe_before_full_refresh: true,
                 result_sender: result_sender.clone(),
             },
         );
@@ -44482,6 +45027,7 @@ diff --git a/file.txt b/file.txt
                 path: PathBuf::from("foreground-repository"),
                 key: "foreground-repository".to_owned(),
                 priority: RepositoryRefreshPriority::Foreground,
+                probe_before_full_refresh: false,
                 result_sender: result_sender.clone(),
             },
         );
@@ -44491,6 +45037,7 @@ diff --git a/file.txt b/file.txt
                 path: PathBuf::from("background-repository"),
                 key: "background-repository".to_owned(),
                 priority: RepositoryRefreshPriority::Foreground,
+                probe_before_full_refresh: false,
                 result_sender,
             },
         );
@@ -44508,6 +45055,55 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
+    fn repository_refresh_schedule_staggers_inactive_repositories() {
+        let repositories = (0..3)
+            .map(|index| ScheduledRepositoryRefresh {
+                path: PathBuf::from(format!("repository-{index}")),
+                key: format!("repository-{index}"),
+                active: false,
+                fingerprint: None,
+            })
+            .chain(std::iter::once(ScheduledRepositoryRefresh {
+                path: PathBuf::from("active-repository"),
+                key: "active-repository".to_owned(),
+                active: true,
+                fingerprint: None,
+            }))
+            .collect();
+        let mut scheduled = HashMap::new();
+        let mut pending = Vec::new();
+        let mut pending_exclusive = Vec::new();
+        let mut exclusive = HashSet::new();
+        let mut blocked = HashSet::new();
+        let mut active_interval = Duration::from_secs(20);
+        let mut inactive_interval = Duration::from_secs(60);
+
+        apply_repository_refresh_scheduler_command(
+            RepositoryRefreshSchedulerCommand::UpdateSchedule {
+                repositories,
+                active_interval,
+                inactive_interval,
+                blocked_keys: HashSet::new(),
+            },
+            &mut scheduled,
+            &mut pending,
+            &mut pending_exclusive,
+            &mut exclusive,
+            &mut blocked,
+            &mut active_interval,
+            &mut inactive_interval,
+        );
+
+        let first = scheduled["repository-0"].next_refresh_at;
+        let second = scheduled["repository-1"].next_refresh_at;
+        let third = scheduled["repository-2"].next_refresh_at;
+        assert_eq!(second.duration_since(first), Duration::from_secs(20));
+        assert_eq!(third.duration_since(second), Duration::from_secs(20));
+        assert!(scheduled["active-repository"].next_refresh_at > first);
+        assert!(scheduled["active-repository"].next_refresh_at < second);
+    }
+
+    #[test]
     fn foreground_refresh_waits_for_exclusive_then_bypasses_background_pause() {
         let (result_sender, _result_receiver) = mpsc::channel::<RepoTaskResult>();
         let repository_key = "repository-after-checkout".to_owned();
@@ -44515,6 +45111,7 @@ diff --git a/file.txt b/file.txt
             path: PathBuf::from(&repository_key),
             key: repository_key.clone(),
             priority: RepositoryRefreshPriority::Foreground,
+            probe_before_full_refresh: false,
             result_sender: result_sender.clone(),
         }];
         let background_blocked = HashSet::from([repository_key.clone()]);
@@ -44535,6 +45132,7 @@ diff --git a/file.txt b/file.txt
             path: PathBuf::from(&repository_key),
             key: repository_key,
             priority: RepositoryRefreshPriority::Background,
+            probe_before_full_refresh: true,
             result_sender,
         }];
         assert_eq!(
@@ -44590,7 +45188,7 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
-    fn workspace_status_loader_does_not_queue_behind_repository_snapshot_work() {
+    fn workspace_status_loader_uses_one_lightweight_git_probe() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let start = implementation_source
@@ -44601,7 +45199,10 @@ diff --git a/file.txt b/file.txt
             .unwrap();
         let loader_source = &implementation_source[start..start + end];
 
-        assert!(loader_source.contains("!self.repo_tasks.is_empty()"));
+        assert!(loader_source.contains("workspace_repository_status_task.is_some()"));
+        assert!(loader_source.contains("git::repository_refresh_fingerprint(&path)"));
+        assert!(!loader_source.contains("start_repository_snapshot_load"));
+        assert!(!loader_source.contains("git::open_repository_core"));
     }
 
     #[test]

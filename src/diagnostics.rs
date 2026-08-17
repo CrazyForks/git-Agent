@@ -16,6 +16,19 @@ static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_TRACE_ID: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_EXPIRES_MS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_FLUSHED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_PRESSED_MS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_X_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_Y_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_DECISION: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_SCREEN_WIDTH_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_MENU_CONTROLS_RIGHT_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_WINDOW_CONTROLS_LEFT_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_START_OUTER_X_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_START_OUTER_Y_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_RELEASE_OUTER_X_BITS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_DRAG_RELEASE_OUTER_Y_BITS: AtomicU64 = AtomicU64::new(0);
 
 pub struct TraceSpan {
     event: &'static str,
@@ -88,8 +101,112 @@ pub fn branch_switch_log_path() -> PathBuf {
     daily_log_path("branch-switch")
 }
 
+/// Temporary title-bar diagnostics requested for interactive validation. The press path performs
+/// atomic stores only. Formatting, locking, and file I/O happen after the primary button is up.
+#[allow(clippy::too_many_arguments)]
+pub fn record_window_drag_probe(
+    x: f32,
+    y: f32,
+    decision: u8,
+    screen_width: f32,
+    menu_controls_right: f32,
+    window_controls_left: f32,
+    outer_x: f32,
+    outer_y: f32,
+) {
+    WINDOW_DRAG_PRESSED_MS.store(epoch_ms(), Ordering::Relaxed);
+    WINDOW_DRAG_X_BITS.store(x.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_Y_BITS.store(y.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_DECISION.store(decision as u64, Ordering::Relaxed);
+    WINDOW_DRAG_SCREEN_WIDTH_BITS.store(screen_width.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_MENU_CONTROLS_RIGHT_BITS
+        .store(menu_controls_right.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_WINDOW_CONTROLS_LEFT_BITS
+        .store(window_controls_left.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_START_OUTER_X_BITS.store(outer_x.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_START_OUTER_Y_BITS.store(outer_y.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_RELEASE_OUTER_X_BITS.store(outer_x.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_RELEASE_OUTER_Y_BITS.store(outer_y.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_SEQUENCE.fetch_add(1, Ordering::Release);
+}
+
+pub fn record_window_drag_release_position(outer_x: f32, outer_y: f32) {
+    if WINDOW_DRAG_SEQUENCE.load(Ordering::Acquire)
+        == WINDOW_DRAG_FLUSHED_SEQUENCE.load(Ordering::Acquire)
+    {
+        return;
+    }
+    WINDOW_DRAG_RELEASE_OUTER_X_BITS.store(outer_x.to_bits() as u64, Ordering::Relaxed);
+    WINDOW_DRAG_RELEASE_OUTER_Y_BITS.store(outer_y.to_bits() as u64, Ordering::Release);
+}
+
+pub fn flush_window_drag_probe() {
+    let sequence = WINDOW_DRAG_SEQUENCE.load(Ordering::Acquire);
+    if sequence == WINDOW_DRAG_FLUSHED_SEQUENCE.load(Ordering::Acquire) {
+        return;
+    }
+    WINDOW_DRAG_FLUSHED_SEQUENCE.store(sequence, Ordering::Release);
+
+    let float = |value: &AtomicU64| f32::from_bits(value.load(Ordering::Acquire) as u32);
+    let decision = match WINDOW_DRAG_DECISION.load(Ordering::Acquire) {
+        1 => "title-drag",
+        2 => "menu-controls-excluded",
+        3 => "window-controls-excluded",
+        4 => "stale-hit-map-excluded",
+        5 => "source-gap-drag",
+        _ => "unknown",
+    };
+    let start_x = float(&WINDOW_DRAG_START_OUTER_X_BITS);
+    let start_y = float(&WINDOW_DRAG_START_OUTER_Y_BITS);
+    let release_x = float(&WINDOW_DRAG_RELEASE_OUTER_X_BITS);
+    let release_y = float(&WINDOW_DRAG_RELEASE_OUTER_Y_BITS);
+    let line = format!(
+        "epoch_ms={} pid={} sequence={} event=window_drag decision={} hold_ms={} press_x={:.1} press_y={:.1} screen_width={:.1} menu_controls_right={:.1} window_controls_left={:.1} moved_x={:.1} moved_y={:.1}\n",
+        epoch_ms(),
+        std::process::id(),
+        sequence,
+        decision,
+        epoch_ms().saturating_sub(WINDOW_DRAG_PRESSED_MS.load(Ordering::Acquire)),
+        float(&WINDOW_DRAG_X_BITS),
+        float(&WINDOW_DRAG_Y_BITS),
+        float(&WINDOW_DRAG_SCREEN_WIDTH_BITS),
+        float(&WINDOW_DRAG_MENU_CONTROLS_RIGHT_BITS),
+        float(&WINDOW_DRAG_WINDOW_CONTROLS_LEFT_BITS),
+        release_x - start_x,
+        release_y - start_y,
+    );
+    let _guard = write_lock();
+    let path = window_drag_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+pub fn window_drag_log_path() -> PathBuf {
+    daily_log_path("window-drag")
+}
+
 pub fn merge_ai_log_path() -> PathBuf {
     daily_log_path("merge-ai")
+}
+
+pub fn repository_refresh_log_path() -> PathBuf {
+    daily_log_path("repository-refresh")
+}
+
+pub fn repository_refresh_trace(event: &str, fields: &str) {
+    let _guard = write_lock();
+    let path = repository_refresh_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let fields = fields.replace(['\r', '\n'], "\\n");
+        let _ = writeln!(file, "[{}] {event} {fields}", epoch_ms());
+    }
 }
 
 /// Append one sanitized, single-line event for the standalone merge assistant. Callers must never

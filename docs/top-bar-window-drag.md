@@ -15,9 +15,10 @@
 
 ## 不可破坏的实现规则
 
-1. **窗口拖动区只能覆盖空白区域。**
-   - 标题栏主拖动区是菜单右侧、窗口控制按钮左侧的水平空白区域。
-     顶部保留 `TITLE_DRAG_TOP_INSET`，避开无边框窗口的缩放命中边缘。
+1. **原生窗口拖动只能从排除前景控件后的空白区域启动。**
+   - egui 可在整行标题背景上注册透明候选交互，但原生 `StartDrag` 必须通过
+     `TitleBarHitMap` 排除菜单和窗口控制按钮的实际矩形。logo 是纯装饰，仍属于可拖动空白区。
+   - 标题栏候选区顶部保留 `TITLE_DRAG_TOP_INSET`，避开无边框窗口的缩放命中边缘。
    - 源仓库页面可使用标题行和标签条之间的空白缝隙。
    - 不得将标签区、右侧工具区、菜单区、窗口控制按钮区注册为窗口拖动区。
 
@@ -52,20 +53,25 @@
 ## 当前设计
 
 ```rust
-const TITLE_MENU_RESERVED_WIDTH: f32 = 500.0;
 const TITLE_DRAG_TOP_INSET: f32 = WINDOW_RESIZE_BORDER + 1.0;
 
-fn custom_title_drag_rect(rect: Rect, controls_width: f32) -> Rect {
+fn title_drag_candidate_rect(rect: Rect) -> Rect {
     Rect::from_min_max(
-        Pos2::new(rect.left() + TITLE_MENU_RESERVED_WIDTH, rect.top() + TITLE_DRAG_TOP_INSET),
-        Pos2::new(rect.right() - controls_width, rect.bottom()),
+        Pos2::new(rect.left(), rect.top() + TITLE_DRAG_TOP_INSET),
+        rect.right_bottom(),
     )
 }
 ```
 
-标题内容保持完整布局。拖动区位于菜单和窗口按钮之间的空白区，不与控制交互重叠，也不和顶部缩放边缘竞争。
-菜单保留宽度需覆盖英文文案，不能只按中文的旧宽度估算。后续的 egui 空白区交互只服务于
-双击等应用内判定；原生移动已在帧开始发出，因此不会被菜单、标签或完整页面布局延后。
+标题背景下方注册整行透明候选交互，随后绘制 logo、菜单和最小化/最大化/关闭按钮。绘制时只把菜单
+和窗口按钮的实际矩形汇总为 `TitleBarHitMap`，装饰性 logo 不进入排除区；下一次鼠标按下时，
+`App::update` 在任何布局和刷新之前
+使用该命中图排除控件，仅在剩余空白区域立即发送 `StartDrag`。候选交互负责双击最大化等 egui
+行为，不能代替原生按下帧判定。
+
+命中图同时记录窗口矩形、DPI 与语言。任一值变化时旧图视为过期，该次不确定的按下不得启动拖动；
+当前帧完成标题栏布局后会生成新图。这样窗口缩放或语言切换不会复用旧的按钮边界，也不需要把菜单
+宽度硬编码为某个固定保留值。
 
 透明拖拽层在 egui 中不能“只渲染一次后继续接收事件”，因为 egui 是即时模式；它的绘制交互可缓存
 边界矩形，但原生 `StartDrag` 与悬停光标必须从**当前** `screen_rect` 直接推导。窗口缩放会改变右边界，
@@ -87,9 +93,9 @@ fn custom_title_drag_rect(rect: Rect, controls_width: f32) -> Rect {
 - 无边框窗口无法调整大小的根因通常不是 `with_min_inner_size`，而是客户区已覆盖系统边框却未派发
   `BeginResize`。最小尺寸只约束成功开始后的拖动结果，不能替代边缘命中处理。
 - “有时能拖、有时不能”通常不是 Windows 随机失效，而是命令晚于按下事件或空白热区与交互控件
-  重叠。应调整安全边界；绝不能通过覆盖菜单、标签或窗口按钮来扩大拖动区。
-- 缩放后不得以 `title_drag_layer` 作为原生拖动或光标判定的来源；它只服务标题栏绘制。原生判定应使用
-  `current_title_drag_rect(ctx.screen_rect())`，使每次按下均使用当前窗口宽度。
+  重叠。整行透明候选层不能直接等价为整行原生拖动区；必须先应用前景控件排除命中图。
+- 缩放后不得无条件复用上一帧的前景控件矩形。原生判定先比较 `TitleBarHitMap` 的窗口矩形、DPI 与
+  语言；不一致时拒绝拖动并等待当前布局重建命中图。
 - 窗口尺寸持久化不得在主鼠标按下或按住期间同步保存。曾有实现以
   `!primary_down || elapsed >= 600ms` 作为保存条件；尺寸变更停留 600ms 后，下一次按下标题栏会在
   `StartDrag` 之前触发配置序列化、加密和系统密钥库访问，造成拖动迟钝甚至错过原生拖动时机。只可在
