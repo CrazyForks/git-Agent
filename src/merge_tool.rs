@@ -84,6 +84,14 @@ struct MergeAiSuggestion {
     choice: MergeAiChoice,
     reason_zh: String,
     reason_en: String,
+    manual_result: Option<String>,
+    middle_edits: Vec<MergeAiMiddleEdit>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MergeAiMiddleEdit {
+    expected_text: String,
+    replacement_text: String,
 }
 
 impl MergeAiSuggestion {
@@ -93,18 +101,28 @@ impl MergeAiSuggestion {
             MergeLanguage::English => &self.reason_en,
         }
     }
+
+    fn is_actionable(&self) -> bool {
+        self.choice != MergeAiChoice::Manual || self.manual_result.is_some()
+    }
+
+    fn change_count(&self) -> usize {
+        usize::from(self.is_actionable()) + self.middle_edits.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MergeAiNotice {
-    Completed(usize),
+    Completed { suggestions: usize, changes: usize },
     NoSuggestions,
 }
 
 #[derive(Clone, Debug, Default)]
 struct MergeAiContext {
     history: String,
+    repository_state: String,
     related_files: String,
+    symbol_references: String,
 }
 
 struct PreparedMergeDocument {
@@ -216,6 +234,23 @@ enum NavDirection {
     Next,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+enum MergeSearchPane {
+    Left,
+    #[default]
+    Middle,
+    Right,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MergeSearchState {
+    open: bool,
+    pane: MergeSearchPane,
+    query: String,
+    current: usize,
+    request_focus: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MergeSideLineTone {
     Unchanged,
@@ -251,9 +286,13 @@ const MERGE_VIRTUAL_ROW_THRESHOLD: usize = 2_000;
 const MERGE_COLLAPSE_MIN_UNCHANGED_ROWS: usize = 12;
 const MERGE_COLLAPSE_CONTEXT_ROWS: usize = 3;
 const MERGE_BUILD_CONFIG: &str = include_str!("../config/merge-tool.toml");
-const MERGE_AI_MAX_RELATED_FILE_BYTES: usize = 48 * 1024;
-const MERGE_AI_MAX_CONTEXT_BYTES: usize = 384 * 1024;
-const MERGE_AI_MAX_HISTORY_CHARS: usize = 16 * 1024;
+const MERGE_AI_MAX_RELATED_FILE_BYTES: usize = 24 * 1024;
+const MERGE_AI_MAX_CONTEXT_BYTES: usize = 96 * 1024;
+const MERGE_AI_MAX_HISTORY_CHARS: usize = 12 * 1024;
+const MERGE_AI_MAX_MANUAL_RESULT_CHARS: usize = 32 * 1024;
+const MERGE_AI_MAX_MIDDLE_EDITS: usize = 12;
+const MERGE_AI_MAX_MIDDLE_EDIT_EXPECTED_CHARS: usize = 512;
+const MERGE_AI_MAX_MIDDLE_EDIT_REPLACEMENT_CHARS: usize = 8 * 1024;
 const MERGE_AI_TOOL_NAME: &str = "submit_merge_suggestions";
 const MERGE_AI_OVERLAY_DRAG_MARGIN: f32 = 8.0;
 #[cfg(target_os = "windows")]
@@ -343,6 +382,7 @@ impl MergePanelGeometry {
 
 struct MergeSidePanelOutput {
     requested_result_scroll_y: Option<f32>,
+    search_result_y: Option<f32>,
     navigation_target: Option<MergeLineActionTarget>,
     geometry: MergePanelGeometry,
     pending_line_action: Option<(MergeLineActionTarget, MergeLineAction)>,
@@ -351,6 +391,7 @@ struct MergeSidePanelOutput {
 struct MergeResultPanelOutput {
     scroll_y: f32,
     viewport_height: f32,
+    search_result_y: Option<f32>,
     geometry: MergePanelGeometry,
 }
 
@@ -968,6 +1009,91 @@ impl MergeDocument {
         text
     }
 
+    fn apply_ai_manual_target(
+        &mut self,
+        target: MergeLineActionTarget,
+        replacement: &str,
+    ) -> Result<(), String> {
+        let line_indices = match target {
+            MergeLineActionTarget::Conflict(index) => self
+                .conflicts
+                .get(index)
+                .map(|conflict| conflict.line_indices.clone())
+                .ok_or_else(|| format!("conflict target {index} is no longer available"))?,
+            MergeLineActionTarget::BaseOnlyGroup(line_index) => {
+                let group = base_only_display_groups(self)
+                    .into_iter()
+                    .find(|group| group.line_index == line_index)
+                    .ok_or_else(|| {
+                        format!("deletion target {line_index} is no longer available")
+                    })?;
+                (group.line_index..group.line_index + group.line_count).collect()
+            }
+        };
+        let Some(first_index) = line_indices.first().copied() else {
+            return Err("AI manual target has no document lines".to_owned());
+        };
+        let replacement = normalize_merge_ai_code(replacement);
+        for line_index in line_indices {
+            let Some(line) = self.lines.get_mut(line_index) else {
+                return Err("AI manual target moved before it could be applied".to_owned());
+            };
+            line.local_resolved = true;
+            line.remote_resolved = true;
+            line.local_taken = false;
+            line.remote_taken = false;
+            line.base_only_resolved = true;
+            line.kind = MergeLineKind::Resolved;
+            line.include_in_result = false;
+            line.result.clear();
+        }
+        let first = &mut self.lines[first_index];
+        first.result = replacement;
+        first.include_in_result = !first.result.is_empty();
+        Ok(())
+    }
+
+    fn apply_ai_middle_edit(&mut self, edit: &MergeAiMiddleEdit) -> Result<(), String> {
+        if edit.expected_text.contains('\r') || edit.expected_text.contains('\n') {
+            return Err("AI middle edit expected_text must fit within one logical line".to_owned());
+        }
+        let expected = edit.expected_text.as_str();
+        if expected.is_empty() {
+            return Err("AI middle edit expected_text is empty".to_owned());
+        }
+        let matches = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.conflict_index.is_none()
+                    && line.kind == MergeLineKind::Resolved
+                    && line.include_in_result
+                    && !line.is_base_only_display()
+            })
+            .flat_map(|(line_index, line)| {
+                line.result
+                    .match_indices(expected)
+                    .map(move |(offset, _)| (line_index, offset))
+            })
+            .collect::<Vec<_>>();
+        let [(line_index, offset)] = matches.as_slice() else {
+            return Err(format!(
+                "AI middle edit expected one unique match for {:?}, found {}",
+                expected,
+                matches.len()
+            ));
+        };
+        let line = &mut self.lines[*line_index];
+        let end = *offset + expected.len();
+        line.result.replace_range(
+            *offset..end,
+            &normalize_merge_ai_code(&edit.replacement_text),
+        );
+        line.include_in_result = !line.result.is_empty();
+        Ok(())
+    }
+
     fn apply_conflict(&mut self, index: usize, side: MergeSide) {
         self.accept_conflict_side_only(index, side);
     }
@@ -1126,7 +1252,11 @@ impl MergeLine {
             return lines;
         }
         if lines.is_empty() && self.include_in_result {
-            lines.push(self.result.as_str());
+            if self.result.is_empty() {
+                lines.push("");
+            } else {
+                lines.extend(self.result.split_terminator('\n'));
+            }
         }
         lines
     }
@@ -1201,6 +1331,8 @@ pub struct MergeToolApp {
     ignore_mode: MergeIgnoreMode,
     highlight_mode: MergeHighlightMode,
     collapse_unchanged: bool,
+    search: MergeSearchState,
+    hovered_search_pane: Option<MergeSearchPane>,
 }
 
 impl MergeToolApp {
@@ -1295,6 +1427,8 @@ impl MergeToolApp {
             ignore_mode: MergeIgnoreMode::None,
             highlight_mode: MergeHighlightMode::Lines,
             collapse_unchanged: false,
+            search: MergeSearchState::default(),
+            hovered_search_pane: None,
         }
     }
 
@@ -1342,6 +1476,8 @@ impl MergeToolApp {
             ignore_mode: MergeIgnoreMode::None,
             highlight_mode: MergeHighlightMode::Lines,
             collapse_unchanged: false,
+            search: MergeSearchState::default(),
+            hovered_search_pane: None,
         }
     }
 
@@ -1532,13 +1668,15 @@ impl MergeToolApp {
                             !config.api_key.trim().is_empty(),
                         ),
                     );
-                    let context = collect_merge_ai_context(&args)?;
+                    let context = collect_merge_ai_context(&args, &sources, &document)?;
                     crate::diagnostics::merge_ai_trace(
                         "context.collected",
                         &format!(
-                            "history_chars={} related_chars={} base_chars={} local_chars={} remote_chars={}",
+                            "history_chars={} repository_state_chars={} related_chars={} symbol_reference_chars={} base_chars={} local_chars={} remote_chars={}",
                             context.history.chars().count(),
+                            context.repository_state.chars().count(),
                             context.related_files.chars().count(),
+                            context.symbol_references.chars().count(),
                             sources.base.chars().count(),
                             sources.local.chars().count(),
                             sources.remote.chars().count(),
@@ -1566,6 +1704,10 @@ impl MergeToolApp {
         match receiver.try_recv() {
             Ok(Ok(suggestions)) => {
                 let suggestion_count = suggestions.len();
+                let change_count = suggestions
+                    .iter()
+                    .map(MergeAiSuggestion::change_count)
+                    .sum::<usize>();
                 self.ai_suggestions = suggestions
                     .into_iter()
                     .map(|suggestion| (suggestion.target, suggestion))
@@ -1575,12 +1717,15 @@ impl MergeToolApp {
                 self.ai_notice = Some(if suggestion_count == 0 {
                     MergeAiNotice::NoSuggestions
                 } else {
-                    MergeAiNotice::Completed(suggestion_count)
+                    MergeAiNotice::Completed {
+                        suggestions: suggestion_count,
+                        changes: change_count,
+                    }
                 });
                 self.ai_analysis_error = None;
                 crate::diagnostics::merge_ai_trace(
                     "ui.received",
-                    &format!("suggestions={suggestion_count}"),
+                    &format!("suggestions={suggestion_count} changes={change_count}"),
                 );
                 ctx.request_repaint();
             }
@@ -1609,52 +1754,75 @@ impl MergeToolApp {
         if self.manual_result_override {
             return;
         }
-        let Some(choice) = self
-            .ai_suggestions
-            .get(&target)
-            .map(|suggestion| suggestion.choice.clone())
-        else {
+        let Some(suggestion) = self.ai_suggestions.get(&target).cloned() else {
             return;
         };
-        let chosen_side = match choice {
-            MergeAiChoice::Local => MergeSide::Local,
-            MergeAiChoice::Remote => MergeSide::Remote,
-            MergeAiChoice::Manual => return,
-        };
-        let base_only_group = match target {
-            MergeLineActionTarget::BaseOnlyGroup(line_index) => {
-                let Some(group) = base_only_display_groups(&self.document)
-                    .into_iter()
-                    .find(|group| group.line_index == line_index)
-                else {
-                    return;
-                };
-                Some(group)
-            }
-            MergeLineActionTarget::Conflict(_) => None,
-        };
-        let before = self.snapshot();
-        match target {
-            MergeLineActionTarget::Conflict(conflict_index) => {
-                self.document.apply_conflict(conflict_index, chosen_side)
-            }
-            MergeLineActionTarget::BaseOnlyGroup(line_index) => {
-                let group = base_only_group.expect("base-only suggestion target was validated");
-                if chosen_side == group.missing_side {
-                    self.document
-                        .take_base_only_group(line_index, group.missing_side);
-                } else {
-                    self.document
-                        .drop_base_only_group(line_index, group.missing_side);
+        let mut updated_document = self.document.clone();
+        let apply_result = (|| -> Result<(), String> {
+            match suggestion.choice {
+                MergeAiChoice::Local | MergeAiChoice::Remote => {
+                    let chosen_side = if suggestion.choice == MergeAiChoice::Local {
+                        MergeSide::Local
+                    } else {
+                        MergeSide::Remote
+                    };
+                    match target {
+                        MergeLineActionTarget::Conflict(conflict_index) => {
+                            updated_document.apply_conflict(conflict_index, chosen_side)
+                        }
+                        MergeLineActionTarget::BaseOnlyGroup(line_index) => {
+                            let group = base_only_display_groups(&updated_document)
+                                .into_iter()
+                                .find(|group| group.line_index == line_index)
+                                .ok_or_else(|| {
+                                    format!("deletion target {line_index} is no longer available")
+                                })?;
+                            if chosen_side == group.missing_side {
+                                updated_document
+                                    .take_base_only_group(line_index, group.missing_side);
+                            } else {
+                                updated_document
+                                    .drop_base_only_group(line_index, group.missing_side);
+                            }
+                        }
+                    }
+                }
+                MergeAiChoice::Manual => {
+                    let replacement = suggestion.manual_result.as_deref().ok_or_else(|| {
+                        "manual AI suggestion does not contain an applicable result".to_owned()
+                    })?;
+                    updated_document.apply_ai_manual_target(target, replacement)?;
                 }
             }
+            for edit in &suggestion.middle_edits {
+                updated_document.apply_ai_middle_edit(edit)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = apply_result {
+            crate::diagnostics::merge_ai_trace(
+                "ui.apply_rejected",
+                &format!("target={target:?} error={error}"),
+            );
+            self.ai_analysis_error = Some(error);
+            return;
         }
+        let before = self.snapshot();
+        self.document = updated_document;
         self.ai_suggestions.remove(&target);
         self.ai_overlay_offsets
             .retain(|(current, _), _| *current != target);
         self.result_text = self.document.result_text();
         self.reset_manual_result_lines();
         self.finish_document_edit(before);
+        crate::diagnostics::merge_ai_trace(
+            "ui.applied",
+            &format!(
+                "target={target:?} choice={:?} middle_edits={}",
+                suggestion.choice,
+                suggestion.middle_edits.len()
+            ),
+        );
     }
 
     fn ignore_ai_suggestion(&mut self, target: MergeLineActionTarget) {
@@ -1693,14 +1861,25 @@ impl MergeToolApp {
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
-        let (undo_requested, redo_requested) = ctx.input(|i| {
-            let ctrl = i.modifiers.ctrl || i.modifiers.command;
-            (
-                ctrl && i.key_pressed(egui::Key::Z) && !i.modifiers.shift,
-                ctrl && i.key_pressed(egui::Key::Y)
-                    || (ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Z)),
-            )
-        });
+        let (undo_requested, redo_requested, find_requested, close_find_requested) =
+            ctx.input(|i| {
+                let ctrl = i.modifiers.ctrl || i.modifiers.command;
+                (
+                    ctrl && i.key_pressed(egui::Key::Z) && !i.modifiers.shift,
+                    ctrl && i.key_pressed(egui::Key::Y)
+                        || (ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Z)),
+                    ctrl && i.key_pressed(egui::Key::F),
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+        if find_requested {
+            self.search.open = true;
+            self.search.pane = self.hovered_search_pane.unwrap_or(self.search.pane);
+            self.search.request_focus = true;
+            self.collapse_unchanged = false;
+        } else if close_find_requested && self.search.open {
+            self.search.open = false;
+        }
         if undo_requested && self.can_undo() {
             self.undo();
         } else if redo_requested && self.can_redo() {
@@ -2029,7 +2208,11 @@ fn stage_merge_output(repo_root: &Path, output: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn collect_merge_ai_context(args: &MergeArgs) -> Result<MergeAiContext, String> {
+fn collect_merge_ai_context(
+    args: &MergeArgs,
+    _sources: &MergeSourceText,
+    document: &MergeDocument,
+) -> Result<MergeAiContext, String> {
     let Some(repo_root) = args.repo_root.as_deref() else {
         return Ok(MergeAiContext::default());
     };
@@ -2039,19 +2222,183 @@ fn collect_merge_ai_context(args: &MergeArgs) -> Result<MergeAiContext, String> 
         .unwrap_or(&args.output)
         .to_string_lossy()
         .replace('\\', "/");
-    let history = git_context_output(
+    let head = git_context_output(
         repo_root,
         [
-            "log".to_owned(),
-            "--all".to_owned(),
-            "--format=%H%n%s%n%b%n---".to_owned(),
-            "-n".to_owned(),
-            "16".to_owned(),
-            "--".to_owned(),
-            relative_output.clone(),
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "HEAD".to_owned(),
         ],
     )
     .unwrap_or_default();
+    let merge_head = git_context_output(
+        repo_root,
+        [
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "MERGE_HEAD".to_owned(),
+        ],
+    )
+    .unwrap_or_default();
+    let head = head.trim();
+    let merge_head = merge_head.trim();
+    let merge_base = (!head.is_empty() && !merge_head.is_empty())
+        .then(|| {
+            git_context_output(
+                repo_root,
+                [
+                    "merge-base".to_owned(),
+                    head.to_owned(),
+                    merge_head.to_owned(),
+                ],
+            )
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let merge_base = merge_base.trim();
+
+    let mut history = String::new();
+    if !head.is_empty() && !merge_head.is_empty() {
+        append_merge_ai_section(
+            &mut history,
+            "MERGE TIPS",
+            &format!(
+                "LEFT HEAD: {head}\nRIGHT MERGE_HEAD: {merge_head}\nMERGE BASE: {}",
+                if merge_base.is_empty() {
+                    "(unavailable)"
+                } else {
+                    merge_base
+                }
+            ),
+        );
+    }
+    for (label, revision) in [
+        ("LEFT FILE HISTORY", head),
+        ("RIGHT FILE HISTORY", merge_head),
+    ] {
+        if revision.is_empty() {
+            continue;
+        }
+        append_merge_ai_section(
+            &mut history,
+            label,
+            &git_context_output(
+                repo_root,
+                [
+                    "log".to_owned(),
+                    "--format=%H%n%s%n%b%n---".to_owned(),
+                    "-n".to_owned(),
+                    "16".to_owned(),
+                    revision.to_owned(),
+                    "--".to_owned(),
+                    relative_output.clone(),
+                ],
+            )
+            .unwrap_or_default(),
+        );
+    }
+    if !head.is_empty() && !merge_head.is_empty() {
+        // Keep file-specific history ahead of the broader branch log. The final context is bounded,
+        // so placing forty potentially verbose commits first could otherwise truncate the history
+        // most directly related to the conflicted file.
+        append_merge_ai_section(
+            &mut history,
+            "COMMITS UNIQUE TO LEFT AND RIGHT MERGE TIPS",
+            &git_context_output(
+                repo_root,
+                [
+                    "log".to_owned(),
+                    "--left-right".to_owned(),
+                    "--cherry-pick".to_owned(),
+                    "--format=%m %H%n%s%n%b%n---".to_owned(),
+                    "-n".to_owned(),
+                    "40".to_owned(),
+                    format!("{head}...{merge_head}"),
+                ],
+            )
+            .unwrap_or_default(),
+        );
+    }
+    if history.is_empty() {
+        append_merge_ai_section(
+            &mut history,
+            "FILE HISTORY",
+            &git_context_output(
+                repo_root,
+                [
+                    "log".to_owned(),
+                    "--all".to_owned(),
+                    "--format=%H%n%s%n%b%n---".to_owned(),
+                    "-n".to_owned(),
+                    "16".to_owned(),
+                    "--".to_owned(),
+                    relative_output.clone(),
+                ],
+            )
+            .unwrap_or_default(),
+        );
+    }
+
+    let mut repository_state = String::new();
+    for (label, command) in [
+        (
+            "MERGE STATUS",
+            vec![
+                "status".to_owned(),
+                "--short".to_owned(),
+                "--branch".to_owned(),
+            ],
+        ),
+        (
+            "CURRENT MERGE DIFF NAMES",
+            vec![
+                "diff".to_owned(),
+                "--name-status".to_owned(),
+                "HEAD".to_owned(),
+            ],
+        ),
+        (
+            "CURRENT MERGE DIFF",
+            vec![
+                "diff".to_owned(),
+                "--no-ext-diff".to_owned(),
+                "--unified=12".to_owned(),
+                "HEAD".to_owned(),
+                "--".to_owned(),
+                ".".to_owned(),
+            ],
+        ),
+    ] {
+        append_merge_ai_section(
+            &mut repository_state,
+            label,
+            &git_context_output(repo_root, command).unwrap_or_default(),
+        );
+    }
+    if !merge_base.is_empty() {
+        for (label, revision) in [
+            ("LEFT BRANCH CHANGES", head),
+            ("RIGHT BRANCH CHANGES", merge_head),
+        ] {
+            if revision.is_empty() {
+                continue;
+            }
+            append_merge_ai_section(
+                &mut repository_state,
+                label,
+                &git_context_output(
+                    repo_root,
+                    [
+                        "diff".to_owned(),
+                        "--name-status".to_owned(),
+                        format!("{merge_base}..{revision}"),
+                    ],
+                )
+                .unwrap_or_default(),
+            );
+        }
+    }
+
     let commit_ids = git_context_output(
         repo_root,
         [
@@ -2078,6 +2425,39 @@ fn collect_merge_ai_context(args: &MergeArgs) -> Result<MergeAiContext, String> 
     .map(str::to_owned)
     .collect::<Vec<_>>();
     related_paths.push(relative_output);
+    for command in [
+        vec![
+            "diff".to_owned(),
+            "--name-only".to_owned(),
+            "HEAD".to_owned(),
+        ],
+        vec![
+            "diff".to_owned(),
+            "--cached".to_owned(),
+            "--name-only".to_owned(),
+        ],
+    ] {
+        if let Ok(paths) = git_context_output(repo_root, command) {
+            related_paths.extend(paths.lines().map(str::to_owned));
+        }
+    }
+    if !merge_base.is_empty() {
+        for revision in [head, merge_head] {
+            if revision.is_empty() {
+                continue;
+            }
+            if let Ok(paths) = git_context_output(
+                repo_root,
+                [
+                    "diff".to_owned(),
+                    "--name-only".to_owned(),
+                    format!("{merge_base}..{revision}"),
+                ],
+            ) {
+                related_paths.extend(paths.lines().map(str::to_owned));
+            }
+        }
+    }
     for commit in commit_ids.lines().filter(|line| !line.trim().is_empty()) {
         if let Ok(paths) = git_context_output(
             repo_root,
@@ -2092,6 +2472,28 @@ fn collect_merge_ai_context(args: &MergeArgs) -> Result<MergeAiContext, String> 
             related_paths.extend(paths.lines().map(str::to_owned));
         }
     }
+
+    let identifiers = merge_ai_candidate_identifiers(document);
+    let symbol_references = if identifiers.is_empty() {
+        String::new()
+    } else {
+        let mut command = vec![
+            "grep".to_owned(),
+            "-n".to_owned(),
+            "-I".to_owned(),
+            "-F".to_owned(),
+        ];
+        for identifier in &identifiers {
+            command.push("-e".to_owned());
+            command.push(identifier.clone());
+        }
+        command.push("--".to_owned());
+        command.push(".".to_owned());
+        git_context_output(repo_root, command).unwrap_or_default()
+    };
+    let mut prioritized_paths = merge_ai_reference_paths(&symbol_references);
+    prioritized_paths.extend(related_paths);
+    related_paths = prioritized_paths;
 
     let mut seen = HashSet::new();
     let mut related_files = String::new();
@@ -2151,28 +2553,233 @@ fn collect_merge_ai_context(args: &MergeArgs) -> Result<MergeAiContext, String> 
     }
     Ok(MergeAiContext {
         history: truncate_merge_ai_text(&history, MERGE_AI_MAX_HISTORY_CHARS),
+        repository_state: truncate_merge_ai_text(&repository_state, 64 * 1024),
         related_files,
+        symbol_references: truncate_merge_ai_text(&symbol_references, 32 * 1024),
     })
+}
+
+fn append_merge_ai_section(target: &mut String, title: &str, content: &str) {
+    if content.trim().is_empty() {
+        return;
+    }
+    target.push_str("\n--- ");
+    target.push_str(title);
+    target.push_str(" ---\n");
+    target.push_str(content.trim());
+    target.push('\n');
+}
+
+fn merge_ai_reference_paths(grep_output: &str) -> Vec<String> {
+    grep_output
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(path, _)| path.to_owned()))
+        .collect()
+}
+
+fn merge_ai_candidate_identifiers(document: &MergeDocument) -> Vec<String> {
+    let mut identifiers = HashSet::new();
+    let conflict_lines = document.conflicts().iter().flat_map(|conflict| {
+        conflict
+            .base
+            .iter()
+            .chain(&conflict.local)
+            .chain(&conflict.remote)
+            .map(String::as_str)
+    });
+    let deletion_lines = document
+        .lines
+        .iter()
+        .filter(|line| line.is_base_only_display())
+        .flat_map(|line| {
+            [
+                line.base.as_deref(),
+                line.local.as_deref(),
+                line.remote.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+        });
+    for line in conflict_lines.chain(deletion_lines) {
+        for token in line.split(|character: char| {
+            !(character.is_ascii_alphanumeric() || character == '_' || character == '$')
+        }) {
+            let token = token.trim_matches('$');
+            if token.len() < 4
+                || token.len() > 96
+                || token.chars().all(|character| character.is_ascii_digit())
+                || matches!(
+                    token,
+                    "const"
+                        | "class"
+                        | "function"
+                        | "return"
+                        | "import"
+                        | "export"
+                        | "default"
+                        | "from"
+                        | "true"
+                        | "false"
+                        | "null"
+                        | "undefined"
+                )
+            {
+                continue;
+            }
+            identifiers.insert(token.to_owned());
+        }
+    }
+    let mut identifiers = identifiers.into_iter().collect::<Vec<_>>();
+    identifiers.sort_by(|left, right| {
+        let left_specific = left.chars().any(char::is_uppercase) || left.contains('_');
+        let right_specific = right.chars().any(char::is_uppercase) || right.contains('_');
+        right_specific
+            .cmp(&left_specific)
+            .then_with(|| right.len().cmp(&left.len()))
+            .then_with(|| left.cmp(right))
+    });
+    identifiers.truncate(24);
+    identifiers
 }
 
 fn git_context_output<I>(repo_root: &Path, args: I) -> Result<String, String>
 where
     I: IntoIterator<Item = String>,
 {
+    let args = args.into_iter().collect::<Vec<_>>();
     let mut command = Command::new("git");
     #[cfg(target_os = "windows")]
     command.creation_flags(MERGE_WINDOWS_CREATE_NO_WINDOW);
     let output = command
         .arg("-C")
         .arg(repo_root)
-        .args(args)
+        .args(&args)
         .output()
         .map_err(|error| format!("Unable to read Git context: {error}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if !error.is_empty() {
+            crate::diagnostics::merge_ai_trace(
+                "context.git_failed",
+                &format!(
+                    "command={} error={}",
+                    truncate_merge_ai_text(&args.join(" "), 500),
+                    truncate_merge_ai_text(&error, 1_000),
+                ),
+            );
+        }
+        Err(error)
     }
+}
+
+fn send_merge_ai_tool_request(
+    config: &crate::app::MergeAiModelConfig,
+    prompt: &str,
+    request_stage: &str,
+    target_count: usize,
+) -> Result<String, String> {
+    let endpoint = merge_ai_endpoint(config)?;
+    crate::diagnostics::merge_ai_trace(
+        "http.start",
+        &format!(
+            "stage={request_stage} format={:?} endpoint={} model_id={} prompt_chars={} targets={target_count}",
+            config.api_format,
+            merge_ai_url_for_log(&endpoint),
+            config.model_id,
+            prompt.chars().count(),
+        ),
+    );
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(90))
+        .build();
+    let response = match config.api_format {
+        crate::app::MergeAiApiFormat::OpenAiCompatible => agent
+            .post(&endpoint)
+            .set(
+                "Authorization",
+                &format!("Bearer {}", config.api_key.trim()),
+            )
+            .set("Content-Type", "application/json")
+            .send_json(serde_json::json!({
+                "model": config.model_id.trim(),
+                "temperature": 0.1,
+                "messages": [
+                    { "role": "system", "content": merge_ai_system_prompt() },
+                    { "role": "user", "content": prompt },
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": MERGE_AI_TOOL_NAME,
+                        "description": "Submit one validated recommendation for every merge conflict and deletion decision.",
+                        "parameters": merge_ai_suggestions_input_schema(),
+                    }
+                }],
+                "tool_choice": {
+                    "type": "function",
+                    "function": { "name": MERGE_AI_TOOL_NAME }
+                },
+            })),
+        crate::app::MergeAiApiFormat::Claude => agent
+            .post(&endpoint)
+            .set("x-api-key", config.api_key.trim())
+            .set("anthropic-version", "2023-06-01")
+            .set("Content-Type", "application/json")
+            .send_json(serde_json::json!({
+                "model": config.model_id.trim(),
+                "max_tokens": 4096,
+                "temperature": 0.1,
+                "thinking": { "type": "disabled" },
+                "system": merge_ai_system_prompt(),
+                "messages": [{ "role": "user", "content": prompt }],
+                "tools": [{
+                    "name": MERGE_AI_TOOL_NAME,
+                    "description": "Submit one validated recommendation for every merge conflict and deletion decision.",
+                    "input_schema": merge_ai_suggestions_input_schema(),
+                }],
+                "tool_choice": { "type": "tool", "name": MERGE_AI_TOOL_NAME },
+            })),
+    }
+    .map_err(|error| match error {
+        ureq::Error::Status(status, response) => {
+            let detail = response.into_string().unwrap_or_default();
+            let detail = truncate_merge_ai_text(&detail, 500);
+            if detail.is_empty() {
+                format!("AI server returned HTTP {status}")
+            } else {
+                format!("AI server returned HTTP {status}: {detail}")
+            }
+        }
+        ureq::Error::Transport(error) => format!("AI request failed: {error}"),
+    })?;
+    crate::diagnostics::merge_ai_trace(
+        "http.success",
+        &format!("stage={request_stage} status=2xx"),
+    );
+    let response: serde_json::Value = response
+        .into_json()
+        .map_err(|_| "AI server returned an invalid JSON response".to_owned())?;
+    crate::diagnostics::merge_ai_trace(
+        "response.structure",
+        &format!(
+            "stage={request_stage} {}",
+            merge_ai_response_structure(config.api_format, &response)
+        ),
+    );
+    let (content, response_mode) = merge_ai_response_payload(config.api_format, &response)?;
+    crate::diagnostics::merge_ai_trace(
+        "response.payload",
+        &format!(
+            "stage={request_stage} mode={} chars={} preview={}",
+            response_mode,
+            content.chars().count(),
+            serde_json::to_string(&truncate_merge_ai_text(&content, 4_000))
+                .unwrap_or_else(|_| "\"<encode error>\"".to_owned()),
+        ),
+    );
+    Ok(content)
 }
 
 fn request_merge_ai_suggestions(
@@ -2290,7 +2897,62 @@ fn request_merge_ai_suggestions(
             .into_iter()
             .map(|group| MergeLineActionTarget::BaseOnlyGroup(group.line_index)),
     );
-    parse_merge_ai_suggestions(&content, &valid_targets, args.language)
+    let suggestions = parse_merge_ai_suggestions(&content, &valid_targets, args.language)?;
+    let suggestions = guard_merge_ai_suggestions(document, suggestions);
+    if merge_ai_needs_completeness_repair(&suggestions) {
+        crate::diagnostics::merge_ai_trace(
+            "validation.repair_requested",
+            "reason=manual_result_without_confirmed_middle_edits",
+        );
+        let repair_prompt = merge_ai_completeness_repair_prompt(&prompt, &content);
+        let repaired_content = send_merge_ai_tool_request(
+            config,
+            &repair_prompt,
+            "completeness_repair",
+            valid_targets.len(),
+        )?;
+        let repaired =
+            parse_merge_ai_suggestions(&repaired_content, &valid_targets, args.language)?;
+        let repaired = guard_merge_ai_suggestions(document, repaired);
+        let repaired_targets = repaired
+            .iter()
+            .map(|suggestion| suggestion.target)
+            .collect::<HashSet<_>>();
+        if repaired_targets != valid_targets {
+            return Err(format!(
+                "AI completeness repair returned {} of {} merge targets",
+                repaired_targets.len(),
+                valid_targets.len()
+            ));
+        }
+        crate::diagnostics::merge_ai_trace(
+            "validation.repair_accepted",
+            &format!(
+                "suggestions={} middle_edits={}",
+                repaired.len(),
+                repaired
+                    .iter()
+                    .map(|suggestion| suggestion.middle_edits.len())
+                    .sum::<usize>()
+            ),
+        );
+        return Ok(repaired);
+    }
+    Ok(suggestions)
+}
+
+fn merge_ai_needs_completeness_repair(suggestions: &[MergeAiSuggestion]) -> bool {
+    suggestions.iter().any(|suggestion| {
+        suggestion.choice == MergeAiChoice::Manual
+            && suggestion.manual_result.is_some()
+            && suggestion.middle_edits.is_empty()
+    })
+}
+
+fn merge_ai_completeness_repair_prompt(prompt: &str, previous_payload: &str) -> String {
+    format!(
+        "{prompt}\n\nSTRUCTURED COMPLETENESS AND CONSISTENCY AUDIT:\nThe previous tool result is reproduced below. Re-derive it from the supplied code instead of trusting any number or claim in that result. Audit it against the full Middle draft, assertions, references, and related files above. Recount every explicit array element, object property, argument, parameter, enum member, and ordered operation in manual_result, then compare those counts and orders with every numeric or derived middle_edit and assertion. For example, six listed elements require a count of 6, never 5. A reason must never describe a concrete required code change that is absent from the structured payload. If applying manual_result changes a collection, signature, enum, or order and a supplied derived value, assertion, caller, or reference must also change, encode every exact non-target change in middle_edits. Do not label a mechanically provable mismatch as pre-existing when the exact correction is available. Keep middle_edits empty only after verifying no additional Middle line must change. Keep reason_zh and reason_en to one or two short sentences and merge order to one short sentence. Return the complete corrected tool payload once, with exactly the same target coverage.\n\nPREVIOUS TOOL RESULT:\n{previous_payload}",
+    )
 }
 
 fn merge_ai_url_for_log(value: &str) -> &str {
@@ -2317,16 +2979,51 @@ fn merge_ai_suggestions_input_schema() -> serde_json::Value {
                             "type": "string",
                             "enum": ["left", "right", "manual"]
                         },
+                        "manual_result_provided": {
+                            "type": "boolean",
+                            "description": "For a manual choice, true only when manual_result contains the exact complete replacement for this target. It may be an empty string to delete the target. Use false when evidence is insufficient or for left/right choices."
+                        },
+                        "manual_result": {
+                            "type": "string",
+                            "description": "Exact code replacing this conflict/deletion target when manual_result_provided is true. Do not include conflict markers or Markdown fences. Use an empty string otherwise."
+                        },
+                        "middle_edits": {
+                            "type": "array",
+                            "description": "Additional exact edits to already resolved Middle code, including non-diff lines. Each expected_text must be a unique substring contained within one logical Middle line. replacement_text may contain multiple lines and should include the anchor text when inserting around it.",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "expected_text": { "type": "string", "minLength": 1 },
+                                    "replacement_text": { "type": "string" }
+                                },
+                                "required": ["expected_text", "replacement_text"]
+                            }
+                        },
                         "reason_zh": {
                             "type": "string",
-                            "description": "A concise Simplified Chinese explanation using 左边、右边、中间 for the three panes."
+                            "maxLength": 220,
+                            "description": "Exactly one or two short Simplified Chinese sentences: state the conclusion first, then only the decisive Middle/history/reference evidence. Use 左边、右边、中间 for the panes. Do not repeat code, the merge order, or the full reasoning process."
                         },
                         "reason_en": {
                             "type": "string",
-                            "description": "A concise English explanation using Left, Right, and Middle for the three panes."
+                            "maxLength": 320,
+                            "description": "Exactly one or two short English sentences: state the conclusion first, then only the decisive Middle/history/reference evidence. Use Left, Right, and Middle for the panes. Do not repeat code, the merge order, or the full reasoning process."
+                        },
+                        "merge_order_zh": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 220,
+                            "description": "In one short sentence, state the exact execution/precedence order when both sides are retained. For overlapping control flow state which branch wins; for parallel edits state that there is no runtime order and give placement. If evidence cannot decide, name the candidate orders and behavioral difference compactly. For left/right suggestions use 不适用."
+                        },
+                        "merge_order_en": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 320,
+                            "description": "In one short sentence, state the exact execution/precedence order when both sides are retained. For overlapping control flow state which branch wins; for parallel edits state that there is no runtime order and give placement. If evidence cannot decide, name the candidate orders and behavioral difference compactly. For left/right suggestions use Not applicable."
                         }
                     },
-                    "required": ["target_type", "target_index", "choice", "reason_zh", "reason_en"]
+                    "required": ["target_type", "target_index", "choice", "manual_result_provided", "manual_result", "middle_edits", "reason_zh", "reason_en", "merge_order_zh", "merge_order_en"]
                 }
             }
         },
@@ -2604,6 +3301,9 @@ fn parse_merge_ai_suggestions(
     let mut invalid_target = 0usize;
     let mut duplicate_target = 0usize;
     let mut unsupported_choice = 0usize;
+    let mut missing_manual_order = 0usize;
+    let mut invalid_manual_result = 0usize;
+    let mut invalid_middle_edits = 0usize;
     for item in items {
         let Some(index) = item
             .get("target_index")
@@ -2656,24 +3356,101 @@ fn parse_merge_ai_suggestions(
                 continue;
             }
         };
+        let manual_result_provided = item
+            .get("manual_result_provided")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let manual_result_value = item
+            .get("manual_result")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let manual_result = if manual_result_provided {
+            if choice != MergeAiChoice::Manual
+                || manual_result_value.chars().count() > MERGE_AI_MAX_MANUAL_RESULT_CHARS
+            {
+                invalid_manual_result += 1;
+                trace_rejected_merge_ai_item("invalid_manual_result", item);
+                continue;
+            }
+            Some(normalize_merge_ai_code(manual_result_value))
+        } else {
+            None
+        };
+        let mut middle_edits = Vec::new();
+        let middle_edit_values = item
+            .get("middle_edits")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut item_has_invalid_middle_edit = middle_edit_values.len() > MERGE_AI_MAX_MIDDLE_EDITS;
+        for edit in middle_edit_values.iter().take(MERGE_AI_MAX_MIDDLE_EDITS) {
+            let expected_text = edit
+                .get("expected_text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let replacement_text = edit
+                .get("replacement_text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if expected_text.is_empty()
+                || expected_text.contains('\r')
+                || expected_text.contains('\n')
+                || expected_text.chars().count() > MERGE_AI_MAX_MIDDLE_EDIT_EXPECTED_CHARS
+                || replacement_text.chars().count() > MERGE_AI_MAX_MIDDLE_EDIT_REPLACEMENT_CHARS
+            {
+                item_has_invalid_middle_edit = true;
+                break;
+            }
+            middle_edits.push(MergeAiMiddleEdit {
+                expected_text: expected_text.to_owned(),
+                replacement_text: normalize_merge_ai_code(replacement_text),
+            });
+        }
+        if item_has_invalid_middle_edit {
+            invalid_middle_edits += 1;
+            trace_rejected_merge_ai_item("invalid_middle_edit", item);
+            continue;
+        }
         let legacy_reason = item
             .get("reason")
             .and_then(serde_json::Value::as_str)
             .filter(|reason| !reason.trim().is_empty());
-        let reason_zh = item
+        let mut reason_zh = item
             .get("reason_zh")
             .and_then(serde_json::Value::as_str)
             .or(legacy_reason)
-            .map(|reason| truncate_merge_ai_text(reason, 700))
+            .map(|reason| compact_merge_ai_text(reason, 220))
             .filter(|reason| !reason.trim().is_empty())
             .unwrap_or_else(|| mt(MergeLanguage::Chinese, "ai_no_reason").to_owned());
-        let reason_en = item
+        let mut reason_en = item
             .get("reason_en")
             .and_then(serde_json::Value::as_str)
             .or(legacy_reason)
-            .map(|reason| truncate_merge_ai_text(reason, 700))
+            .map(|reason| compact_merge_ai_text(reason, 320))
             .filter(|reason| !reason.trim().is_empty())
             .unwrap_or_else(|| mt(MergeLanguage::English, "ai_no_reason").to_owned());
+        if choice == MergeAiChoice::Manual {
+            let merge_order_zh = item
+                .get("merge_order_zh")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|order| !order.is_empty());
+            let merge_order_en = item
+                .get("merge_order_en")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|order| !order.is_empty());
+            let (Some(merge_order_zh), Some(merge_order_en)) = (merge_order_zh, merge_order_en)
+            else {
+                missing_manual_order += 1;
+                trace_rejected_merge_ai_item("missing_manual_merge_order", item);
+                continue;
+            };
+            reason_zh.push_str("\n\n合并顺序：");
+            reason_zh.push_str(&compact_merge_ai_text(merge_order_zh, 220));
+            reason_en.push_str("\n\nMerge order: ");
+            reason_en.push_str(&compact_merge_ai_text(merge_order_en, 320));
+        }
         crate::diagnostics::merge_ai_trace(
             "parse.accepted",
             &format!("target={target:?} choice={choice:?}"),
@@ -2683,12 +3460,14 @@ fn parse_merge_ai_suggestions(
             choice,
             reason_zh,
             reason_en,
+            manual_result,
+            middle_edits,
         });
     }
     crate::diagnostics::merge_ai_trace(
         "parse.summary",
         &format!(
-            "items={} accepted={} missing_index={} unsupported_target_type={} invalid_target={} duplicate_target={} unsupported_choice={}",
+            "items={} accepted={} missing_index={} unsupported_target_type={} invalid_target={} duplicate_target={} unsupported_choice={} missing_manual_order={} invalid_manual_result={} invalid_middle_edits={}",
             items.len(),
             suggestions.len(),
             missing_index,
@@ -2696,6 +3475,9 @@ fn parse_merge_ai_suggestions(
             invalid_target,
             duplicate_target,
             unsupported_choice,
+            missing_manual_order,
+            invalid_manual_result,
+            invalid_middle_edits,
         ),
     );
     Ok(suggestions)
@@ -2712,8 +3494,461 @@ fn trace_rejected_merge_ai_item(reason: &str, item: &serde_json::Value) {
     );
 }
 
+fn guard_merge_ai_suggestions(
+    document: &MergeDocument,
+    suggestions: Vec<MergeAiSuggestion>,
+) -> Vec<MergeAiSuggestion> {
+    suggestions
+        .into_iter()
+        .map(|mut suggestion| {
+            if let MergeLineActionTarget::BaseOnlyGroup(line_index) = suggestion.target {
+                return guard_merge_ai_deletion_suggestion(document, suggestion, line_index);
+            }
+            let MergeLineActionTarget::Conflict(conflict_index) = suggestion.target else {
+                return suggestion;
+            };
+            let chosen_side = match suggestion.choice {
+                MergeAiChoice::Local => MergeSide::Local,
+                MergeAiChoice::Remote => MergeSide::Remote,
+                MergeAiChoice::Manual => {
+                    return guard_merge_ai_manual_suggestion(document, suggestion);
+                }
+            };
+            let Some(conflict) = document.conflicts().get(conflict_index) else {
+                return suggestion;
+            };
+            let (chosen_lines, other_lines, other_choice) = match chosen_side {
+                MergeSide::Local => (&conflict.local, &conflict.remote, MergeAiChoice::Remote),
+                MergeSide::Remote => (&conflict.remote, &conflict.local, MergeAiChoice::Local),
+            };
+            let bindings = merge_import_bindings(chosen_lines);
+            if bindings.is_empty()
+                || bindings.iter().any(|binding| {
+                    other_lines
+                        .iter()
+                        .any(|line| contains_identifier(line, binding))
+                })
+            {
+                return suggestion;
+            }
+
+            let mut chosen_document = document.clone();
+            chosen_document.apply_conflict(conflict_index, chosen_side);
+            let chosen_result = chosen_document.result_text();
+            let unused = bindings
+                .iter()
+                .all(|binding| count_identifier_occurrences(&chosen_result, binding) <= 1);
+            if !unused {
+                return suggestion;
+            }
+
+            let names = bindings.join(", ");
+            let import_only_choice = chosen_lines.iter().all(|line| {
+                let line = line.trim();
+                line.is_empty() || (line.starts_with("import ") && line.contains(" from "))
+            });
+            crate::diagnostics::merge_ai_trace(
+                "validation.corrected",
+                &format!(
+                    "target={:?} reason=unused_import chosen={chosen_side:?} bindings={names} import_only={import_only_choice}",
+                    suggestion.target,
+                ),
+            );
+            if import_only_choice {
+                suggestion.choice = other_choice;
+                suggestion.manual_result = None;
+                suggestion.middle_edits.clear();
+                suggestion.reason_zh = format!(
+                    "中间完整结果中仅剩导入声明本身，没有发现 {names} 的实际使用；因此不保留该未使用导入，采用另一边的删除结果。"
+                );
+                suggestion.reason_en = format!(
+                    "In the complete Middle result, {names} appears only in the import declaration and has no remaining usage, so the unused import is removed by choosing the other side."
+                );
+            } else {
+                suggestion.choice = MergeAiChoice::Manual;
+                suggestion.manual_result = None;
+                suggestion.middle_edits.clear();
+                suggestion.reason_zh = format!(
+                    "中间完整结果中没有发现 {names} 的实际使用，但包含该导入的一边还有其他改动，不能安全地整体切换到另一边；建议手动合并其他改动并删除未使用导入。"
+                );
+                suggestion.reason_en = format!(
+                    "The complete Middle result has no usage of {names}, but that side also contains other changes, so switching the whole conflict is unsafe; manually keep the other changes and remove the unused import."
+                );
+            }
+            suggestion
+        })
+        .collect()
+}
+
+fn guard_merge_ai_manual_suggestion(
+    document: &MergeDocument,
+    mut suggestion: MergeAiSuggestion,
+) -> MergeAiSuggestion {
+    let Some(manual_result) = suggestion.manual_result.as_deref() else {
+        return suggestion;
+    };
+    let middle_lines = merge_result_display_rows(document)
+        .into_iter()
+        .map(|row| row.text)
+        .collect::<Vec<_>>();
+    for manual_line in manual_result.lines() {
+        let Some((collection_name, item_count)) = explicit_array_assignment(manual_line) else {
+            continue;
+        };
+        let Some(count_name) = middle_lines
+            .iter()
+            .find_map(|line| equality_count_for_array(line, &collection_name))
+        else {
+            continue;
+        };
+        let declarations = middle_lines
+            .iter()
+            .filter(|line| {
+                contains_identifier(line, &count_name)
+                    && line.contains('=')
+                    && assignment_integer(line).is_some()
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let [declaration] = declarations.as_slice() else {
+            continue;
+        };
+        let replacement = replace_assignment_integer(declaration, item_count);
+        let Some(replacement) = replacement else {
+            continue;
+        };
+        let mut corrected = false;
+        let mut verified = false;
+        if let Some(edit) = suggestion.middle_edits.iter_mut().find(|edit| {
+            contains_identifier(&edit.expected_text, &count_name)
+                || contains_identifier(&edit.replacement_text, &count_name)
+        }) {
+            verified = true;
+            if edit.replacement_text != replacement {
+                edit.expected_text = (*declaration).to_owned();
+                edit.replacement_text = replacement;
+                corrected = true;
+            }
+        } else if assignment_integer(declaration) != Some(item_count) {
+            suggestion.middle_edits.push(MergeAiMiddleEdit {
+                expected_text: (*declaration).to_owned(),
+                replacement_text: replacement,
+            });
+            corrected = true;
+            verified = true;
+        }
+        if verified {
+            let order_zh = suggestion
+                .reason_zh
+                .split_once("\n\n")
+                .map(|(_, order)| order.to_owned());
+            let order_en = suggestion
+                .reason_en
+                .split_once("\n\n")
+                .map(|(_, order)| order.to_owned());
+            suggestion.reason_zh = format!(
+                "建议同时保留左边和右边中仍被引用的改动。中间代码明确约束 {collection_name}.length 与 {count_name} 一致，已按合并后的 {item_count} 项生成联动修改。"
+            );
+            suggestion.reason_en = format!(
+                "Keep the still-referenced changes from both Left and Right. Middle explicitly requires {collection_name}.length to match {count_name}, so the linked edit now uses the merged count of {item_count}."
+            );
+            if let Some(order) = order_zh {
+                suggestion.reason_zh.push_str("\n\n");
+                suggestion.reason_zh.push_str(&order);
+            }
+            if let Some(order) = order_en {
+                suggestion.reason_en.push_str("\n\n");
+                suggestion.reason_en.push_str(&order);
+            }
+            crate::diagnostics::merge_ai_trace(
+                if corrected {
+                    "validation.corrected"
+                } else {
+                    "validation.verified"
+                },
+                &format!(
+                    "target={:?} reason=derived_array_count collection={} count_binding={} corrected_count={item_count}",
+                    suggestion.target, collection_name, count_name
+                ),
+            );
+        }
+    }
+    suggestion
+}
+
+fn explicit_array_assignment(line: &str) -> Option<(String, usize)> {
+    let (left, right) = line.split_once('=')?;
+    let name = left
+        .trim_end()
+        .chars()
+        .rev()
+        .take_while(|character| is_identifier_character(*character))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    if name.is_empty() {
+        return None;
+    }
+    let start = right.find('[')?;
+    count_top_level_array_items(&right[start..]).map(|count| (name, count))
+}
+
+fn count_top_level_array_items(value: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut commas = 0usize;
+    let mut has_item = false;
+    for character in value.chars() {
+        if let Some(current_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == current_quote {
+                quote = None;
+            }
+            if depth == 1 && !character.is_whitespace() {
+                has_item = true;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => {
+                quote = Some(character);
+                if depth == 1 {
+                    has_item = true;
+                }
+            }
+            '[' | '(' | '{' => {
+                depth += 1;
+                if depth > 1 {
+                    has_item = true;
+                }
+            }
+            ']' => {
+                if depth == 1 {
+                    return Some(if has_item { commas + 1 } else { 0 });
+                }
+                depth = depth.checked_sub(1)?;
+            }
+            ')' | '}' => depth = depth.checked_sub(1)?,
+            ',' if depth == 1 => commas += 1,
+            _ if depth == 1 && !character.is_whitespace() => has_item = true,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn equality_count_for_array(line: &str, collection_name: &str) -> Option<String> {
+    let marker = format!("{collection_name}.length");
+    let tail = line.split_once(&marker)?.1.trim_start();
+    let tail = ["!==", "===", "!=", "=="]
+        .into_iter()
+        .find_map(|operator| tail.strip_prefix(operator))?
+        .trim_start();
+    let count_name = tail
+        .chars()
+        .take_while(|character| is_identifier_character(*character))
+        .collect::<String>();
+    (!count_name.is_empty()).then_some(count_name)
+}
+
+fn assignment_integer(line: &str) -> Option<usize> {
+    let (_, right) = line.split_once('=')?;
+    right
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+fn replace_assignment_integer(line: &str, value: usize) -> Option<String> {
+    let equals = line.find('=')?;
+    let digit_start = line[equals + 1..]
+        .char_indices()
+        .find(|(_, character)| character.is_ascii_digit())?
+        .0
+        + equals
+        + 1;
+    let digit_end = line[digit_start..]
+        .char_indices()
+        .take_while(|(_, character)| character.is_ascii_digit())
+        .map(|(index, character)| index + character.len_utf8())
+        .last()?
+        + digit_start;
+    Some(format!(
+        "{}{value}{}",
+        &line[..digit_start],
+        &line[digit_end..]
+    ))
+}
+
+fn guard_merge_ai_deletion_suggestion(
+    document: &MergeDocument,
+    mut suggestion: MergeAiSuggestion,
+    line_index: usize,
+) -> MergeAiSuggestion {
+    let chosen_side = match suggestion.choice {
+        MergeAiChoice::Local => MergeSide::Local,
+        MergeAiChoice::Remote => MergeSide::Remote,
+        MergeAiChoice::Manual => return suggestion,
+    };
+    let Some(group) = base_only_display_groups(document)
+        .into_iter()
+        .find(|group| group.line_index == line_index)
+    else {
+        return suggestion;
+    };
+    if chosen_side == group.missing_side {
+        return suggestion;
+    }
+
+    let kept_lines = document.lines[group.line_index..group.line_index + group.line_count]
+        .iter()
+        .filter_map(|line| match chosen_side {
+            MergeSide::Local => line.local.clone(),
+            MergeSide::Remote => line.remote.clone(),
+        })
+        .collect::<Vec<_>>();
+    let bindings = merge_import_bindings(&kept_lines);
+    if bindings.is_empty()
+        || bindings.iter().any(|binding| {
+            document.conflicts().iter().any(|conflict| {
+                conflict.local.iter().chain(&conflict.remote).any(|line| {
+                    !line.trim_start().starts_with("import ") && contains_identifier(line, binding)
+                })
+            })
+        })
+    {
+        return suggestion;
+    }
+
+    let mut kept_document = document.clone();
+    kept_document.drop_base_only_group(line_index, group.missing_side);
+    let kept_result = kept_document.result_text();
+    if !bindings
+        .iter()
+        .all(|binding| count_identifier_usages_outside_imports(&kept_result, binding) == 0)
+    {
+        return suggestion;
+    }
+
+    let names = bindings.join(", ");
+    suggestion.choice = match group.missing_side {
+        MergeSide::Local => MergeAiChoice::Local,
+        MergeSide::Remote => MergeAiChoice::Remote,
+    };
+    suggestion.manual_result = None;
+    suggestion.middle_edits.clear();
+    suggestion.reason_zh = format!(
+        "中间完整结果和所有待解决冲突中都没有发现 {names} 的实际使用；保留该块只会留下未使用导入，因此采用删除它的一边。"
+    );
+    suggestion.reason_en = format!(
+        "Neither the complete Middle result nor any unresolved conflict contains a remaining use of {names}; keeping this block would only retain an unused import, so the side that deletes it is selected."
+    );
+    crate::diagnostics::merge_ai_trace(
+        "validation.corrected",
+        &format!(
+            "target={:?} reason=unused_base_only_import bindings={names}",
+            suggestion.target,
+        ),
+    );
+    suggestion
+}
+
+fn merge_import_bindings(lines: &[String]) -> Vec<String> {
+    let mut bindings = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        let Some(mut clause) = trimmed.strip_prefix("import ") else {
+            continue;
+        };
+        clause = clause.strip_prefix("type ").unwrap_or(clause);
+        let Some((clause, _)) = clause.split_once(" from ") else {
+            continue;
+        };
+        let clause = clause.trim();
+        if let Some((default, rest)) = clause.split_once(',') {
+            push_import_binding(&mut bindings, default);
+            collect_named_import_bindings(&mut bindings, rest);
+        } else if clause.starts_with('{') {
+            collect_named_import_bindings(&mut bindings, clause);
+        } else if let Some(alias) = clause.strip_prefix("* as ") {
+            push_import_binding(&mut bindings, alias);
+        } else {
+            push_import_binding(&mut bindings, clause);
+        }
+    }
+    bindings.sort();
+    bindings.dedup();
+    bindings
+}
+
+fn collect_named_import_bindings(bindings: &mut Vec<String>, clause: &str) {
+    let clause = clause.trim().trim_start_matches('{').trim_end_matches('}');
+    for item in clause.split(',') {
+        let item = item.trim().strip_prefix("type ").unwrap_or(item.trim());
+        let binding = item.rsplit_once(" as ").map_or(item, |(_, alias)| alias);
+        push_import_binding(bindings, binding);
+    }
+}
+
+fn push_import_binding(bindings: &mut Vec<String>, binding: &str) {
+    let binding = binding.trim();
+    if binding.len() >= 2
+        && binding.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '$'
+        })
+    {
+        bindings.push(binding.to_owned());
+    }
+}
+
+fn contains_identifier(text: &str, identifier: &str) -> bool {
+    count_identifier_occurrences(text, identifier) > 0
+}
+
+fn count_identifier_occurrences(text: &str, identifier: &str) -> usize {
+    text.match_indices(identifier)
+        .filter(|(index, _)| {
+            let before = text[..*index].chars().next_back();
+            let after = text[*index + identifier.len()..].chars().next();
+            !before.is_some_and(is_identifier_character)
+                && !after.is_some_and(is_identifier_character)
+        })
+        .count()
+}
+
+fn count_identifier_usages_outside_imports(text: &str, identifier: &str) -> usize {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("import "))
+        .map(|line| count_identifier_occurrences(line, identifier))
+        .sum()
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '$'
+}
+
 fn merge_ai_system_prompt() -> &'static str {
-    "You are a conservative Git merge assistant. Never claim to edit files and never execute changes. Analyze each conflict and deletion decision using the supplied three-way text, Git history, and related file context. The panes are named Left, Middle, and Right; they do not imply local or remote repository ownership. Recommend left only when the Left pane should win, right only when the Right pane should win, or manual when the Middle result needs human editing. Submit recommendations exactly once through the submit_merge_suggestions tool."
+    "You are a conservative Git merge assistant. Never claim to edit files and never execute changes. Analyze each conflict and deletion decision using the complete Left/Base/Right texts, the current editable Middle draft, branch-specific Git history, the current repository merge diff, symbol references, and related files. The panes are named Left, Middle, and Right; they do not imply local or remote repository ownership. Treat the Middle draft as the authoritative context for changes already merged outside the target conflict. Never preserve an import, declaration, dependency, or call merely because it exists on one side: first verify that the merged Middle draft or current related code still uses it. When either side adds, removes, renames, or reorders array elements, object properties, method or function parameters and arguments, enum members, or ordered operations, inspect the complete Middle draft plus related definitions and callers for resulting effects before choosing. Recommend left only when evidence shows the Left pane should win, right only when evidence shows the Right pane should win, or manual when the correct Middle result requires editing or evidence is insufficient. For an exact manual resolution, set manual_result_provided to true and return the complete replacement for that target in manual_result. Use middle_edits only for additional exact changes to already-resolved Middle code, including non-diff lines; every expected_text must be a unique substring within one logical Middle line, and replacement_text may contain multiple lines. Leave manual_result_provided false and middle_edits empty when evidence is insufficient. These payloads are proposals applied only after user confirmation. For every manual recommendation that retains meaningful content from both sides, merge_order_zh and merge_order_en must state the exact execution or precedence order. For control-flow branches, analyze condition overlap and state which branch wins when both conditions match; never claim mutual exclusivity without concrete supplied proof. If the retained edits are structurally parallel, explicitly state that no runtime order exists and specify their placement. If evidence cannot determine the order, list the candidate orders and their behavioral difference instead of saying only to keep both. Keep each localized reason to one or two short sentences: conclusion first, then only decisive evidence. Keep merge order to one short sentence and do not duplicate it in the reason. Do not expose the full reasoning chain. Submit recommendations exactly once through the submit_merge_suggestions tool."
+}
+
+fn merge_ai_editable_middle_text(document: &MergeDocument) -> String {
+    let mut text = merge_result_display_rows(document)
+        .into_iter()
+        .map(|row| row.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text
 }
 
 fn merge_ai_prompt(
@@ -2766,26 +4001,37 @@ fn merge_ai_prompt(
             )
         })
         .collect::<String>();
-    let sources = format!(
-        "BASE FILE EXCERPT:\n{}\nLEFT FILE EXCERPT:\n{}\nRIGHT FILE EXCERPT:\n{}",
-        truncate_merge_ai_text(&sources.base, 32 * 1024),
-        truncate_merge_ai_text(&sources.local, 32 * 1024),
-        truncate_merge_ai_text(&sources.remote, 32 * 1024),
+    let source_excerpts = format!(
+        "BASE FILE EXCERPT:\n{}\nLEFT FILE EXCERPT:\n{}\nRIGHT FILE EXCERPT:\n{}\nMIDDLE AUTO-MERGED DRAFT:\n{}",
+        truncate_merge_ai_text(&sources.base, 20 * 1024),
+        truncate_merge_ai_text(&sources.local, 20 * 1024),
+        truncate_merge_ai_text(&sources.remote, 20 * 1024),
+        truncate_merge_ai_text(&merge_ai_editable_middle_text(document), 32 * 1024),
     );
     format!(
-        "Analyze a merge for `{}`. For every suggestion, write both `reason_zh` in Simplified Chinese and `reason_en` in English. In those reasons call the panes 左边/中间/右边 and Left/Middle/Right respectively; never infer or say local branch or remote branch. Call `{MERGE_AI_TOOL_NAME}` exactly once and include one suggestion for every conflict and every deletion decision. The call is advisory only: do not claim that any file or merge result was changed.\n\nCONFLICTS:{conflicts}\n\nDELETION DECISIONS:{deletions}\n\nGIT HISTORY:\n{}\n\nRELATED FILE CONTEXT:{}\n\n{}",
+        "Analyze a merge for `{}`. Before choosing a side, reconcile each target with the entire MIDDLE AUTO-MERGED DRAFT and CURRENT REPOSITORY MERGE STATE, because non-conflicting edits may make a line from either side obsolete. For imports and declarations, explicitly verify current usage in the Middle draft and SYMBOL REFERENCES; absence of usage is evidence for removal, not preservation. When either side adds, removes, renames, or reorders array elements, object properties, method or function parameters and arguments, enum members, or ordered operations, inspect the complete Middle draft plus related definitions and callers for resulting effects before choosing. Use branch-specific history to infer intent, but choose manual if the evidence conflicts or the correct result is neither side verbatim. When the correct target is neither side verbatim and evidence is sufficient, set manual_result_provided=true and put the exact complete target replacement in manual_result. Put any additional required edits to already-resolved Middle code in middle_edits. This includes non-diff lines. Each expected_text must occur exactly once inside one logical Middle line; replacement_text may contain multiple lines, and insertions must retain the chosen anchor text in replacement_text. Do not use line numbers or Markdown fences. For left/right choices, or when evidence is insufficient, use manual_result_provided=false, manual_result=\"\", and middle_edits=[] unless the selected side mechanically requires a proven additional Middle edit. For every suggestion, write both `reason_zh` in Simplified Chinese and `reason_en` in English. Each reason must be exactly one or two short sentences: the first states the recommendation, and the optional second cites only the decisive Middle/history/reference evidence. Do not repeat code, merge order, or the full analysis. Also always return `merge_order_zh` and `merge_order_en` as one short sentence: for a manual result that retains both sides, state the exact before/after or precedence order; for control-flow branches analyze whether conditions overlap and state which branch wins when both match, never asserting mutual exclusivity without concrete evidence; for parallel declarations/fields state that no runtime order exists and give their structural placement; when evidence is insufficient state the candidate orders and how behavior differs. Never respond only that both sides should be kept. For left/right choices use 不适用 and Not applicable. In those reasons call the panes 左边/中间/右边 and Left/Middle/Right respectively; never infer or say local branch or remote branch. Call `{MERGE_AI_TOOL_NAME}` exactly once and include one suggestion for every conflict and every deletion decision. The call is advisory only: do not claim that any file or merge result was changed.\n\nCONFLICTS:{conflicts}\n\nDELETION DECISIONS:{deletions}\n\nGIT HISTORY:\n{}\n\nCURRENT REPOSITORY MERGE STATE:\n{}\n\nSYMBOL REFERENCES IN CURRENT WORKTREE:\n{}\n\nRELATED FILE CONTEXT:{}\n\n{}",
         args.output.display(),
         if context.history.is_empty() {
             "(unavailable)"
         } else {
             &context.history
         },
+        if context.repository_state.is_empty() {
+            "(unavailable)"
+        } else {
+            &context.repository_state
+        },
+        if context.symbol_references.is_empty() {
+            "(none found)"
+        } else {
+            &context.symbol_references
+        },
         if context.related_files.is_empty() {
             "(none found)"
         } else {
             &context.related_files
         },
-        sources,
+        source_excerpts,
     )
 }
 
@@ -2796,6 +4042,21 @@ fn truncate_merge_ai_text(value: &str, max_chars: usize) -> String {
     let mut truncated = value.chars().take(max_chars).collect::<String>();
     truncated.push_str("\n[context truncated]");
     truncated
+}
+
+fn compact_merge_ai_text(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let compact = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else {
+        compact
+    }
+}
+
+fn normalize_merge_ai_code(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 impl App for MergeToolApp {
@@ -3332,10 +4593,14 @@ fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
                         );
                     } else if let Some(notice) = app.ai_notice {
                         let text = match notice {
-                            MergeAiNotice::Completed(count) => format!(
-                                "{} {count} {}",
+                            MergeAiNotice::Completed {
+                                suggestions,
+                                changes,
+                            } => format!(
+                                "{} {suggestions} {} · {changes} {}",
                                 mt(app.language, "ai_completed_prefix"),
-                                mt(app.language, "ai_completed_suffix")
+                                mt(app.language, "ai_completed_suffix"),
+                                mt(app.language, "ai_changes_suffix")
                             ),
                             MergeAiNotice::NoSuggestions => {
                                 mt(app.language, "ai_no_suggestions").to_owned()
@@ -3667,6 +4932,17 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         Pos2::new(right.right() + MERGE_OVERVIEW_GAP, rect.top()),
         Vec2::new(MERGE_OVERVIEW_WIDTH, rect.height()),
     );
+    app.hovered_search_pane = ui.ctx().pointer_hover_pos().and_then(|pointer| {
+        if left.contains(pointer) {
+            Some(MergeSearchPane::Left)
+        } else if result.contains(pointer) {
+            Some(MergeSearchPane::Middle)
+        } else if right.contains(pointer) {
+            Some(MergeSearchPane::Right)
+        } else {
+            None
+        }
+    });
     let horizontal_scrollbar = Rect::from_min_max(
         Pos2::new(left.left(), rect.bottom() + MERGE_HORIZONTAL_SCROLLBAR_GAP),
         Pos2::new(
@@ -3699,6 +4975,7 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
     let mut result_output = MergeResultPanelOutput {
         scroll_y: requested_scroll_y,
         viewport_height: 0.0,
+        search_result_y: None,
         geometry: MergePanelGeometry::default(),
     };
     let use_virtual_rows = app.uses_virtual_merge_rows();
@@ -3786,6 +5063,21 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         next_shared_scroll_y = merge_scroll_offset_after_input(
             frame_scroll_y,
             scroll_delta_y,
+            result_output.viewport_height,
+            stable_content_height,
+        );
+        ui.ctx().request_repaint();
+    }
+    // Search navigation, like conflict navigation, is resolved only after all three panes have
+    // rendered. Writing `app.shared_scroll_y` from inside a pane is ineffective because this
+    // outer synchronization pass still owns the frame's canonical offset and would overwrite it.
+    let search_result_y = result_output
+        .search_result_y
+        .or(remote_output.search_result_y)
+        .or(local_output.search_result_y);
+    if let Some(search_result_y) = search_result_y {
+        next_shared_scroll_y = merge_search_scroll_target(
+            search_result_y,
             result_output.viewport_height,
             stable_content_height,
         );
@@ -4117,6 +5409,16 @@ fn merge_ai_suggestion_overlays(
                     continue;
                 }
             };
+        let mut connector_anchors = connector_anchors;
+        for edit in &suggestion.middle_edits {
+            if let Some(edit_anchor) = merge_ai_middle_edit_anchor(
+                result_geometry,
+                &app.manual_result_lines,
+                &edit.expected_text,
+            ) {
+                connector_anchors.push(edit_anchor);
+            }
+        }
         let width = 252.0_f32.min(anchor.width() - 12.0).max(164.0);
         let x = match placement {
             MergeAiCardPlacement::Middle => anchor.center().x - width * 0.5,
@@ -4169,12 +5471,64 @@ fn merge_ai_suggestion_overlays(
                             });
                         });
                         ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(suggestion.reason(language))
+                        for (index, paragraph) in
+                            suggestion.reason(language).split("\n\n").enumerate()
+                        {
+                            if index > 0 {
+                                ui.add_space(5.0);
+                            }
+                            ui.label(RichText::new(paragraph).small().color(if index == 0 {
+                                palette.text
+                            } else {
+                                palette.muted
+                            }));
+                        }
+                        if suggestion.is_actionable() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} {}",
+                                    mt(language, "ai_actual_changes"),
+                                    suggestion.change_count()
+                                ))
                                 .small()
-                                .color(palette.text),
-                        );
-                        if !matches!(suggestion.choice, MergeAiChoice::Manual) {
+                                .strong()
+                                .color(palette.accent),
+                            );
+                            if let Some(result) = suggestion.manual_result.as_deref() {
+                                let preview = format!(
+                                    "{}: {}",
+                                    mt(language, "ai_target_result"),
+                                    merge_ai_code_preview(result, 72)
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(preview).small().color(palette.muted),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(result);
+                            }
+                            for edit in &suggestion.middle_edits {
+                                let preview = format!(
+                                    "{}: {} → {}",
+                                    mt(language, "ai_middle_edit"),
+                                    merge_ai_code_preview(&edit.expected_text, 44),
+                                    merge_ai_code_preview(&edit.replacement_text, 44),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(preview).small().color(palette.muted),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(format!(
+                                    "{}\n→\n{}",
+                                    edit.expected_text, edit.replacement_text
+                                ));
+                            }
+                        }
+                        if suggestion.is_actionable() {
                             ui.add_space(4.0);
                             if ui
                                 .small_button(mt(language, "ai_apply_suggestion"))
@@ -4245,6 +5599,56 @@ fn merge_ai_middle_anchor(
             Pos2::new(right, y + MERGE_CODE_ROW_HEIGHT * 0.5),
         ))
     })
+}
+
+fn merge_ai_middle_edit_anchor(
+    geometry: &MergePanelGeometry,
+    lines: &[String],
+    expected_text: &str,
+) -> Option<Pos2> {
+    let row_index = merge_ai_middle_edit_row(lines, expected_text)?;
+    geometry
+        .rows
+        .iter()
+        .find(|(index, _)| *index == row_index)
+        .map(|(_, rect)| rect.left_center())
+}
+
+fn merge_ai_middle_edit_row(lines: &[String], expected_text: &str) -> Option<usize> {
+    if expected_text.is_empty() || expected_text.contains(['\r', '\n']) {
+        return None;
+    }
+    let matches = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.contains(expected_text).then_some(index))
+        .collect::<Vec<_>>();
+    let [row_index] = matches.as_slice() else {
+        return None;
+    };
+    Some(*row_index)
+}
+
+fn merge_ai_pending_middle_edit_rows(
+    suggestions: &HashMap<MergeLineActionTarget, MergeAiSuggestion>,
+    lines: &[String],
+) -> HashSet<usize> {
+    suggestions
+        .values()
+        .flat_map(|suggestion| suggestion.middle_edits.iter())
+        .filter_map(|edit| merge_ai_middle_edit_row(lines, &edit.expected_text))
+        .collect()
+}
+
+fn merge_ai_code_preview(value: &str, max_chars: usize) -> String {
+    let flattened = value.lines().collect::<Vec<_>>().join(" ↵ ");
+    let mut chars = flattened.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 fn merge_ai_overlay_allowed_offset(viewport: Rect, anchor_pos: Pos2, card_size: Vec2) -> Rect {
@@ -4377,6 +5781,141 @@ fn merge_ai_choice_label(language: MergeLanguage, choice: &MergeAiChoice) -> &'s
     }
 }
 
+struct MergeSearchBarOutput {
+    matches: Vec<usize>,
+    current_row: Option<usize>,
+    jump_row: Option<usize>,
+}
+
+fn merge_search_matches<'a>(lines: impl IntoIterator<Item = &'a str>, query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.to_lowercase().contains(&query).then_some(index))
+        .collect()
+}
+
+fn merge_next_search_index(current: usize, match_count: usize, direction: NavDirection) -> usize {
+    if match_count == 0 {
+        return 0;
+    }
+    match direction {
+        NavDirection::Previous => current
+            .checked_sub(1)
+            .unwrap_or(match_count.saturating_sub(1)),
+        NavDirection::Next => (current + 1) % match_count,
+    }
+}
+
+fn merge_search_bar<'a>(
+    ui: &mut Ui,
+    search: &mut MergeSearchState,
+    pane: MergeSearchPane,
+    lines: impl IntoIterator<Item = &'a str>,
+    language: MergeLanguage,
+    palette: MergePalette,
+) -> MergeSearchBarOutput {
+    if !search.open || search.pane != pane {
+        return MergeSearchBarOutput {
+            matches: Vec::new(),
+            current_row: None,
+            jump_row: None,
+        };
+    }
+
+    let lines = lines.into_iter().collect::<Vec<_>>();
+    let mut direction = None;
+    let mut close = false;
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let id = ui.make_persistent_id(("merge_code_search", pane));
+        let response = ui.add_sized(
+            [ui.available_width().max(180.0) - 118.0, 24.0],
+            egui::TextEdit::singleline(&mut search.query)
+                .id(id)
+                .hint_text(mt(language, "search_placeholder")),
+        );
+        if search.request_focus {
+            response.request_focus();
+            search.request_focus = false;
+        }
+        changed = response.changed();
+        let preview_matches = merge_search_matches(lines.iter().copied(), &search.query);
+        let preview_current = if preview_matches.is_empty() {
+            0
+        } else {
+            search.current.min(preview_matches.len() - 1) + 1
+        };
+        ui.label(
+            RichText::new(format!("{preview_current}/{}", preview_matches.len()))
+                .small()
+                .color(palette.muted),
+        );
+        let enter = response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if enter {
+            direction = Some(if ui.input(|input| input.modifiers.shift) {
+                NavDirection::Previous
+            } else {
+                NavDirection::Next
+            });
+        }
+        if ui.small_button("↑").clicked() {
+            direction = Some(NavDirection::Previous);
+        }
+        if ui.small_button("↓").clicked() {
+            direction = Some(NavDirection::Next);
+        }
+        if ui.small_button("×").clicked() {
+            close = true;
+        }
+    });
+
+    let matches = merge_search_matches(lines.iter().copied(), &search.query);
+    if changed {
+        search.current = 0;
+    } else if let Some(direction) = direction {
+        if !matches.is_empty() {
+            search.current = merge_next_search_index(search.current, matches.len(), direction);
+        }
+    }
+    if matches.is_empty() {
+        search.current = 0;
+    } else {
+        search.current = search.current.min(matches.len() - 1);
+    }
+    let current_row = matches.get(search.current).copied();
+    let jump_row = (changed || direction.is_some())
+        .then_some(current_row)
+        .flatten();
+    if close {
+        search.open = false;
+    }
+    MergeSearchBarOutput {
+        matches,
+        current_row,
+        jump_row,
+    }
+}
+
+fn paint_merge_search_match(ui: &Ui, rect: Rect, current: bool, palette: MergePalette) {
+    let alpha = if current { 44 } else { 22 };
+    let fill = Color32::from_rgba_unmultiplied(
+        palette.accent.r(),
+        palette.accent.g(),
+        palette.accent.b(),
+        alpha,
+    );
+    ui.painter().rect_filled(
+        rect.intersect(ui.clip_rect()),
+        egui::CornerRadius::ZERO,
+        fill,
+    );
+}
+
 fn merge_side_panel(
     ui: &mut Ui,
     app: &mut MergeToolApp,
@@ -4389,6 +5928,7 @@ fn merge_side_panel(
     palette: MergePalette,
 ) -> MergeSidePanelOutput {
     let mut requested_result_scroll_y = None;
+    let mut search_result_y = None;
     let mut navigation_target = None;
     let mut geometry = MergePanelGeometry::default();
     let mut pending_line_action = None;
@@ -4403,12 +5943,32 @@ fn merge_side_panel(
     merge_panel_frame(ui, palette, |ui| {
         side_header(ui, title, &path, palette);
         let nav_target = side_conflict_nav(ui, app, side, palette);
-        ui.add_space(8.0);
-        let use_virtual_rows = app.uses_virtual_merge_rows();
+        let search_pane = match side {
+            MergeSide::Local => MergeSearchPane::Left,
+            MergeSide::Remote => MergeSearchPane::Right,
+        };
         let rows = match side {
             MergeSide::Local => &app.local_display_rows,
             MergeSide::Remote => &app.remote_display_rows,
         };
+        let search_output = merge_search_bar(
+            ui,
+            &mut app.search,
+            search_pane,
+            rows.iter().map(|row| row.text.as_str()),
+            app.language,
+            palette,
+        );
+        if let Some(row) = search_output.jump_row {
+            let side_scroll_y = row as f32 * MERGE_CODE_ROW_HEIGHT;
+            search_result_y = Some(if app.collapse_unchanged {
+                side_scroll_y
+            } else {
+                app.cached_result_scroll_y_for_side_scroll(side, side_scroll_y)
+            });
+        }
+        ui.add_space(8.0);
+        let use_virtual_rows = app.uses_virtual_merge_rows();
         let visible_rows = merge_visible_tail_len(rows, app.collapse_unchanged);
         let hidden_rows = rows.len().saturating_sub(visible_rows);
         let display_rows = visible_rows + usize::from(hidden_rows > 0);
@@ -4460,6 +6020,14 @@ fn merge_side_panel(
                         palette,
                         &mut pending_line_action,
                     );
+                    if search_output.matches.binary_search(&display_index).is_ok() {
+                        paint_merge_search_match(
+                            ui,
+                            rect,
+                            search_output.current_row == Some(display_index),
+                            palette,
+                        );
+                    }
                     geometry.record_row(display_index, rect);
                 }
             });
@@ -4501,6 +6069,7 @@ fn merge_side_panel(
     });
     MergeSidePanelOutput {
         requested_result_scroll_y,
+        search_result_y,
         navigation_target,
         geometry,
         pending_line_action,
@@ -4518,10 +6087,22 @@ fn merge_result_panel(
 ) -> MergeResultPanelOutput {
     let mut next_scroll_y = scroll_y;
     let mut viewport_height = 0.0;
+    let mut search_result_y = None;
     let mut geometry = MergePanelGeometry::default();
     merge_panel_frame(ui, palette, |ui| {
         result_header(ui, app, palette);
         merge_result_nav_spacer(ui);
+        let search_output = merge_search_bar(
+            ui,
+            &mut app.search,
+            MergeSearchPane::Middle,
+            app.manual_result_lines.iter().map(String::as_str),
+            app.language,
+            palette,
+        );
+        if let Some(row) = search_output.jump_row {
+            search_result_y = Some(row as f32 * MERGE_CODE_ROW_HEIGHT);
+        }
         ui.add_space(8.0);
         if app.manual_result_lines.is_empty() {
             app.manual_result_lines
@@ -4548,6 +6129,8 @@ fn merge_result_panel(
                 })
                 .collect::<Vec<_>>()
         };
+        let ai_middle_edit_rows =
+            merge_ai_pending_middle_edit_rows(&app.ai_suggestions, &app.manual_result_lines);
         let visible_rows = merge_visible_result_len(&result_row_styles, app.collapse_unchanged);
         let hidden_rows = line_count.saturating_sub(visible_rows);
         let display_rows = visible_rows + usize::from(hidden_rows > 0);
@@ -4589,10 +6172,19 @@ fn merge_result_panel(
                         background,
                         app.highlight_mode,
                         reference_text,
+                        ai_middle_edit_rows.contains(&result_index),
                         scroll_x,
                         code_content_width,
                         palette,
                     );
+                    if search_output.matches.binary_search(&result_index).is_ok() {
+                        paint_merge_search_match(
+                            ui,
+                            rect,
+                            search_output.current_row == Some(result_index),
+                            palette,
+                        );
+                    }
                     geometry.record_row(result_index, rect);
                     if let Some(before_line) = before_line {
                         changed_lines.push((result_index, before_line));
@@ -4620,6 +6212,7 @@ fn merge_result_panel(
     MergeResultPanelOutput {
         scroll_y: next_scroll_y,
         viewport_height,
+        search_result_y,
         geometry,
     }
 }
@@ -4641,6 +6234,15 @@ fn merge_visible_tail_len(rows: &[CachedMergeSideDisplayRow], collapse: bool) ->
 
 fn merge_clamp_scroll_offset(offset_y: f32, content_height: f32, viewport_height: f32) -> f32 {
     offset_y.clamp(0.0, (content_height - viewport_height).max(0.0))
+}
+
+fn merge_search_scroll_target(result_row_y: f32, viewport_height: f32, content_height: f32) -> f32 {
+    let row_center = result_row_y + MERGE_CODE_ROW_HEIGHT * 0.5;
+    merge_clamp_scroll_offset(
+        row_center - viewport_height * 0.5,
+        content_height,
+        viewport_height,
+    )
 }
 
 fn merge_side_offset_changed_by_user(
@@ -5957,6 +7559,7 @@ fn merge_editable_result_row(
     background: Option<(Color32, usize)>,
     highlight_mode: MergeHighlightMode,
     reference_text: Option<&str>,
+    ai_suggested_edit: bool,
     scroll_x: f32,
     code_content_width: f32,
     palette: MergePalette,
@@ -5977,6 +7580,18 @@ fn merge_editable_result_row(
         );
         ui.painter()
             .rect_filled(fill_rect, egui::CornerRadius::ZERO, fill);
+    }
+    if ai_suggested_edit {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::ZERO,
+            color_with_opacity(palette.accent, 0.14),
+        );
+        ui.painter().rect_filled(
+            Rect::from_min_max(rect.min, Pos2::new(rect.left() + 3.0, rect.bottom())),
+            egui::CornerRadius::ZERO,
+            palette.accent,
+        );
     }
     paint_result_side_status_badges(ui, rect, tone, palette);
     ui.painter().text(
@@ -7636,6 +9251,7 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (MergeLanguage::Chinese, "local") => "左边",
         (MergeLanguage::Chinese, "remote") => "右边",
         (MergeLanguage::Chinese, "result") => "中间",
+        (MergeLanguage::Chinese, "search_placeholder") => "搜索代码",
         (MergeLanguage::Chinese, "accept_left") => "使用左边",
         (MergeLanguage::Chinese, "accept_right") => "使用右边",
         (MergeLanguage::Chinese, "apply") => "应用",
@@ -7647,6 +9263,10 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (MergeLanguage::Chinese, "ai_analyzing") => "AI 正在分析冲突",
         (MergeLanguage::Chinese, "ai_completed_prefix") => "AI 分析完成：",
         (MergeLanguage::Chinese, "ai_completed_suffix") => "条建议",
+        (MergeLanguage::Chinese, "ai_changes_suffix") => "项实际改动",
+        (MergeLanguage::Chinese, "ai_actual_changes") => "将执行改动",
+        (MergeLanguage::Chinese, "ai_target_result") => "冲突区结果",
+        (MergeLanguage::Chinese, "ai_middle_edit") => "中间代码",
         (MergeLanguage::Chinese, "ai_no_suggestions") => "AI 分析完成：暂无可用建议",
         (MergeLanguage::Chinese, "ai_no_reason") => "未提供说明。",
         (MergeLanguage::Chinese, "ai_choose_local") => "建议采用左边",
@@ -7698,6 +9318,7 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (_, "local") => "Left",
         (_, "remote") => "Right",
         (_, "result") => "Middle",
+        (_, "search_placeholder") => "Search code",
         (_, "accept_left") => "Use Left",
         (_, "accept_right") => "Use Right",
         (_, "apply") => "Apply",
@@ -7709,6 +9330,10 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (_, "ai_analyzing") => "AI is analyzing conflicts",
         (_, "ai_completed_prefix") => "AI analysis complete:",
         (_, "ai_completed_suffix") => "suggestion(s)",
+        (_, "ai_changes_suffix") => "actual change(s)",
+        (_, "ai_actual_changes") => "Changes to apply",
+        (_, "ai_target_result") => "Conflict result",
+        (_, "ai_middle_edit") => "Middle code",
         (_, "ai_no_suggestions") => "AI analysis complete: no suggestions",
         (_, "ai_no_reason") => "No explanation provided.",
         (_, "ai_choose_local") => "Recommend Left",
@@ -7757,6 +9382,7 @@ mod tests {
     use super::*;
 
     static MERGE_LOAD_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+    static MERGE_AI_CONTEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
     fn test_merge_args() -> MergeArgs {
         MergeArgs {
@@ -7770,6 +9396,332 @@ mod tests {
             language: MergeLanguage::Chinese,
             ai_model_name: None,
         }
+    }
+
+    fn run_context_test_git(repo: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        #[cfg(target_os = "windows")]
+        command.creation_flags(MERGE_WINDOWS_CREATE_NO_WINDOW);
+        let output = command
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("unable to run git {}: {error}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn live_merge_stage_text(repo: &Path, stage: usize, relative_path: &str) -> String {
+        let mut command = Command::new("git");
+        #[cfg(target_os = "windows")]
+        command.creation_flags(MERGE_WINDOWS_CREATE_NO_WINDOW);
+        let output = command
+            .arg("-C")
+            .arg(repo)
+            .args(["show", &format!(":{stage}:{relative_path}")])
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("unable to read stage {stage} for {relative_path}: {error}")
+            });
+        assert!(
+            output.status.success(),
+            "unable to read stage {stage} for {relative_path}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap_or_else(|error| {
+            panic!("stage {stage} for {relative_path} is not UTF-8: {error}")
+        })
+    }
+
+    /// Manual live regression for the configured model. It reads Git's unmerged index stages and
+    /// calls the same context collector, tool schema, HTTP request, parser, and safety guard as the
+    /// Merge window, without opening or controlling any UI. API keys are never printed.
+    #[test]
+    #[ignore = "requires a configured AI model and explicit GIT_AGENT_LIVE_AI_REPO"]
+    fn live_merge_ai_self_test_current_index() {
+        let repo = PathBuf::from(
+            env::var("GIT_AGENT_LIVE_AI_REPO")
+                .expect("set GIT_AGENT_LIVE_AI_REPO to an intentionally conflicted repository"),
+        );
+        let configured_files = env::var("GIT_AGENT_LIVE_AI_FILES").unwrap_or_default();
+        let files = if configured_files.trim().is_empty() {
+            run_context_test_git(&repo, &["diff", "--name-only", "--diff-filter=U"])
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        } else {
+            configured_files
+                .split(';')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !files.is_empty(),
+            "repository has no selected unmerged files"
+        );
+        let requested_model = env::var("GIT_AGENT_LIVE_AI_MODEL").ok();
+        let config = crate::app::load_merge_ai_model_config(requested_model.as_deref())
+            .expect("unable to load the configured AI model");
+        println!(
+            "LIVE_AI_CONFIG\tname={}\tformat={:?}\tbase_url={}\tmodel_id={}",
+            config.name,
+            config.api_format,
+            merge_ai_url_for_log(&config.base_url),
+            config.model_id,
+        );
+
+        let temp_root = env::temp_dir().join(format!(
+            "git-agent-live-ai-{}-{}",
+            std::process::id(),
+            MERGE_AI_CONTEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&temp_root).expect("unable to create live AI temporary directory");
+
+        for (file_index, relative_path) in files.iter().enumerate() {
+            let base = live_merge_stage_text(&repo, 1, relative_path);
+            let local = live_merge_stage_text(&repo, 2, relative_path);
+            let remote = live_merge_stage_text(&repo, 3, relative_path);
+            let document = three_way_merge(&base, &local, &remote);
+            let sources = MergeSourceText {
+                base: base.clone(),
+                local: local.clone(),
+                remote: remote.clone(),
+            };
+            let file_temp = temp_root.join(file_index.to_string());
+            fs::create_dir_all(&file_temp).expect("unable to create file temporary directory");
+            let base_path = file_temp.join("base.ts");
+            let local_path = file_temp.join("left.ts");
+            let remote_path = file_temp.join("right.ts");
+            fs::write(&base_path, base).expect("unable to write base stage");
+            fs::write(&local_path, local).expect("unable to write left stage");
+            fs::write(&remote_path, remote).expect("unable to write right stage");
+            let args = MergeArgs {
+                base: base_path,
+                local: local_path,
+                remote: remote_path,
+                output: repo.join(relative_path),
+                repo_root: Some(repo.clone()),
+                stage: false,
+                theme: MergeTheme::Light,
+                language: MergeLanguage::Chinese,
+                ai_model_name: requested_model.clone(),
+            };
+            let context =
+                collect_merge_ai_context(&args, &sources, &document).unwrap_or_else(|error| {
+                    panic!("context collection failed for {relative_path}: {error}")
+                });
+            println!(
+                "LIVE_AI_CONTEXT\tfile={}\tconflicts={}\tdeletions={}\thistory_chars={}\tstate_chars={}\treferences_chars={}\trelated_chars={}",
+                relative_path,
+                document.conflicts().len(),
+                base_only_display_groups(&document).len(),
+                context.history.chars().count(),
+                context.repository_state.chars().count(),
+                context.symbol_references.chars().count(),
+                context.related_files.chars().count(),
+            );
+            for conflict in document.conflicts() {
+                println!(
+                    "LIVE_AI_TARGET\tfile={}\ttarget=Conflict({})\tbase={}\tleft={}\tright={}",
+                    relative_path,
+                    conflict.index,
+                    serde_json::to_string(&conflict.base).expect("encode base conflict"),
+                    serde_json::to_string(&conflict.local).expect("encode left conflict"),
+                    serde_json::to_string(&conflict.remote).expect("encode right conflict"),
+                );
+            }
+            for group in base_only_display_groups(&document) {
+                let lines = &document.lines[group.line_index..group.line_index + group.line_count];
+                println!(
+                    "LIVE_AI_TARGET\tfile={}\ttarget=BaseOnlyGroup({})\tmissing_side={:?}\tbase={}\tleft={}\tright={}",
+                    relative_path,
+                    group.line_index,
+                    group.missing_side,
+                    serde_json::to_string(
+                        &lines
+                            .iter()
+                            .filter_map(|line| line.base.as_deref())
+                            .collect::<Vec<_>>()
+                    )
+                    .expect("encode base deletion"),
+                    serde_json::to_string(
+                        &lines
+                            .iter()
+                            .filter_map(|line| line.local.as_deref())
+                            .collect::<Vec<_>>()
+                    )
+                    .expect("encode left deletion"),
+                    serde_json::to_string(
+                        &lines
+                            .iter()
+                            .filter_map(|line| line.remote.as_deref())
+                            .collect::<Vec<_>>()
+                    )
+                    .expect("encode right deletion"),
+                );
+            }
+            let expected_targets =
+                document.conflicts().len() + base_only_display_groups(&document).len();
+            let suggestions =
+                request_merge_ai_suggestions(&config, &args, &sources, &document, &context)
+                    .unwrap_or_else(|error| {
+                        panic!("AI request failed for {relative_path}: {error}")
+                    });
+            println!(
+                "LIVE_AI_SUMMARY\tfile={}\texpected_targets={}\taccepted_suggestions={}",
+                relative_path,
+                expected_targets,
+                suggestions.len(),
+            );
+            for suggestion in &suggestions {
+                let middle_edits = suggestion
+                    .middle_edits
+                    .iter()
+                    .map(|edit| {
+                        serde_json::json!({
+                            "expected_text": edit.expected_text,
+                            "replacement_text": edit.replacement_text,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "LIVE_AI_SUGGESTION\tfile={}\ttarget={:?}\tchoice={:?}\tmanual_result={}\tmiddle_edits={}\treason_zh={}\treason_en={}",
+                    relative_path,
+                    suggestion.target,
+                    suggestion.choice,
+                    serde_json::to_string(&suggestion.manual_result).expect("encode manual result"),
+                    serde_json::to_string(&middle_edits).expect("encode middle edits"),
+                    suggestion.reason_zh.replace(['\r', '\n'], " "),
+                    suggestion.reason_en.replace(['\r', '\n'], " "),
+                );
+            }
+            assert_eq!(
+                suggestions.len(),
+                expected_targets,
+                "the model must return one accepted suggestion per merge target for {relative_path}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    /// Live regression for the failure mode where one pane retains an import even though the
+    /// complete Middle draft no longer contains any use of its binding. This stays in memory and
+    /// does not alter the repository or its intentionally conflicted index.
+    #[test]
+    #[ignore = "requires a configured AI model and explicit GIT_AGENT_LIVE_AI_REPO"]
+    fn live_merge_ai_removed_reference_prefers_deletion() {
+        let repo = PathBuf::from(
+            env::var("GIT_AGENT_LIVE_AI_REPO")
+                .expect("set GIT_AGENT_LIVE_AI_REPO to the merge test repository"),
+        );
+        let requested_model = env::var("GIT_AGENT_LIVE_AI_MODEL").ok();
+        let config = crate::app::load_merge_ai_model_config(requested_model.as_deref())
+            .expect("unable to load the configured AI model");
+        let base = r#"import { legacyDiscount } from "./legacyDiscount";
+import { calculateModernPrice } from "./modernPrice";
+
+export function quote(total: number): number {
+  const legacy = legacyDiscount(total);
+  return calculateModernPrice(total) + legacy;
+}
+"#;
+        let local = r#"import { calculateModernPrice } from "./modernPrice";
+
+export function quote(total: number): number {
+  return calculateModernPrice(total);
+}
+"#;
+        let remote = r#"import { legacyDiscount } from "./legacyDiscount";
+import { calculateModernPrice } from "./modernPrice";
+
+export function quote(total: number): number {
+  const auditedTotal = Math.max(total, 0);
+  return calculateModernPrice(auditedTotal);
+}
+"#;
+        let document = three_way_merge(base, local, remote);
+        let sources = MergeSourceText {
+            base: base.to_owned(),
+            local: local.to_owned(),
+            remote: remote.to_owned(),
+        };
+        let deletion = base_only_display_groups(&document)
+            .into_iter()
+            .find(|group| {
+                document.lines[group.line_index..group.line_index + group.line_count]
+                    .iter()
+                    .any(|line| {
+                        line.base
+                            .as_deref()
+                            .is_some_and(|line| line.contains("legacyDiscount"))
+                    })
+            })
+            .expect("fixture must expose the stale import as a deletion decision");
+        assert_eq!(deletion.missing_side, MergeSide::Local);
+        assert_eq!(
+            count_identifier_occurrences(&document.result_text(), "legacyDiscount"),
+            0,
+            "the Middle draft should already contain no stale import or usage"
+        );
+
+        let temp_root = env::temp_dir().join(format!(
+            "git-agent-live-ai-removed-reference-{}-{}",
+            std::process::id(),
+            MERGE_AI_CONTEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&temp_root).expect("unable to create live AI temporary directory");
+        let base_path = temp_root.join("base.ts");
+        let local_path = temp_root.join("left.ts");
+        let remote_path = temp_root.join("right.ts");
+        fs::write(&base_path, base).expect("unable to write base fixture");
+        fs::write(&local_path, local).expect("unable to write left fixture");
+        fs::write(&remote_path, remote).expect("unable to write right fixture");
+        let args = MergeArgs {
+            base: base_path,
+            local: local_path,
+            remote: remote_path,
+            output: repo.join("src/checkout/deletedImportProbe.ts"),
+            repo_root: Some(repo),
+            stage: false,
+            theme: MergeTheme::Light,
+            language: MergeLanguage::Chinese,
+            ai_model_name: requested_model,
+        };
+        let context = collect_merge_ai_context(&args, &sources, &document)
+            .expect("unable to collect live AI context");
+        let suggestions =
+            request_merge_ai_suggestions(&config, &args, &sources, &document, &context)
+                .expect("live AI request failed");
+        for suggestion in &suggestions {
+            println!(
+                "LIVE_AI_REMOVED_REFERENCE\ttarget={:?}\tchoice={:?}\treason_zh={}\treason_en={}",
+                suggestion.target,
+                suggestion.choice,
+                suggestion.reason_zh.replace(['\r', '\n'], " "),
+                suggestion.reason_en.replace(['\r', '\n'], " "),
+            );
+        }
+        let suggestion = suggestions
+            .iter()
+            .find(|suggestion| {
+                suggestion.target == MergeLineActionTarget::BaseOnlyGroup(deletion.line_index)
+            })
+            .expect("model must return the stale-import deletion suggestion");
+        assert_eq!(
+            suggestion.choice,
+            MergeAiChoice::Local,
+            "the Left deletion must win because Middle has no legacyDiscount usage"
+        );
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     fn navigation_matrix_document() -> MergeDocument {
@@ -7789,7 +9741,7 @@ mod tests {
         let suggestions = parse_merge_ai_suggestions(
             r#"{"suggestions":[
                 {"conflict_index":0,"choice":"left","reason":"keeps local validation"},
-                {"conflict_index":2,"choice":"manual","reason":"both changes are needed"},
+                {"conflict_index":2,"choice":"manual","reason":"both changes are needed","merge_order_zh":"先执行左边校验，再执行右边回退","merge_order_en":"Run Left validation before the Right fallback"},
                 {"conflict_index":3,"choice":"remote","reason":"not current"}
             ]}"#,
             &valid_targets,
@@ -7800,6 +9752,35 @@ mod tests {
         assert_eq!(suggestions.len(), 2);
         assert_eq!(suggestions[0].choice, MergeAiChoice::Local);
         assert_eq!(suggestions[1].choice, MergeAiChoice::Manual);
+        assert!(
+            suggestions[1]
+                .reason_zh
+                .contains("合并顺序：先执行左边校验")
+        );
+        assert!(
+            suggestions[1]
+                .reason_en
+                .contains("Merge order: Run Left validation")
+        );
+    }
+
+    #[test]
+    fn manual_ai_suggestion_without_explicit_merge_order_is_rejected() {
+        let valid_targets = HashSet::from([MergeLineActionTarget::Conflict(0)]);
+        let suggestions = parse_merge_ai_suggestions(
+            r#"{"suggestions":[{
+                "target_type":"conflict",
+                "target_index":0,
+                "choice":"manual",
+                "reason_zh":"保留两边",
+                "reason_en":"Keep both sides"
+            }]}"#,
+            &valid_targets,
+            MergeLanguage::Chinese,
+        )
+        .unwrap();
+
+        assert!(suggestions.is_empty());
     }
 
     #[test]
@@ -7854,7 +9835,7 @@ mod tests {
                         "type": "function",
                         "function": {
                             "name": MERGE_AI_TOOL_NAME,
-                            "arguments": "{\"suggestions\":[{\"target_type\":\"conflict\",\"target_index\":0,\"choice\":\"manual\",\"reason_zh\":\"左右两边都很重要\",\"reason_en\":\"both sides matter\"}]}"
+                            "arguments": "{\"suggestions\":[{\"target_type\":\"conflict\",\"target_index\":0,\"choice\":\"manual\",\"reason_zh\":\"左右两边都很重要\",\"reason_en\":\"both sides matter\",\"merge_order_zh\":\"先左后右\",\"merge_order_en\":\"Left before Right\"}]}"
                         }
                     }]
                 }
@@ -7904,7 +9885,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_suggestion_tool_schema_only_exposes_advisory_choices() {
+    fn merge_suggestion_tool_schema_exposes_confirmable_middle_edits_without_file_writes() {
         let schema = merge_ai_suggestions_input_schema();
         assert_eq!(
             schema.pointer("/properties/suggestions/items/properties/choice/enum"),
@@ -7912,8 +9893,207 @@ mod tests {
         );
         assert!(schema.to_string().contains("reason_zh"));
         assert!(schema.to_string().contains("reason_en"));
+        assert_eq!(
+            schema.pointer("/properties/suggestions/items/properties/reason_zh/maxLength"),
+            Some(&serde_json::json!(220)),
+        );
+        assert_eq!(
+            schema.pointer("/properties/suggestions/items/properties/reason_en/maxLength"),
+            Some(&serde_json::json!(320)),
+        );
+        assert!(schema.to_string().contains("merge_order_zh"));
+        assert!(schema.to_string().contains("merge_order_en"));
+        assert!(schema.to_string().contains("manual_result_provided"));
+        assert!(schema.to_string().contains("manual_result"));
+        assert!(schema.to_string().contains("middle_edits"));
+        assert!(schema.to_string().contains("expected_text"));
+        assert!(schema.to_string().contains("replacement_text"));
         assert!(!schema.to_string().contains("write_file"));
         assert!(!schema.to_string().contains("git_commit"));
+    }
+
+    #[test]
+    fn manual_suggestion_parser_keeps_exact_target_result_and_middle_edits() {
+        let valid_targets = HashSet::from([MergeLineActionTarget::Conflict(0)]);
+        let suggestions = parse_merge_ai_suggestions(
+            r#"{"suggestions":[{
+                "target_type":"conflict",
+                "target_index":0,
+                "choice":"manual",
+                "manual_result_provided":true,
+                "manual_result":"const fields = ['left', 'right']",
+                "middle_edits":[{
+                    "expected_text":"const fieldCount = 1",
+                    "replacement_text":"const fieldCount = fields.length"
+                }],
+                "reason_zh":"两边字段都需要保留并同步派生数量",
+                "reason_en":"Keep both fields and synchronize the derived count",
+                "merge_order_zh":"字段按左边在前、右边在后排列，然后计算数量",
+                "merge_order_en":"Place Left before Right, then calculate the count"
+            }]}"#,
+            &valid_targets,
+            MergeLanguage::Chinese,
+        )
+        .unwrap();
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(
+            suggestions[0].manual_result.as_deref(),
+            Some("const fields = ['left', 'right']")
+        );
+        assert_eq!(
+            suggestions[0].middle_edits,
+            vec![MergeAiMiddleEdit {
+                expected_text: "const fieldCount = 1".to_owned(),
+                replacement_text: "const fieldCount = fields.length".to_owned(),
+            }]
+        );
+        assert!(suggestions[0].is_actionable());
+        assert!(suggestions[0].reason_zh.contains("\n\n合并顺序："));
+        assert!(suggestions[0].reason_en.contains("\n\nMerge order: "));
+    }
+
+    #[test]
+    fn manual_suggestion_reports_every_executable_change() {
+        let suggestion = MergeAiSuggestion {
+            target: MergeLineActionTarget::Conflict(0),
+            choice: MergeAiChoice::Manual,
+            reason_zh: "组合冲突并同步派生值".to_owned(),
+            reason_en: "Combine the conflict and update the derived value".to_owned(),
+            manual_result: Some("const pipeline = ['left', 'right']".to_owned()),
+            middle_edits: vec![MergeAiMiddleEdit {
+                expected_text: "const count = 1".to_owned(),
+                replacement_text: "const count = 2".to_owned(),
+            }],
+        };
+
+        assert_eq!(suggestion.change_count(), 2);
+        assert!(!merge_ai_needs_completeness_repair(&[suggestion.clone()]));
+
+        let target_only = MergeAiSuggestion {
+            middle_edits: Vec::new(),
+            ..suggestion
+        };
+        assert!(merge_ai_needs_completeness_repair(&[target_only]));
+    }
+
+    #[test]
+    fn manual_guard_corrects_mechanically_proven_array_count() {
+        let base = "export const EXPECTED_COUNT = 4\nexport const PIPELINE = ['a', 'c', 'e', 'f']\nif (PIPELINE.length !== EXPECTED_COUNT) throw new Error()\n";
+        let local = "export const EXPECTED_COUNT = 4\nexport const PIPELINE = ['a', 'b', 'c', 'e', 'f']\nif (PIPELINE.length !== EXPECTED_COUNT) throw new Error()\n";
+        let remote = "export const EXPECTED_COUNT = 4\nexport const PIPELINE = ['a', 'c', 'd', 'e', 'f']\nif (PIPELINE.length !== EXPECTED_COUNT) throw new Error()\n";
+        let document = three_way_merge(base, local, remote);
+        let target = MergeLineActionTarget::Conflict(0);
+        let guarded = guard_merge_ai_suggestions(
+            &document,
+            vec![MergeAiSuggestion {
+                target,
+                choice: MergeAiChoice::Manual,
+                reason_zh: "合并两边".to_owned(),
+                reason_en: "Merge both sides".to_owned(),
+                manual_result: Some(
+                    "export const PIPELINE = ['a', 'b', 'c', 'd', 'e', 'f']".to_owned(),
+                ),
+                middle_edits: vec![MergeAiMiddleEdit {
+                    expected_text: "export const EXPECTED_COUNT = 4".to_owned(),
+                    replacement_text: "export const EXPECTED_COUNT = 5".to_owned(),
+                }],
+            }],
+        );
+
+        assert_eq!(guarded.len(), 1);
+        assert_eq!(guarded[0].middle_edits.len(), 1);
+        assert_eq!(
+            guarded[0].middle_edits[0].replacement_text,
+            "export const EXPECTED_COUNT = 6"
+        );
+        assert!(guarded[0].reason_zh.contains("合并后的 6 项"));
+        assert!(guarded[0].reason_en.contains("merged count of 6"));
+        assert_eq!(
+            explicit_array_assignment("const values = ['a,b', nested(1, 2), { value: 3 }]")
+                .map(|(_, count)| count),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn completeness_repair_requires_reasons_and_payload_to_agree() {
+        let prompt = merge_ai_completeness_repair_prompt("original context", "previous payload");
+
+        assert!(prompt.contains("original context"));
+        assert!(prompt.contains("previous payload"));
+        assert!(prompt.contains("must never describe a concrete required code change"));
+        assert!(prompt.contains("encode every exact non-target change in middle_edits"));
+        assert!(prompt.contains("Recount every explicit array element"));
+        assert!(prompt.contains("six listed elements require a count of 6, never 5"));
+        assert!(prompt.contains("exactly the same target coverage"));
+    }
+
+    #[test]
+    fn middle_edit_connector_uses_the_unique_visible_middle_line() {
+        let mut geometry = MergePanelGeometry::default();
+        geometry.record_row(
+            0,
+            Rect::from_min_max(Pos2::new(100.0, 10.0), Pos2::new(500.0, 30.0)),
+        );
+        geometry.record_row(
+            1,
+            Rect::from_min_max(Pos2::new(100.0, 30.0), Pos2::new(500.0, 50.0)),
+        );
+        let lines = vec![
+            "export const EXPECTED_COUNT = 4".to_owned(),
+            "export const pipeline = []".to_owned(),
+        ];
+
+        assert_eq!(
+            merge_ai_middle_edit_anchor(&geometry, &lines, "EXPECTED_COUNT = 4"),
+            Some(Pos2::new(100.0, 20.0))
+        );
+        assert_eq!(
+            merge_ai_middle_edit_anchor(
+                &geometry,
+                &["same anchor".to_owned(), "same anchor".to_owned()],
+                "same"
+            ),
+            None
+        );
+        assert_eq!(merge_ai_code_preview("first\nsecond", 40), "first ↵ second");
+        assert_eq!(merge_ai_code_preview("abcdef", 3), "abc…");
+
+        let target = MergeLineActionTarget::Conflict(0);
+        let suggestions = HashMap::from([(
+            target,
+            MergeAiSuggestion {
+                target,
+                choice: MergeAiChoice::Manual,
+                reason_zh: "同步数量".to_owned(),
+                reason_en: "Synchronize the count".to_owned(),
+                manual_result: Some("pipeline".to_owned()),
+                middle_edits: vec![MergeAiMiddleEdit {
+                    expected_text: "EXPECTED_COUNT = 4".to_owned(),
+                    replacement_text: "EXPECTED_COUNT = 6".to_owned(),
+                }],
+            },
+        )]);
+        assert_eq!(
+            merge_ai_pending_middle_edit_rows(&suggestions, &lines),
+            HashSet::from([0])
+        );
+    }
+
+    #[test]
+    fn pending_ai_middle_edit_rows_use_accent_highlight_and_marker() {
+        let source = include_str!("merge_tool.rs");
+        let row = source
+            .split("fn merge_editable_result_row")
+            .nth(1)
+            .and_then(|tail| tail.split("fn paint_result_side_status_badges").next())
+            .expect("editable Middle row implementation");
+
+        assert!(row.contains("ai_suggested_edit"));
+        assert!(row.contains("color_with_opacity(palette.accent, 0.14)"));
+        assert!(row.contains("rect.left() + 3.0"));
+        assert!(row.contains("palette.accent"));
     }
 
     #[test]
@@ -7923,6 +10103,8 @@ mod tests {
             choice: MergeAiChoice::Manual,
             reason_zh: "在中间手动组合左右两边的校验".to_owned(),
             reason_en: "Combine validation from Left and Right in the Middle".to_owned(),
+            manual_result: None,
+            middle_edits: Vec::new(),
         };
 
         assert_eq!(
@@ -8033,6 +10215,93 @@ mod tests {
     }
 
     #[test]
+    fn merge_code_search_is_case_insensitive_and_wraps_navigation() {
+        let lines = ["import Widget", "const value = 1", "render(widget)"];
+        assert_eq!(merge_search_matches(lines, "WIDGET"), vec![0, 2]);
+        assert_eq!(merge_next_search_index(1, 2, NavDirection::Next), 0);
+        assert_eq!(merge_next_search_index(0, 2, NavDirection::Previous), 1);
+        assert_eq!(merge_next_search_index(0, 0, NavDirection::Next), 0);
+    }
+
+    #[test]
+    fn merge_search_jump_centers_and_clamps_the_selected_result_row() {
+        let row_y = 50.0 * MERGE_CODE_ROW_HEIGHT;
+        assert_eq!(
+            merge_search_scroll_target(row_y, 200.0, 2_000.0),
+            row_y + MERGE_CODE_ROW_HEIGHT * 0.5 - 100.0
+        );
+        assert_eq!(merge_search_scroll_target(0.0, 200.0, 2_000.0), 0.0);
+        assert_eq!(merge_search_scroll_target(1_990.0, 200.0, 2_000.0), 1_800.0);
+        assert_eq!(merge_search_scroll_target(400.0, 800.0, 600.0), 0.0);
+    }
+
+    #[test]
+    fn merge_search_jump_is_applied_by_outer_shared_scroll_owner() {
+        let source = include_str!("merge_tool.rs");
+        let columns = source
+            .split("fn merge_editor_columns")
+            .nth(1)
+            .and_then(|tail| tail.split("fn merge_horizontal_scroll_input").next())
+            .expect("merge editor columns implementation");
+        assert!(columns.contains("let search_result_y = result_output"));
+        assert!(columns.contains(".or(remote_output.search_result_y)"));
+        assert!(columns.contains(".or(local_output.search_result_y)"));
+        assert!(columns.contains("merge_search_scroll_target("));
+
+        for panel_name in ["fn merge_side_panel", "fn merge_result_panel"] {
+            let panel = source
+                .split(panel_name)
+                .nth(1)
+                .and_then(|tail| tail.split("fn ").next())
+                .expect("merge panel implementation");
+            assert!(panel.contains("search_result_y = Some("));
+            assert!(!panel.contains("app.shared_scroll_y ="));
+        }
+    }
+
+    #[test]
+    fn ctrl_f_routes_search_to_the_hovered_merge_pane() {
+        for pane in [
+            MergeSearchPane::Left,
+            MergeSearchPane::Middle,
+            MergeSearchPane::Right,
+        ] {
+            let mut app = MergeToolApp::new(test_merge_args(), navigation_matrix_document());
+            app.hovered_search_pane = Some(pane);
+            app.collapse_unchanged = true;
+            let modifiers = egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            };
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput {
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F,
+                    physical_key: Some(egui::Key::F),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            });
+
+            app.handle_keyboard_shortcuts(&ctx);
+
+            assert!(app.search.open);
+            assert_eq!(app.search.pane, pane);
+            assert!(app.search.request_focus);
+            assert!(!app.collapse_unchanged);
+            let _ = ctx.end_pass();
+        }
+
+        let implementation = include_str!("merge_tool.rs");
+        assert!(implementation.contains("small_button(\"↑\")"));
+        assert!(implementation.contains("small_button(\"↓\")"));
+    }
+
+    #[test]
     fn ai_prompt_includes_three_way_conflicts_history_and_related_files() {
         let document = three_way_merge("value = base\n", "value = local\n", "value = remote\n");
         let prompt = merge_ai_prompt(
@@ -8045,22 +10314,297 @@ mod tests {
             &document,
             &MergeAiContext {
                 history: "abc123 change validation".to_owned(),
+                repository_state: "M src/plugin.ts".to_owned(),
                 related_files: "--- related file: settings.toml ---\nmode = strict\n".to_owned(),
+                symbol_references: "src/app.ts:4:autoAnimationPlugin()".to_owned(),
             },
         );
 
         assert!(prompt.contains("CONFLICTS:"));
         assert!(prompt.contains("Simplified Chinese"));
         assert!(prompt.contains("reason_en"));
+        assert!(prompt.contains("exactly one or two short sentences"));
+        assert!(prompt.contains("Do not repeat code, merge order, or the full analysis"));
+        assert!(merge_ai_system_prompt().contains("one or two short sentences"));
+        assert!(merge_ai_system_prompt().contains("Do not expose the full reasoning chain"));
+        assert!(prompt.contains("merge_order_zh"));
+        assert!(prompt.contains("exact before/after or precedence order"));
+        assert!(prompt.contains("analyze whether conditions overlap"));
+        assert!(prompt.contains("which branch wins when both match"));
+        assert!(prompt.contains("Never respond only that both sides should be kept"));
+        assert!(prompt.contains("adds, removes, renames, or reorders array elements"));
+        assert!(prompt.contains("object properties"));
+        assert!(prompt.contains("method or function parameters and arguments"));
+        assert!(prompt.contains("enum members"));
+        assert!(prompt.contains("ordered operations"));
+        assert!(prompt.contains("manual_result_provided=true"));
+        assert!(prompt.contains("middle_edits"));
+        assert!(prompt.contains("non-diff lines"));
+        assert!(prompt.contains("occur exactly once inside one logical Middle line"));
         assert!(prompt.contains("左边/中间/右边"));
         assert!(prompt.contains("Left/Middle/Right"));
         assert!(!prompt.contains("LOCAL FILE EXCERPT"));
         assert!(!prompt.contains("REMOTE FILE EXCERPT"));
         assert!(prompt.contains("value = local"));
+        assert!(prompt.contains("MIDDLE AUTO-MERGED DRAFT"));
         assert!(prompt.contains("abc123 change validation"));
+        assert!(prompt.contains("CURRENT REPOSITORY MERGE STATE"));
+        assert!(prompt.contains("M src/plugin.ts"));
+        assert!(prompt.contains("SYMBOL REFERENCES IN CURRENT WORKTREE"));
+        assert!(prompt.contains("autoAnimationPlugin"));
         assert!(prompt.contains("related file: settings.toml"));
         assert!(prompt.contains("submit_merge_suggestions"));
         assert!(prompt.contains("advisory only"));
+    }
+
+    #[test]
+    fn ai_context_identifier_scan_keeps_specific_import_names() {
+        let document = three_way_merge(
+            "import { autoAnimationPlugin } from './animation';\n",
+            "\n",
+            "import { autoAnimationPlugin } from './new-animation';\n",
+        );
+        let identifiers = merge_ai_candidate_identifiers(&document);
+        assert!(identifiers.contains(&"autoAnimationPlugin".to_owned()));
+        assert!(!identifiers.contains(&"import".to_owned()));
+        assert_eq!(
+            merge_ai_reference_paths(
+                "src/plugin.ts:8:autoAnimationPlugin()\nsrc/app.ts:12:autoAnimationPlugin\n"
+            ),
+            vec!["src/plugin.ts".to_owned(), "src/app.ts".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ai_context_reads_real_merge_tips_history_state_and_symbol_files() {
+        let test_id = MERGE_AI_CONTEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let repo = env::temp_dir().join(format!(
+            "git-agent-merge-ai-context-{}-{test_id}",
+            std::process::id()
+        ));
+        if repo.exists() {
+            fs::remove_dir_all(&repo).unwrap();
+        }
+        fs::create_dir_all(repo.join("src")).unwrap();
+        run_context_test_git(&repo, &["init"]);
+        run_context_test_git(&repo, &["config", "user.name", "Git Agent Test"]);
+        run_context_test_git(&repo, &["config", "user.email", "git-agent@example.test"]);
+
+        let output = repo.join("src/plugin.ts");
+        let registry = repo.join("src/registry.ts");
+        let base = "import { autoAnimationPlugin } from './old-animation';\n// stable 01\n// stable 02\n// stable 03\n// stable 04\n// stable 05\n// stable 06\n// stable 07\n// stable 08\nexport const plugins = [autoAnimationPlugin];\nexport const stable = true;\n";
+        let left = "// stable 01\n// stable 02\n// stable 03\n// stable 04\n// stable 05\n// stable 06\n// stable 07\n// stable 08\nexport const plugins = [];\nexport const stable = true;\n";
+        let right = "import { autoAnimationPlugin } from './new-animation';\n// stable 01\n// stable 02\n// stable 03\n// stable 04\n// stable 05\n// stable 06\n// stable 07\n// stable 08\nexport const plugins = [];\nexport const stable = true;\n";
+        fs::write(&output, base).unwrap();
+        fs::write(
+            &registry,
+            "export const historicalPluginName = 'autoAnimationPlugin';\n",
+        )
+        .unwrap();
+        run_context_test_git(&repo, &["add", "."]);
+        run_context_test_git(&repo, &["commit", "-m", "base animation setup"]);
+        let left_branch = run_context_test_git(&repo, &["branch", "--show-current"]);
+
+        run_context_test_git(&repo, &["checkout", "-b", "right"]);
+        fs::write(&output, right).unwrap();
+        run_context_test_git(&repo, &["add", "."]);
+        run_context_test_git(&repo, &["commit", "-m", "right: migrate animation import"]);
+
+        run_context_test_git(&repo, &["checkout", &left_branch]);
+        fs::write(&output, left).unwrap();
+        run_context_test_git(&repo, &["add", "."]);
+        run_context_test_git(
+            &repo,
+            &["commit", "-m", "left: remove animation plugin usage"],
+        );
+        let merge_output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["merge", "right"])
+            .output()
+            .unwrap();
+        assert!(
+            !merge_output.status.success(),
+            "fixture must produce a conflict"
+        );
+
+        let document = three_way_merge(base, left, right);
+        assert_eq!(document.conflicts().len(), 1);
+        let context = collect_merge_ai_context(
+            &MergeArgs {
+                output: output.clone(),
+                repo_root: Some(repo.clone()),
+                ..test_merge_args()
+            },
+            &MergeSourceText {
+                base: base.to_owned(),
+                local: left.to_owned(),
+                remote: right.to_owned(),
+            },
+            &document,
+        )
+        .unwrap();
+
+        assert!(context.history.contains("LEFT HEAD"));
+        assert!(context.history.contains("RIGHT MERGE_HEAD"));
+        assert!(
+            context
+                .history
+                .contains("left: remove animation plugin usage")
+        );
+        assert!(context.history.contains("right: migrate animation import"));
+        assert!(context.repository_state.contains("MERGE STATUS"));
+        assert!(context.repository_state.contains("src/plugin.ts"));
+        assert!(context.symbol_references.contains("autoAnimationPlugin"));
+        assert!(context.symbol_references.contains("src/registry.ts"));
+        assert!(
+            context
+                .related_files
+                .contains("related file: src/registry.ts")
+        );
+
+        let guarded = guard_merge_ai_suggestions(
+            &document,
+            vec![MergeAiSuggestion {
+                target: MergeLineActionTarget::Conflict(0),
+                choice: MergeAiChoice::Remote,
+                reason_zh: "右边仍有导入".to_owned(),
+                reason_en: "The Right import remains".to_owned(),
+                manual_result: None,
+                middle_edits: Vec::new(),
+            }],
+        );
+        assert_eq!(guarded[0].choice, MergeAiChoice::Local);
+
+        run_context_test_git(&repo, &["merge", "--abort"]);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn ai_guard_rejects_preserving_an_import_removed_with_all_usages() {
+        let document = three_way_merge(
+            "import { autoAnimationPlugin } from './old-animation';\nconst plugins = [autoAnimationPlugin];\n",
+            "\n",
+            "import { autoAnimationPlugin } from './new-animation';\n",
+        );
+        assert_eq!(document.conflicts().len(), 1);
+        let target = MergeLineActionTarget::Conflict(0);
+        let guarded = guard_merge_ai_suggestions(
+            &document,
+            vec![MergeAiSuggestion {
+                target,
+                choice: MergeAiChoice::Remote,
+                reason_zh: "右边仍有导入".to_owned(),
+                reason_en: "The Right import remains".to_owned(),
+                manual_result: None,
+                middle_edits: Vec::new(),
+            }],
+        );
+
+        assert_eq!(guarded[0].choice, MergeAiChoice::Local);
+        assert!(
+            guarded[0]
+                .reason_zh
+                .contains("没有发现 autoAnimationPlugin 的实际使用")
+        );
+        assert!(guarded[0].reason_en.contains("no remaining usage"));
+    }
+
+    #[test]
+    fn ai_guard_rejects_preserving_a_base_only_import_without_remaining_usage() {
+        let document = three_way_merge(
+            "import { legacyDiscount } from './legacyDiscount';\nimport { modernPrice } from './modernPrice';\n\nexport function quote(total: number) {\n  return modernPrice(total) + legacyDiscount(total);\n}\n",
+            "import { modernPrice } from './modernPrice';\n\nexport function quote(total: number) {\n  return modernPrice(total);\n}\n",
+            "import { legacyDiscount } from './legacyDiscount';\nimport { modernPrice } from './modernPrice';\n\nexport function quote(total: number) {\n  return modernPrice(Math.max(total, 0));\n}\n",
+        );
+        let group = base_only_display_groups(&document)
+            .into_iter()
+            .find(|group| {
+                document.lines[group.line_index..group.line_index + group.line_count]
+                    .iter()
+                    .any(|line| {
+                        line.base
+                            .as_deref()
+                            .is_some_and(|line| line.contains("legacyDiscount"))
+                    })
+            })
+            .expect("stale import should be represented as a deletion target");
+        assert_eq!(group.missing_side, MergeSide::Local);
+
+        let guarded = guard_merge_ai_suggestions(
+            &document,
+            vec![MergeAiSuggestion {
+                target: MergeLineActionTarget::BaseOnlyGroup(group.line_index),
+                choice: MergeAiChoice::Remote,
+                reason_zh: "右边仍有导入".to_owned(),
+                reason_en: "The Right import remains".to_owned(),
+                manual_result: None,
+                middle_edits: Vec::new(),
+            }],
+        );
+
+        assert_eq!(guarded[0].choice, MergeAiChoice::Local);
+        assert!(
+            guarded[0]
+                .reason_zh
+                .contains("没有发现 legacyDiscount 的实际使用")
+        );
+        assert!(guarded[0].reason_en.contains("unused import"));
+    }
+
+    #[test]
+    fn ai_guard_keeps_an_import_when_the_merged_file_still_uses_it() {
+        let document = three_way_merge(
+            "import { autoAnimationPlugin } from './old-animation';\nconst plugins = [autoAnimationPlugin];\n",
+            "const plugins = [autoAnimationPlugin];\n",
+            "import { autoAnimationPlugin } from './new-animation';\nconst plugins = [autoAnimationPlugin];\n",
+        );
+        assert_eq!(document.conflicts().len(), 1);
+        let target = MergeLineActionTarget::Conflict(0);
+        let guarded = guard_merge_ai_suggestions(
+            &document,
+            vec![MergeAiSuggestion {
+                target,
+                choice: MergeAiChoice::Remote,
+                reason_zh: "中间仍使用该符号".to_owned(),
+                reason_en: "Middle still uses the symbol".to_owned(),
+                manual_result: None,
+                middle_edits: Vec::new(),
+            }],
+        );
+
+        assert_eq!(guarded[0].choice, MergeAiChoice::Remote);
+        assert_eq!(guarded[0].reason_en, "Middle still uses the symbol");
+    }
+
+    #[test]
+    fn ai_guard_uses_manual_when_unused_import_shares_a_conflict_with_other_edits() {
+        let document = three_way_merge(
+            "import { autoAnimationPlugin } from './old-animation';\nexport const mode = 'base';\nconst plugins = [autoAnimationPlugin];\n",
+            "export const mode = 'left';\n",
+            "import { autoAnimationPlugin } from './new-animation';\nexport const mode = 'right';\n",
+        );
+        assert_eq!(document.conflicts().len(), 1);
+        let target = MergeLineActionTarget::Conflict(0);
+        let guarded = guard_merge_ai_suggestions(
+            &document,
+            vec![MergeAiSuggestion {
+                target,
+                choice: MergeAiChoice::Remote,
+                reason_zh: "采用右边".to_owned(),
+                reason_en: "Use Right".to_owned(),
+                manual_result: None,
+                middle_edits: Vec::new(),
+            }],
+        );
+
+        assert_eq!(guarded[0].choice, MergeAiChoice::Manual);
+        assert!(guarded[0].reason_zh.contains("还有其他改动"));
+        assert!(
+            guarded[0]
+                .reason_en
+                .contains("switching the whole conflict is unsafe")
+        );
     }
 
     #[test]
@@ -8075,6 +10619,8 @@ mod tests {
                 choice: MergeAiChoice::Local,
                 reason_zh: "左边行为是有意保留的".to_owned(),
                 reason_en: "The Left behavior is intentional".to_owned(),
+                manual_result: None,
+                middle_edits: Vec::new(),
             },
         );
 
@@ -8101,6 +10647,78 @@ mod tests {
         assert!(app.document.conflict_side_resolved(0, MergeSide::Local));
         assert!(app.document.conflict_side_resolved(0, MergeSide::Remote));
         assert!(!app.ai_suggestions.contains_key(&target));
+    }
+
+    #[test]
+    fn manual_ai_suggestion_updates_target_and_non_diff_middle_line_without_resolving_others() {
+        let document = navigation_matrix_document();
+        let mut app = MergeToolApp::new(test_merge_args(), document);
+        let target = MergeLineActionTarget::Conflict(0);
+        app.ai_suggestions.insert(
+            target,
+            MergeAiSuggestion {
+                target,
+                choice: MergeAiChoice::Manual,
+                reason_zh: "组合冲突，并同步修改中间已有代码".to_owned(),
+                reason_en: "Combine the conflict and update existing Middle code".to_owned(),
+                manual_result: Some("conflict-a = combined".to_owned()),
+                middle_edits: vec![MergeAiMiddleEdit {
+                    expected_text: "stable-a".to_owned(),
+                    replacement_text: "stable-a-updated".to_owned(),
+                }],
+            },
+        );
+
+        app.apply_ai_suggestion(target);
+
+        assert!(!app.manual_result_override);
+        assert!(!app.ai_suggestions.contains_key(&target));
+        assert!(app.result_text.contains("conflict-a = combined"));
+        assert!(app.result_text.contains("stable-a-updated"));
+        assert_eq!(app.unresolved_conflict_count(), 2);
+        assert_eq!(app.undo_stack.len(), 1);
+
+        assert!(app.undo());
+        assert!(!app.result_text.contains("conflict-a = combined"));
+        assert!(app.result_text.contains("stable-a"));
+        assert_eq!(app.unresolved_conflict_count(), 3);
+    }
+
+    #[test]
+    fn stale_or_ambiguous_middle_edit_rejects_the_entire_ai_application() {
+        let document = three_way_merge(
+            "same\nvalue = 'base'\nsame\n",
+            "same\nvalue = 'left'\nsame\n",
+            "same\nvalue = 'right'\nsame\n",
+        );
+        let mut app = MergeToolApp::new(test_merge_args(), document);
+        let target = MergeLineActionTarget::Conflict(0);
+        let before = app.document.clone();
+        app.ai_suggestions.insert(
+            target,
+            MergeAiSuggestion {
+                target,
+                choice: MergeAiChoice::Manual,
+                reason_zh: "建议存在歧义锚点".to_owned(),
+                reason_en: "The proposed anchor is ambiguous".to_owned(),
+                manual_result: Some("value = 'combined'".to_owned()),
+                middle_edits: vec![MergeAiMiddleEdit {
+                    expected_text: "same".to_owned(),
+                    replacement_text: "updated".to_owned(),
+                }],
+            },
+        );
+
+        app.apply_ai_suggestion(target);
+
+        assert_eq!(app.document, before);
+        assert!(app.ai_suggestions.contains_key(&target));
+        assert!(
+            app.ai_analysis_error
+                .as_deref()
+                .is_some_and(|error| error.contains("found 2"))
+        );
+        assert!(app.undo_stack.is_empty());
     }
 
     #[test]
@@ -8144,6 +10762,8 @@ mod tests {
                 choice: MergeAiChoice::Local,
                 reason_zh: "左边有意删除了过时行".to_owned(),
                 reason_en: "The Left pane intentionally removed the obsolete line".to_owned(),
+                manual_result: None,
+                middle_edits: Vec::new(),
             },
         );
 

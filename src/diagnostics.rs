@@ -136,6 +136,14 @@ pub fn merge_tool_error(event: &str, fields: &str) {
     write_domain_event("merge-tool", LogLevel::Error, event, fields);
 }
 
+pub fn diff_tool_info(event: &str, fields: &str) {
+    write_domain_event("diff-tool", LogLevel::Info, event, fields);
+}
+
+pub fn diff_tool_error(event: &str, fields: &str) {
+    write_domain_event("diff-tool", LogLevel::Error, event, fields);
+}
+
 pub fn error_log_path() -> PathBuf {
     daily_log_path("error")
 }

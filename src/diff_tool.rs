@@ -1,13 +1,20 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, anyhow};
+use eframe::egui::containers::scroll_area::ScrollBarVisibility;
 use eframe::{
     App,
     egui::{
-        self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, ScrollArea, Sense,
-        Stroke, Vec2,
+        self, Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rect, RichText, ScrollArea,
+        Sense, Stroke, Vec2,
     },
 };
+
+const DIFF_ROW_HEIGHT: f32 = 21.0;
+const DIFF_MINIMAP_WIDTH: f32 = 14.0;
+const DIFF_HORIZONTAL_SCROLLBAR_HEIGHT: f32 = 9.0;
+const DIFF_PANE_GAP: f32 = 8.0;
+const DIFF_GUTTER_WIDTH: f32 = 50.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiffTheme {
@@ -67,6 +74,8 @@ pub struct DiffToolApp {
     args: DiffArgs,
     diff_text: String,
     files: Vec<DiffFile>,
+    scroll_x: f32,
+    scroll_y: f32,
 }
 
 impl DiffToolApp {
@@ -78,6 +87,8 @@ impl DiffToolApp {
             args,
             diff_text,
             files,
+            scroll_x: 0.0,
+            scroll_y: 0.0,
         })
     }
 
@@ -95,6 +106,7 @@ impl DiffToolApp {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title(title.clone())
+                .with_icon(diff_app_icon_data())
                 .with_inner_size([1120.0, 760.0])
                 .with_min_inner_size([820.0, 540.0]),
             ..Default::default()
@@ -116,6 +128,8 @@ impl DiffToolApp {
                     },
                     diff_text: error.to_string(),
                     files: Vec::new(),
+                    scroll_x: 0.0,
+                    scroll_y: 0.0,
                 });
                 Ok(Box::new(app))
             }),
@@ -125,11 +139,10 @@ impl DiffToolApp {
 
 impl App for DiffToolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        apply_diff_theme(ctx, self.args.theme);
         let palette = diff_palette(self.args.theme);
 
         egui::TopBottomPanel::top("diff_toolbar")
-            .exact_height(54.0)
+            .exact_height(32.0)
             .frame(egui::Frame::new().fill(palette.bg))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -147,29 +160,26 @@ impl App for DiffToolApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(palette.panel))
             .show(ctx, |ui| {
-                ScrollArea::both()
-                    .id_salt("diff_tool_side_by_side_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add_space(10.0);
-                        if self.diff_text.trim().is_empty() {
-                            ui.label(
-                                RichText::new(dt(self.args.language, "empty")).color(palette.muted),
-                            );
-                            return;
-                        }
-                        if self.files.is_empty() {
-                            show_raw_diff(ui, &self.diff_text, palette);
-                        } else {
-                            show_side_by_side_diff(
-                                ui,
-                                &self.files,
-                                &self.args.left_label,
-                                &self.args.right_label,
-                                palette,
-                            );
-                        }
-                    });
+                if self.diff_text.trim().is_empty() {
+                    ui.label(RichText::new(dt(self.args.language, "empty")).color(palette.muted));
+                } else if self.files.is_empty() {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ScrollArea::both()
+                        .id_salt("diff_tool_raw_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| show_raw_diff(ui, &self.diff_text, palette));
+                } else {
+                    show_side_by_side_diff(
+                        ui,
+                        &self.files,
+                        &self.args.left_label,
+                        &self.args.right_label,
+                        self.args.language,
+                        &mut self.scroll_x,
+                        &mut self.scroll_y,
+                        palette,
+                    );
+                }
             });
     }
 }
@@ -427,23 +437,64 @@ fn parse_diff_git_paths(line: &str) -> (String, String) {
 }
 
 fn parse_hunk_start(line: &str) -> Option<(usize, usize)> {
-    let mut left = None;
-    let mut right = None;
-    for part in line.split_whitespace() {
-        if part.starts_with('-') {
-            left = parse_hunk_part(part);
-        } else if part.starts_with('+') {
-            right = parse_hunk_part(part);
-        }
-    }
-    Some((left?, right?))
+    let (left, right) = parse_hunk_ranges(line)?;
+    Some((left.start, right.start))
 }
 
-fn parse_hunk_part(part: &str) -> Option<usize> {
-    part.get(1..)?
-        .split(',')
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DiffHunkRange {
+    start: usize,
+    count: usize,
+}
+
+fn parse_hunk_ranges(line: &str) -> Option<(DiffHunkRange, DiffHunkRange)> {
+    let header = line.strip_prefix("@@")?.split("@@").next()?;
+    let mut parts = header.split_whitespace();
+    let left = parse_hunk_range(parts.next()?)?;
+    let right = parse_hunk_range(parts.next()?)?;
+    Some((left, right))
+}
+
+fn parse_hunk_range(part: &str) -> Option<DiffHunkRange> {
+    let mut values = part.get(1..)?.split(',');
+    let start = values.next()?.parse::<usize>().ok()?;
+    let count = values
         .next()
-        .and_then(|value| value.parse::<usize>().ok())
+        .map(str::parse::<usize>)
+        .transpose()
+        .ok()?
+        .unwrap_or(1);
+    Some(DiffHunkRange { start, count })
+}
+
+fn format_hunk_summary(line: &str, language: DiffLanguage) -> String {
+    let Some((left, right)) = parse_hunk_ranges(line) else {
+        return line.to_owned();
+    };
+    let context = line
+        .split_once("@@")
+        .and_then(|(_, rest)| rest.split_once("@@"))
+        .map(|(_, context)| context.trim())
+        .filter(|context| !context.is_empty());
+    let left = format_hunk_range(left);
+    let right = format_hunk_range(right);
+    let mut label = match language {
+        DiffLanguage::Chinese => format!("区块  旧 {left}  →  新 {right}"),
+        DiffLanguage::English => format!("Block  old {left}  →  new {right}"),
+    };
+    if let Some(context) = context {
+        label.push_str("  ·  ");
+        label.push_str(context);
+    }
+    label
+}
+
+fn format_hunk_range(range: DiffHunkRange) -> String {
+    match range.count {
+        0 => format!("{} (0 行)", range.start),
+        1 => range.start.to_string(),
+        count => format!("{}–{}", range.start, range.start + count - 1),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -509,55 +560,396 @@ fn show_raw_diff(ui: &mut egui::Ui, diff_text: &str, palette: DiffPalette) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DiffDisplayRow<'a> {
+    File(&'a DiffFile),
+    Hunk(&'a str),
+    Line(&'a DiffLine),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiffOverviewTone {
+    File,
+    Hunk,
+    Added,
+    Removed,
+    Changed,
+    Context,
+}
+
 fn show_side_by_side_diff(
     ui: &mut egui::Ui,
     files: &[DiffFile],
     left_label: &str,
     right_label: &str,
+    language: DiffLanguage,
+    scroll_x: &mut f32,
+    scroll_y: &mut f32,
     palette: DiffPalette,
 ) {
-    let gap = 8.0;
-    let column_width = ((ui.available_width().max(980.0) - gap) / 2.0).max(460.0);
-    let total_width = column_width * 2.0 + gap;
+    let rows = diff_display_rows(files);
+    if rows.is_empty() {
+        return;
+    }
 
-    for (index, file) in files.iter().enumerate() {
-        if index > 0 {
-            ui.add_space(12.0);
-        }
-        draw_file_header(
+    let available = ui.available_rect_before_wrap();
+    let content_bottom = available.bottom() - DIFF_HORIZONTAL_SCROLLBAR_HEIGHT - 3.0;
+    let viewport_height = (content_bottom - available.top()).max(0.0);
+    let needs_minimap = diff_needs_minimap(rows.len(), viewport_height);
+    let map_rect = needs_minimap.then(|| {
+        Rect::from_min_max(
+            Pos2::new(available.right() - DIFF_MINIMAP_WIDTH, available.top()),
+            Pos2::new(available.right(), content_bottom),
+        )
+    });
+    let code_right = map_rect
+        .map(|rect| rect.left() - 4.0)
+        .unwrap_or(available.right());
+    let code_rect = Rect::from_min_max(available.left_top(), Pos2::new(code_right, content_bottom));
+    let horizontal_rect = Rect::from_min_max(
+        Pos2::new(code_rect.left(), code_rect.bottom() + 3.0),
+        Pos2::new(code_rect.right(), available.bottom()),
+    );
+    let longest_chars = rows
+        .iter()
+        .filter_map(|row| match row {
+            DiffDisplayRow::Line(line) => Some(
+                line.left_text
+                    .chars()
+                    .count()
+                    .max(line.right_text.chars().count()),
+            ),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let narrow_column = ((code_rect.width() - DIFF_PANE_GAP) / 2.0).max(1.0);
+    let code_column = (DIFF_GUTTER_WIDTH + 20.0 + longest_chars as f32 * 7.7).max(narrow_column);
+    let total_width = code_column * 2.0 + DIFF_PANE_GAP;
+    let max_scroll_x = (total_width - code_rect.width()).max(0.0);
+    *scroll_x = diff_horizontal_scroll_input(ui, code_rect, *scroll_x, max_scroll_x);
+
+    let output = ui
+        .allocate_new_ui(egui::UiBuilder::new().max_rect(code_rect), |ui| {
+            // `show_rows` captures spacing before its callback. Dense spacing must be installed
+            // here or every virtual row gains an invisible default gap.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ScrollArea::vertical()
+                .id_salt("diff_tool_vertical_scroll")
+                .vertical_scroll_offset(*scroll_y)
+                .scroll_bar_visibility(ScrollBarVisibility::AlwaysHidden)
+                .auto_shrink([false, false])
+                .show_rows(ui, DIFF_ROW_HEIGHT, rows.len(), |ui, range| {
+                    ui.set_min_width(ui.available_width());
+                    for index in range {
+                        draw_display_row(
+                            ui,
+                            rows[index],
+                            left_label,
+                            right_label,
+                            language,
+                            total_width,
+                            code_column,
+                            *scroll_x,
+                            palette,
+                        );
+                    }
+                })
+        })
+        .inner;
+    *scroll_y = output.state.offset.y;
+
+    if let Some(map_rect) = map_rect {
+        if let Some(target) = draw_diff_minimap(
             ui,
+            map_rect,
+            &rows,
+            *scroll_y,
+            output.inner_rect.height(),
+            output.content_size.y,
+            palette,
+        ) {
+            *scroll_y = target;
+        }
+    }
+    *scroll_x = draw_diff_horizontal_scrollbar(
+        ui,
+        horizontal_rect,
+        *scroll_x,
+        code_rect.width(),
+        total_width,
+        palette,
+    );
+}
+
+fn diff_needs_minimap(row_count: usize, viewport_height: f32) -> bool {
+    row_count as f32 * DIFF_ROW_HEIGHT > viewport_height + 0.5
+}
+
+fn diff_display_rows(files: &[DiffFile]) -> Vec<DiffDisplayRow<'_>> {
+    let mut rows = Vec::new();
+    for file in files {
+        rows.push(DiffDisplayRow::File(file));
+        for row in &file.rows {
+            match row {
+                // Patch plumbing such as `index <old>..<new> 100644` is useful to Git, not to a
+                // source reader. Keep it in the parser for fidelity but omit it from the viewer.
+                DiffRow::Meta(_) => {}
+                DiffRow::Hunk(text) => rows.push(DiffDisplayRow::Hunk(text)),
+                DiffRow::Line(line) => rows.push(DiffDisplayRow::Line(line)),
+            }
+        }
+    }
+    rows
+}
+
+fn draw_display_row(
+    ui: &mut egui::Ui,
+    row: DiffDisplayRow<'_>,
+    left_label: &str,
+    right_label: &str,
+    language: DiffLanguage,
+    total_width: f32,
+    column_width: f32,
+    scroll_x: f32,
+    palette: DiffPalette,
+) {
+    let (viewport_row, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), DIFF_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    let paint_rect = Rect::from_min_size(
+        Pos2::new(viewport_row.left() - scroll_x, viewport_row.top()),
+        Vec2::new(total_width, DIFF_ROW_HEIGHT),
+    );
+    match row {
+        DiffDisplayRow::File(file) => draw_file_header(
+            ui,
+            paint_rect,
             file,
             left_label,
             right_label,
-            total_width,
             column_width,
-            gap,
+            DIFF_PANE_GAP,
             palette,
-        );
-        for row in &file.rows {
-            match row {
-                DiffRow::Meta(text) => draw_meta_row(ui, text, total_width, palette),
-                DiffRow::Hunk(text) => draw_hunk_row(ui, text, total_width, palette),
-                DiffRow::Line(line) => {
-                    draw_line_row(ui, line, total_width, column_width, gap, palette)
-                }
-            }
+        ),
+        DiffDisplayRow::Hunk(text) => draw_hunk_row(
+            ui,
+            paint_rect,
+            &format_hunk_summary(text, language),
+            palette,
+        ),
+        DiffDisplayRow::Line(line) => {
+            draw_line_row(ui, paint_rect, line, column_width, DIFF_PANE_GAP, palette)
         }
     }
 }
 
+fn diff_horizontal_scroll_input(
+    ui: &egui::Ui,
+    code_rect: Rect,
+    current: f32,
+    max_scroll: f32,
+) -> f32 {
+    if !ui.rect_contains_pointer(code_rect) || max_scroll <= 0.0 {
+        return current.clamp(0.0, max_scroll);
+    }
+    let (delta, shift) = ui
+        .ctx()
+        .input(|input| (input.smooth_scroll_delta, input.modifiers.shift));
+    let horizontal = if delta.x.abs() > f32::EPSILON {
+        delta.x
+    } else if shift {
+        delta.y
+    } else {
+        0.0
+    };
+    if horizontal.abs() > f32::EPSILON {
+        ui.ctx().request_repaint();
+    }
+    (current - horizontal).clamp(0.0, max_scroll)
+}
+
+fn draw_diff_horizontal_scrollbar(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    current: f32,
+    viewport_width: f32,
+    content_width: f32,
+    palette: DiffPalette,
+) -> f32 {
+    ui.painter().rect_filled(rect, 3.0, palette.gutter_bg);
+    let max_scroll = (content_width - viewport_width).max(0.0);
+    if max_scroll <= 0.0 || rect.width() <= 1.0 {
+        return 0.0;
+    }
+    let thumb_width = (rect.width() * viewport_width / content_width).clamp(28.0, rect.width());
+    let travel = (rect.width() - thumb_width).max(0.0);
+    let thumb_left = rect.left() + travel * (current / max_scroll);
+    let thumb = Rect::from_min_size(
+        Pos2::new(thumb_left, rect.top() + 1.0),
+        Vec2::new(thumb_width, (rect.height() - 2.0).max(1.0)),
+    );
+    ui.painter()
+        .rect_filled(thumb, 3.0, diff_color_with_opacity(palette.meta, 0.72));
+    let response = ui
+        .interact(
+            rect,
+            ui.make_persistent_id("diff_horizontal_scrollbar"),
+            Sense::click_and_drag(),
+        )
+        .on_hover_cursor(CursorIcon::ResizeHorizontal);
+    if !(response.clicked() || response.dragged()) {
+        return current.clamp(0.0, max_scroll);
+    }
+    let Some(pointer) = response.interact_pointer_pos() else {
+        return current.clamp(0.0, max_scroll);
+    };
+    ui.ctx().request_repaint();
+    ((pointer.x - rect.left() - thumb_width / 2.0) / travel.max(1.0) * max_scroll)
+        .clamp(0.0, max_scroll)
+}
+
+fn draw_diff_minimap(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    rows: &[DiffDisplayRow<'_>],
+    scroll_y: f32,
+    viewport_height: f32,
+    content_height: f32,
+    palette: DiffPalette,
+) -> Option<f32> {
+    if rows.is_empty()
+        || content_height <= viewport_height + 0.5
+        || content_height <= 0.0
+        || rect.height() <= 4.0
+    {
+        return None;
+    }
+    ui.painter().rect_filled(rect, 3.0, palette.gutter_bg);
+    let row_height = rect.height() / rows.len() as f32;
+    for (index, row) in rows.iter().enumerate() {
+        let tone = diff_overview_tone(*row);
+        let Some(color) = diff_overview_color(tone, palette) else {
+            continue;
+        };
+        let top = rect.top() + index as f32 * row_height;
+        let bottom = (top + row_height.max(1.0)).min(rect.bottom());
+        ui.painter().rect_filled(
+            Rect::from_min_max(
+                Pos2::new(rect.left() + 2.0, top),
+                Pos2::new(rect.right() - 2.0, bottom),
+            ),
+            0.0,
+            color,
+        );
+    }
+    let viewport = diff_minimap_viewport_rect(rect, scroll_y, viewport_height, content_height);
+    ui.painter()
+        .rect_filled(viewport, 2.0, diff_color_with_opacity(palette.meta, 0.48));
+    let response = ui
+        .interact(
+            rect,
+            ui.make_persistent_id("diff_minimap"),
+            Sense::click_and_drag(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if !(response.clicked() || response.dragged()) {
+        return None;
+    }
+    let pointer = response.interact_pointer_pos()?;
+    ui.ctx().request_repaint();
+    Some(diff_minimap_scroll_target(
+        rect,
+        pointer.y,
+        viewport_height,
+        content_height,
+    ))
+}
+
+fn diff_overview_tone(row: DiffDisplayRow<'_>) -> DiffOverviewTone {
+    match row {
+        DiffDisplayRow::File(_) => DiffOverviewTone::File,
+        DiffDisplayRow::Hunk(_) => DiffOverviewTone::Hunk,
+        DiffDisplayRow::Line(line) => match (line.left_kind, line.right_kind) {
+            (DiffCellKind::Removed, DiffCellKind::Added) => DiffOverviewTone::Changed,
+            (DiffCellKind::Removed, _) => DiffOverviewTone::Removed,
+            (_, DiffCellKind::Added) => DiffOverviewTone::Added,
+            _ => DiffOverviewTone::Context,
+        },
+    }
+}
+
+fn diff_overview_color(tone: DiffOverviewTone, palette: DiffPalette) -> Option<Color32> {
+    match tone {
+        DiffOverviewTone::File => Some(diff_color_with_opacity(palette.text, 0.48)),
+        DiffOverviewTone::Hunk => Some(diff_color_with_opacity(palette.meta, 0.72)),
+        DiffOverviewTone::Added => Some(diff_color_with_opacity(palette.added, 0.86)),
+        DiffOverviewTone::Removed => Some(diff_color_with_opacity(palette.removed, 0.86)),
+        DiffOverviewTone::Changed => Some(Color32::from_rgb(
+            ((palette.added.r() as u16 + palette.removed.r() as u16) / 2) as u8,
+            ((palette.added.g() as u16 + palette.removed.g() as u16) / 2) as u8,
+            ((palette.added.b() as u16 + palette.removed.b() as u16) / 2) as u8,
+        )),
+        DiffOverviewTone::Context => None,
+    }
+}
+
+fn diff_color_with_opacity(color: Color32, opacity: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        (255.0 * opacity.clamp(0.0, 1.0)).round() as u8,
+    )
+}
+
+fn diff_minimap_viewport_rect(
+    track: Rect,
+    scroll_y: f32,
+    viewport_height: f32,
+    content_height: f32,
+) -> Rect {
+    let visible_ratio = (viewport_height / content_height).clamp(0.0, 1.0);
+    let thumb_height = (track.height() * visible_ratio).clamp(8.0, track.height());
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    let travel = (track.height() - thumb_height).max(0.0);
+    let top = if max_scroll > 0.0 {
+        track.top() + travel * (scroll_y / max_scroll).clamp(0.0, 1.0)
+    } else {
+        track.top()
+    };
+    Rect::from_min_size(
+        Pos2::new(track.left() + 1.0, top),
+        Vec2::new((track.width() - 2.0).max(1.0), thumb_height),
+    )
+}
+
+fn diff_minimap_scroll_target(
+    track: Rect,
+    pointer_y: f32,
+    viewport_height: f32,
+    content_height: f32,
+) -> f32 {
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    if max_scroll <= 0.0 {
+        return 0.0;
+    }
+    let ratio = ((pointer_y - track.top()) / track.height().max(1.0)).clamp(0.0, 1.0);
+    (ratio * content_height - viewport_height / 2.0).clamp(0.0, max_scroll)
+}
+
 fn draw_file_header(
     ui: &mut egui::Ui,
+    rect: Rect,
     file: &DiffFile,
     left_label: &str,
     right_label: &str,
-    total_width: f32,
     column_width: f32,
     gap: f32,
     palette: DiffPalette,
 ) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_width, 30.0), Sense::hover());
-    ui.painter().rect_filled(rect, 4.0, palette.file_bg);
+    ui.painter().rect_filled(rect, 0.0, palette.file_bg);
     let (left_rect, right_rect) = split_columns(rect, column_width, gap);
     draw_header_text(
         ui,
@@ -575,22 +967,7 @@ fn draw_file_header(
     );
 }
 
-fn draw_meta_row(ui: &mut egui::Ui, text: &str, total_width: f32, palette: DiffPalette) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_width, 22.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, palette.panel);
-    ui.painter()
-        .with_clip_rect(rect.intersect(ui.clip_rect()))
-        .text(
-            rect.left_center() + Vec2::new(10.0, 0.0),
-            Align2::LEFT_CENTER,
-            text,
-            FontId::monospace(12.0),
-            palette.meta,
-        );
-}
-
-fn draw_hunk_row(ui: &mut egui::Ui, text: &str, total_width: f32, palette: DiffPalette) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_width, 24.0), Sense::hover());
+fn draw_hunk_row(ui: &mut egui::Ui, rect: Rect, text: &str, palette: DiffPalette) {
     ui.painter().rect_filled(rect, 0.0, palette.hunk_bg);
     ui.painter()
         .with_clip_rect(rect.intersect(ui.clip_rect()))
@@ -605,13 +982,12 @@ fn draw_hunk_row(ui: &mut egui::Ui, text: &str, total_width: f32, palette: DiffP
 
 fn draw_line_row(
     ui: &mut egui::Ui,
+    rect: Rect,
     line: &DiffLine,
-    total_width: f32,
     column_width: f32,
     gap: f32,
     palette: DiffPalette,
 ) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_width, 24.0), Sense::hover());
     let (left_rect, right_rect) = split_columns(rect, column_width, gap);
     draw_cell(
         ui,
@@ -649,10 +1025,9 @@ fn draw_cell(
     palette: DiffPalette,
 ) {
     ui.painter().rect_filled(rect, 0.0, cell_bg(kind, palette));
-    let gutter_width = 50.0;
     let gutter_rect = Rect::from_min_max(
         rect.left_top(),
-        Pos2::new(rect.left() + gutter_width, rect.bottom()),
+        Pos2::new(rect.left() + DIFF_GUTTER_WIDTH, rect.bottom()),
     );
     ui.painter()
         .rect_filled(gutter_rect, 0.0, palette.gutter_bg);
@@ -722,6 +1097,68 @@ fn diff_line_color(line: &str, palette: DiffPalette) -> Color32 {
     }
 }
 
+fn diff_app_icon_data() -> egui::IconData {
+    const SIZE: usize = 64;
+    let mut rgba = vec![0_u8; SIZE * SIZE * 4];
+    let removed = [231, 91, 83, 255];
+    let added = [49, 181, 112, 255];
+    let neutral = [113, 137, 174, 255];
+
+    // Two compact source panes with opposing change marks. This stays recognizable at the
+    // Windows title-bar size and deliberately differs from both eframe's `e` and the merge icon.
+    paint_diff_icon_box(&mut rgba, 7, 11, 27, 53, removed);
+    paint_diff_icon_box(&mut rgba, 37, 11, 57, 53, added);
+    paint_diff_icon_line(&mut rgba, 12, 23, 22, 23, removed);
+    paint_diff_icon_line(&mut rgba, 12, 32, 22, 32, removed);
+    paint_diff_icon_line(&mut rgba, 42, 32, 52, 32, added);
+    paint_diff_icon_line(&mut rgba, 42, 41, 52, 41, added);
+    paint_diff_icon_line(&mut rgba, 28, 32, 36, 32, neutral);
+    paint_diff_icon_line(&mut rgba, 33, 28, 37, 32, neutral);
+    paint_diff_icon_line(&mut rgba, 33, 36, 37, 32, neutral);
+
+    egui::IconData {
+        rgba,
+        width: SIZE as u32,
+        height: SIZE as u32,
+    }
+}
+
+fn paint_diff_icon_box(
+    rgba: &mut [u8],
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+    color: [u8; 4],
+) {
+    paint_diff_icon_line(rgba, left, top, right, top, color);
+    paint_diff_icon_line(rgba, left, top, left, bottom, color);
+    paint_diff_icon_line(rgba, right, top, right, bottom, color);
+    paint_diff_icon_line(rgba, left, bottom, right, bottom, color);
+}
+
+fn paint_diff_icon_line(
+    rgba: &mut [u8],
+    start_x: usize,
+    start_y: usize,
+    end_x: usize,
+    end_y: usize,
+    color: [u8; 4],
+) {
+    let steps = start_x.abs_diff(end_x).max(start_y.abs_diff(end_y)).max(1);
+    for step in 0..=steps {
+        let progress = step as f32 / steps as f32;
+        let x = (start_x as f32 + (end_x as f32 - start_x as f32) * progress).round() as usize;
+        let y = (start_y as f32 + (end_y as f32 - start_y as f32) * progress).round() as usize;
+        for paint_y in y.saturating_sub(2)..=(y + 2).min(63) {
+            for paint_x in x.saturating_sub(2)..=(x + 2).min(63) {
+                let index = (paint_y * 64 + paint_x) * 4;
+                rgba[index..index + 4].copy_from_slice(&color);
+            }
+        }
+    }
+}
+
 fn apply_diff_theme(ctx: &egui::Context, theme: DiffTheme) {
     let palette = diff_palette(theme);
     let mut visuals = match theme {
@@ -762,5 +1199,71 @@ fn dt(language: DiffLanguage, key: &str) -> &'static str {
         (DiffLanguage::Chinese, "empty") => "\u{6ca1}\u{6709}\u{5dee}\u{5f02}",
         (_, "empty") => "No differences",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hunk_header_becomes_readable_range_summary() {
+        let raw = "@@ -96,6 +96,12 @@ const ruleId = getRuleId()";
+        assert_eq!(
+            format_hunk_summary(raw, DiffLanguage::Chinese),
+            "区块  旧 96–101  →  新 96–107  ·  const ruleId = getRuleId()"
+        );
+        assert_eq!(
+            format_hunk_summary(raw, DiffLanguage::English),
+            "Block  old 96–101  →  new 96–107  ·  const ruleId = getRuleId()"
+        );
+    }
+
+    #[test]
+    fn display_rows_hide_git_index_plumbing() {
+        let files = parse_side_by_side_diff(
+            "diff --git a/a.rs b/a.rs\nindex 1111111..2222222 100644\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        );
+        assert!(
+            files[0]
+                .rows
+                .iter()
+                .any(|row| matches!(row, DiffRow::Meta(text) if text.starts_with("index ")))
+        );
+        let rows = diff_display_rows(&files);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0], DiffDisplayRow::File(_)));
+        assert!(matches!(rows[1], DiffDisplayRow::Hunk(_)));
+        assert!(matches!(rows[2], DiffDisplayRow::Line(_)));
+    }
+
+    #[test]
+    fn minimap_clicks_reach_document_ends() {
+        let track = Rect::from_min_size(Pos2::new(20.0, 10.0), Vec2::new(14.0, 600.0));
+        assert_eq!(
+            diff_minimap_scroll_target(track, track.top(), 200.0, 1_000.0),
+            0.0
+        );
+        assert_eq!(
+            diff_minimap_scroll_target(track, track.bottom(), 200.0, 1_000.0),
+            800.0
+        );
+        let bottom = diff_minimap_viewport_rect(track, 800.0, 200.0, 1_000.0);
+        assert!((bottom.bottom() - track.bottom()).abs() < 0.01);
+    }
+
+    #[test]
+    fn minimap_is_only_reserved_for_overflowing_diff_rows() {
+        assert!(!diff_needs_minimap(10, 10.0 * DIFF_ROW_HEIGHT));
+        assert!(!diff_needs_minimap(0, 600.0));
+        assert!(diff_needs_minimap(11, 10.0 * DIFF_ROW_HEIGHT));
+    }
+
+    #[test]
+    fn diff_icon_has_transparency_and_colored_content() {
+        let icon = diff_app_icon_data();
+        assert_eq!((icon.width, icon.height), (64, 64));
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 0));
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
     }
 }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Validate Merge AI Suggestions"
+  short_description: "Compare expert merge baselines with live AI advice"
+  default_prompt: "Use $validate-merge-ai-suggestions to validate this repository merge against the configured AI model."

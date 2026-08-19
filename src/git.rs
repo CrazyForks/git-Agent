@@ -120,6 +120,7 @@ pub struct RepositoryConfig {
     pub user_name: String,
     pub user_email: String,
     pub uses_global_user: bool,
+    pub identity_warning_suppressed: bool,
 }
 
 #[allow(dead_code)]
@@ -3065,6 +3066,29 @@ pub struct PullOptions {
     pub rebase: bool,
 }
 
+#[derive(Debug)]
+pub struct PullConflictError {
+    diagnostic: String,
+}
+
+impl PullConflictError {
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+}
+
+impl std::fmt::Display for PullConflictError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "git pull stopped with unresolved merge conflicts: {}",
+            self.diagnostic
+        )
+    }
+}
+
+impl std::error::Error for PullConflictError {}
+
 impl Default for PullOptions {
     fn default() -> Self {
         Self {
@@ -3134,6 +3158,70 @@ pub fn commit_with_options(
     git_output(root.as_ref(), &refs).map(|_| ())
 }
 
+pub fn commit_with_identity(
+    root: impl AsRef<Path>,
+    message: &str,
+    options: CommitOptions,
+    name: &str,
+    email: &str,
+) -> Result<()> {
+    let mut args = vec![
+        "-c".to_owned(),
+        format!("user.name={name}"),
+        "-c".to_owned(),
+        format!("user.email={email}"),
+    ];
+    args.extend(commit_args(message, options));
+    if options.amend {
+        args.insert(6, "--reset-author".to_owned());
+    }
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+pub fn commit_with_repository_identity(
+    root: impl AsRef<Path>,
+    message: &str,
+    options: CommitOptions,
+) -> Result<()> {
+    let mut args = commit_args(message, options);
+    if options.amend {
+        args.insert(2, "--reset-author".to_owned());
+    }
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+pub fn set_repository_user_identity(root: impl AsRef<Path>, name: &str, email: &str) -> Result<()> {
+    let root = root.as_ref();
+    git_output(
+        root,
+        &["config", "--local", "--replace-all", "user.name", name],
+    )?;
+    git_output(
+        root,
+        &["config", "--local", "--replace-all", "user.email", email],
+    )?;
+    set_repository_identity_warning_suppressed(root, false)
+}
+
+pub fn set_repository_identity_warning_suppressed(
+    root: impl AsRef<Path>,
+    suppressed: bool,
+) -> Result<()> {
+    git_output(
+        root.as_ref(),
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            "git-agent.identityWarningSuppressed",
+            if suppressed { "true" } else { "false" },
+        ],
+    )
+    .map(|_| ())
+}
+
 pub fn fetch_with_options(root: impl AsRef<Path>, options: FetchOptions) -> Result<()> {
     let args = fetch_args(options);
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -3169,7 +3257,7 @@ pub fn pull_from_remote(
 ) -> Result<()> {
     let args = pull_args(remote, branch, options);
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    git_output(root.as_ref(), &refs).map(|_| ())
+    git_pull(root.as_ref(), &refs)
 }
 
 fn pull_args(remote: &str, branch: &str, options: PullOptions) -> Vec<String> {
@@ -3196,7 +3284,7 @@ fn pull_args(remote: &str, branch: &str, options: PullOptions) -> Vec<String> {
 }
 
 pub fn pull(root: impl AsRef<Path>) -> Result<()> {
-    git_output(root.as_ref(), &["pull"]).map(|_| ())
+    git_pull(root.as_ref(), &["pull"])
 }
 
 pub fn push(root: impl AsRef<Path>) -> Result<()> {
@@ -3608,6 +3696,17 @@ fn load_repository_config(root: &Path) -> RepositoryConfig {
     } else {
         local_user_email.clone()
     };
+    let identity_warning_suppressed = git_config_value(
+        root,
+        &[
+            "config",
+            "--local",
+            "--bool",
+            "--get",
+            "git-agent.identityWarningSuppressed",
+        ],
+    )
+    .eq_ignore_ascii_case("true");
 
     RepositoryConfig {
         config_path,
@@ -3615,6 +3714,7 @@ fn load_repository_config(root: &Path) -> RepositoryConfig {
         user_name: effective_user_name,
         user_email: effective_user_email,
         uses_global_user: local_user_name.is_empty() && local_user_email.is_empty(),
+        identity_warning_suppressed,
     }
 }
 
@@ -3849,6 +3949,43 @@ fn git_failure_diagnostic(output: &Output) -> String {
         return stdout;
     }
     format!("git process exited without diagnostics ({})", output.status)
+}
+
+fn git_full_failure_diagnostic(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (false, false) => format!("{stderr}\n{stdout}"),
+        (false, true) => stderr,
+        (true, false) => stdout,
+        (true, true) => format!("git process exited without diagnostics ({})", output.status),
+    }
+}
+
+fn git_pull(root: &Path, args: &[&str]) -> Result<()> {
+    let output = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    if has_unmerged_paths(root) {
+        return Err(PullConflictError {
+            diagnostic: git_full_failure_diagnostic(&output),
+        }
+        .into());
+    }
+
+    Err(anyhow!(
+        "git {} failed: {}",
+        args.join(" "),
+        git_failure_diagnostic(&output)
+    ))
 }
 
 fn git_output_allowing_new_conflicts(root: &Path, args: &[&str]) -> Result<()> {
@@ -4573,6 +4710,51 @@ mod tests {
     }
 
     #[test]
+    fn pull_conflicts_return_a_typed_error_and_keep_complete_git_diagnostics() -> Result<()> {
+        let nonce = NEXT_COMMIT_PATCH_REPO.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-pull-conflict-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "core.autocrlf", "false"])?;
+        git_output(&root, &["config", "pull.rebase", "false"])?;
+        git_output(&root, &["config", "user.name", "Pull Tester"])?;
+        git_output(&root, &["config", "user.email", "pull-tester@example.com"])?;
+        git_output(&root, &["checkout", "-b", "main"])?;
+        fs::write(root.join("story.txt"), "base\n")?;
+        git_output(&root, &["add", "story.txt"])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+
+        git_output(&root, &["checkout", "-b", "incoming"])?;
+        fs::write(root.join("story.txt"), "incoming\n")?;
+        git_output(&root, &["commit", "-am", "incoming"])?;
+        git_output(&root, &["checkout", "main"])?;
+        fs::write(root.join("story.txt"), "local\n")?;
+        git_output(&root, &["commit", "-am", "local"])?;
+
+        let error = pull_from_remote(&root, ".", "incoming", PullOptions::default())
+            .expect_err("divergent edits should leave a merge conflict");
+        let conflict = error
+            .downcast_ref::<PullConflictError>()
+            .expect("pull conflicts should use the typed error");
+        let diagnostic = conflict.diagnostic().to_ascii_lowercase();
+
+        assert!(has_unmerged_paths(&root));
+        assert!(diagnostic.contains("from "), "{diagnostic}");
+        assert!(diagnostic.contains("conflict"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("automatic merge failed"),
+            "{diagnostic}"
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn merge_commit_args_reflect_dialog_options() {
         assert_eq!(
             merge_commit_args("abc123", MergeOptions::default()),
@@ -4698,14 +4880,14 @@ mod tests {
             hash: "aaa111".to_owned(),
             subject: "rewrite author".to_owned(),
             message: Some("rewrite author".to_owned()),
-            author_name: Some("Adoin O'Neil".to_owned()),
-            author_email: Some("adoin@example.com".to_owned()),
+            author_name: Some("Test O'Neil".to_owned()),
+            author_email: Some("test.author@example.com".to_owned()),
         };
 
         let todo = interactive_rebase_todo(&[item]);
         assert!(todo.starts_with("pick aaa111 rewrite author\n"));
         assert!(todo.contains(
-            "exec git -c user.name='Adoin O'\"'\"'Neil' -c user.email='adoin@example.com' commit --amend --allow-empty --reset-author\n"
+            "exec git -c user.name='Test O'\"'\"'Neil' -c user.email='test.author@example.com' commit --amend --allow-empty --reset-author\n"
         ));
     }
 
@@ -5833,22 +6015,23 @@ summary add second
         git_command()
             .arg("-C")
             .arg(&root)
-            .args(["config", "--local", "user.name", "Ado Wang"])
+            .args(["config", "--local", "user.name", "Test Author"])
             .output()
             .unwrap();
         git_command()
             .arg("-C")
             .arg(&root)
-            .args(["config", "--local", "user.email", "adoin.wang@qq.com"])
+            .args(["config", "--local", "user.email", "test.author@example.com"])
             .output()
             .unwrap();
 
         let config = load_repository_config(&root);
 
         assert_eq!(config.gitignore_path, root.join(".gitignore"));
-        assert_eq!(config.user_name, "Ado Wang");
-        assert_eq!(config.user_email, "adoin.wang@qq.com");
+        assert_eq!(config.user_name, "Test Author");
+        assert_eq!(config.user_email, "test.author@example.com");
         assert!(!config.uses_global_user);
+        assert!(!config.identity_warning_suppressed);
         assert!(config.config_path.ends_with("config"));
 
         fs::remove_dir_all(&root).unwrap();
@@ -5861,6 +6044,48 @@ summary add second
         let args = cherry_pick_args(&hashes);
 
         assert_eq!(args, vec!["cherry-pick", "old123", "new456"]);
+    }
+
+    #[test]
+    fn repository_identity_can_be_persisted_or_used_for_one_commit() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("git-agent-commit-identity-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.name", "Personal Author"])?;
+        git_output(&root, &["config", "user.email", "personal@example.com"])?;
+        fs::write(root.join("file.txt"), "identity test\n")?;
+        git_output(&root, &["add", "file.txt"])?;
+
+        commit_with_identity(
+            &root,
+            "company commit",
+            CommitOptions::default(),
+            "Company Author",
+            "author@corp.example.com",
+        )?;
+
+        assert_eq!(
+            git_output(&root, &["log", "-1", "--format=%an <%ae>"])?.trim(),
+            "Company Author <author@corp.example.com>"
+        );
+        assert_eq!(
+            git_output(&root, &["config", "--get", "user.name"])?.trim(),
+            "Personal Author"
+        );
+
+        set_repository_user_identity(&root, "Company Author", "author@corp.example.com")?;
+        let config = load_repository_config(&root);
+        assert_eq!(config.user_name, "Company Author");
+        assert_eq!(config.user_email, "author@corp.example.com");
+        assert!(!config.identity_warning_suppressed);
+
+        set_repository_identity_warning_suppressed(&root, true)?;
+        assert!(load_repository_config(&root).identity_warning_suppressed);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
     }
 
     #[test]

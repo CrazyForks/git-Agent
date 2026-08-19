@@ -672,6 +672,30 @@ pub fn accent_color(accent: ThemeAccent) -> Color32 {
     configured_color(current_mode(), accent, "--accent").unwrap_or_else(|| accent_seed(accent))
 }
 
+pub fn pattern_accent(mode: ThemeMode, accent: ThemeAccent) -> Color32 {
+    let token = match accent {
+        ThemeAccent::Green => "--pattern-accent-green",
+        ThemeAccent::ForestGreen => "--pattern-accent-forest",
+        ThemeAccent::SunRed => "--pattern-accent-red",
+        _ => "--pattern-accent",
+    };
+    configured_color(mode, accent, token).unwrap_or_else(|| {
+        let hue = rgb_to_hsl(accent_seed(accent)).h;
+        let (saturation, lightness, alpha) = match (mode, accent) {
+            (ThemeMode::Light, ThemeAccent::SunRed) => (0.68, 0.50, 36),
+            (ThemeMode::Dark, ThemeAccent::SunRed) => (0.66, 0.68, 46),
+            (ThemeMode::Light, ThemeAccent::Green) => (0.50, 0.32, 46),
+            (ThemeMode::Dark, ThemeAccent::Green) => (0.50, 0.68, 51),
+            (ThemeMode::Light, ThemeAccent::ForestGreen) => (0.42, 0.28, 46),
+            (ThemeMode::Dark, ThemeAccent::ForestGreen) => (0.42, 0.65, 51),
+            (ThemeMode::Light, _) => (0.78, 0.42, 56),
+            (ThemeMode::Dark, _) => (0.60, 0.70, 56),
+        };
+        let color = hsl_to_rgb(hue, saturation, lightness);
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+    })
+}
+
 fn accent_index(accent: ThemeAccent) -> u8 {
     match accent {
         ThemeAccent::Green => 0,
@@ -980,6 +1004,58 @@ mod tests {
             luminance(deep_sea) < luminance(sky),
             "deep sea blue should read darker than sky blue"
         );
+    }
+
+    #[test]
+    fn background_pattern_uses_separate_day_and_night_color_tuning() {
+        let light = pattern_accent(ThemeMode::Light, ThemeAccent::Blue);
+        let dark = pattern_accent(ThemeMode::Dark, ThemeAccent::Blue);
+        let unpremultiplied_hsl = |color: Color32| {
+            let [r, g, b, _] = color.to_srgba_unmultiplied();
+            rgb_to_hsl(Color32::from_rgb(r, g, b))
+        };
+        let light_hsl = unpremultiplied_hsl(light);
+        let dark_hsl = unpremultiplied_hsl(dark);
+        let light_red = pattern_accent(ThemeMode::Light, ThemeAccent::SunRed);
+        let light_green = pattern_accent(ThemeMode::Light, ThemeAccent::Green);
+        let light_forest = pattern_accent(ThemeMode::Light, ThemeAccent::ForestGreen);
+        let light_green_hsl = unpremultiplied_hsl(light_green);
+        let light_forest_hsl = unpremultiplied_hsl(light_forest);
+
+        assert!(light_hsl.s >= 0.74);
+        assert!((0.38..=0.46).contains(&light_hsl.l));
+        assert!(dark_hsl.s <= light_hsl.s);
+        assert!(dark_hsl.l >= 0.66);
+        assert!(dark_hsl.l > light_hsl.l);
+        assert!(light.a() >= 52);
+        assert!(dark.a() >= 52);
+        assert!(light_red.a() < light.a());
+        assert!(light_green_hsl.s < light_hsl.s);
+        assert!(light_green_hsl.l < light_hsl.l);
+        assert!(light_forest_hsl.s <= light_green_hsl.s);
+        assert!(light_forest_hsl.l < light_green_hsl.l);
+    }
+
+    #[test]
+    fn every_background_pattern_keeps_its_theme_accent_hue() {
+        let unpremultiplied_hsl = |color: Color32| {
+            let [r, g, b, _] = color.to_srgba_unmultiplied();
+            rgb_to_hsl(Color32::from_rgb(r, g, b))
+        };
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            for accent in all_accents() {
+                let main = configured_color(mode, accent, "--accent").unwrap();
+                let pattern = pattern_accent(mode, accent);
+                let main_hue = unpremultiplied_hsl(main).h;
+                let pattern_hue = unpremultiplied_hsl(pattern).h;
+                let direct = (main_hue - pattern_hue).abs();
+                let circular_difference = direct.min(1.0 - direct);
+                assert!(
+                    circular_difference <= 0.01,
+                    "{mode:?}/{accent:?} pattern hue {pattern_hue} diverged from main hue {main_hue}"
+                );
+            }
+        }
     }
 
     #[test]
