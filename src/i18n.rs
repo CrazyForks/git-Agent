@@ -243,6 +243,73 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ("about.title", "\u{5173}\u{4e8e} Git Agent"),
     ("about.version", "\u{7248}\u{672c}"),
     ("about.repository", "\u{9879}\u{76ee}\u{4e3b}\u{9875}"),
+    ("tutorial.menu", "\u{65b0}\u{624b}\u{6559}\u{7a0b}"),
+    ("tutorial.close", "\u{5173}\u{95ed}\u{6559}\u{7a0b}"),
+    ("tutorial.previous", "\u{4e0a}\u{4e00}\u{6b65}"),
+    ("tutorial.next", "\u{4e0b}\u{4e00}\u{6b65}"),
+    ("tutorial.finish", "\u{5b8c}\u{6210}"),
+    ("tutorial.menus.title", "\u{4e3b}\u{83dc}\u{5355}"),
+    (
+        "tutorial.menus.body",
+        "文件、查看、仓库、操作和工具菜单集中提供各项功能，菜单右侧会标出可用快捷键。\n拖动顶部空白区域移动窗口，双击可最大化或还原。",
+    ),
+    (
+        "tutorial.repositories.title",
+        "\u{4ed3}\u{5e93}\u{6807}\u{7b7e}",
+    ),
+    (
+        "tutorial.repositories.body",
+        "单击标签切换仓库，拖动可调整顺序，双击名称可设置显示别名；使用 × 关闭，使用 + 打开更多仓库。",
+    ),
+    (
+        "tutorial.git_actions.title",
+        "\u{5e38}\u{7528} Git \u{64cd}\u{4f5c}",
+    ),
+    (
+        "tutorial.git_actions.body",
+        "提交、分支、标签和贮藏等入口都在这一行。\n拉取、推送、获取：单击打开选项，双击按默认参数直接执行。",
+    ),
+    (
+        "tutorial.navigation.title",
+        "\u{5de5}\u{4f5c}\u{533a}\u{5bfc}\u{822a}",
+    ),
+    (
+        "tutorial.navigation.body",
+        "工作区处理待提交文件，历史浏览提交图谱，搜索定位历史提交。\nCtrl+1 / 2 / 3 可直接切换；Ctrl+Tab 切换仓库标签，F5 刷新。",
+    ),
+    (
+        "tutorial.resources.title",
+        "\u{5206}\u{652f}\u{4e0e}\u{4ed3}\u{5e93}\u{8d44}\u{6e90}",
+    ),
+    (
+        "tutorial.resources.body",
+        "在这里查看本地分支、远端分支、标签和贮藏。双击非当前本地分支可直接切换，双击远端分支可直接检出；右键可执行更多操作。",
+    ),
+    ("tutorial.changes.title", "\u{6587}\u{4ef6}\u{53d8}\u{66f4}"),
+    (
+        "tutorial.changes.body",
+        "\u{5728}\u{5df2}\u{6682}\u{5b58}\u{548c}\u{672a}\u{6682}\u{5b58}\u{4e4b}\u{95f4}\u{79fb}\u{52a8}\u{6587}\u{4ef6}\u{ff0c}\u{9009}\u{4e2d}\u{6587}\u{4ef6}\u{53ef}\u{67e5}\u{770b}\u{5dee}\u{5f02}\u{ff1b}\u{5de6}\u{4e0a}\u{89d2}\u{56fe}\u{6807}\u{53ef}\u{5207}\u{6362}\u{6811}\u{5f62}\u{4e0e}\u{5b8c}\u{6574}\u{8def}\u{5f84}\u{3002}",
+    ),
+    ("tutorial.worktree_shortcuts.title", "选择与暂存快捷键"),
+    (
+        "tutorial.worktree_shortcuts.body",
+        "Ctrl+单击多选文件，Shift+单击连续选择；Ctrl+Shift++ 暂存所选，Ctrl+Shift+- 取消暂存。\nCtrl+Shift+C 在“全部暂存”和“全部取消暂存”间切换；差异行也可用 Ctrl+单击多选。",
+    ),
+    ("tutorial.commit.title", "\u{521b}\u{5efa}\u{63d0}\u{4ea4}"),
+    (
+        "tutorial.commit.body",
+        "\u{8f93}\u{5165}\u{63d0}\u{4ea4}\u{4fe1}\u{606f}\u{540e}\u{63d0}\u{4ea4}\u{5df2}\u{6682}\u{5b58}\u{53d8}\u{66f4}\u{3002}\u{8fd8}\u{53ef}\u{8bbe}\u{7f6e}\u{7acb}\u{5373}\u{63a8}\u{9001}\u{3001}\u{4fee}\u{6539}\u{4e0a}\u{6b21}\u{63d0}\u{4ea4}\u{4ee5}\u{53ca}\u{66f4}\u{591a}\u{63d0}\u{4ea4}\u{9009}\u{9879}\u{3002}",
+    ),
+    ("tutorial.commit_shortcuts.title", "提交快捷键"),
+    (
+        "tutorial.commit_shortcuts.body",
+        "提交输入框聚焦时：Ctrl+Enter 提交，Ctrl+P 勾选或取消“立即推送”，Ctrl+L 勾选或取消“修改上一次提交”。\n输入框未聚焦时，Ctrl+P / Ctrl+L 分别打开推送 / 拉取配置。",
+    ),
+    ("tutorial.tools.title", "\u{5168}\u{5c40}\u{5de5}\u{5177}"),
+    (
+        "tutorial.tools.body",
+        "Git \u{5de5}\u{4f5c}\u{6d41}\u{3001}\u{8fdc}\u{7aef}\u{3001}\u{547d}\u{4ee4}\u{884c}\u{6a21}\u{5f0f}\u{3001}\u{8d44}\u{6e90}\u{7ba1}\u{7406}\u{5668}\u{548c}\u{4ed3}\u{5e93}\u{8bbe}\u{7f6e}\u{4ece}\u{8fd9}\u{91cc}\u{8fdb}\u{5165}\u{3002}",
+    ),
     ("update.title", "\u{68c0}\u{67e5}\u{66f4}\u{65b0}"),
     ("update.current_version", "\u{5f53}\u{524d}\u{7248}\u{672c}"),
     ("update.latest_version", "\u{6700}\u{65b0}\u{7248}\u{672c}"),
@@ -1918,6 +1985,64 @@ const EN: &[(&str, &str)] = &[
     ("about.title", "About Git Agent"),
     ("about.version", "Version"),
     ("about.repository", "Project home"),
+    ("tutorial.menu", "Beginner Tutorial"),
+    ("tutorial.close", "Close tutorial"),
+    ("tutorial.previous", "Previous"),
+    ("tutorial.next", "Next"),
+    ("tutorial.finish", "Finish"),
+    ("tutorial.menus.title", "Main menus"),
+    (
+        "tutorial.menus.body",
+        "File, View, Repository, Actions, and Tools collect all commands; available shortcuts appear at the right of menu items.\nDrag an empty title-bar area to move the window, or double-click it to maximize or restore.",
+    ),
+    ("tutorial.repositories.title", "Repository tabs"),
+    (
+        "tutorial.repositories.body",
+        "Click a tab to switch repositories, drag to reorder, or double-click its name to set a display alias. Use × to close and + to open more.",
+    ),
+    ("tutorial.git_actions.title", "Everyday Git actions"),
+    (
+        "tutorial.git_actions.body",
+        "Commit, Branches, Tags, and Stashes are available from this action row.\nFor Pull, Push, and Fetch: single-click opens options; double-click runs immediately with defaults.",
+    ),
+    ("tutorial.navigation.title", "Workspace navigation"),
+    (
+        "tutorial.navigation.body",
+        "Workspace handles pending files, History shows the commit graph, and Search locates past commits.\nUse Ctrl+1 / 2 / 3 to switch views, Ctrl+Tab to switch repository tabs, and F5 to refresh.",
+    ),
+    ("tutorial.resources.title", "Branches and resources"),
+    (
+        "tutorial.resources.body",
+        "Browse local and remote branches, tags, and stashes. Double-click a non-current local branch to switch, or a remote branch to check it out; right-click for more actions.",
+    ),
+    ("tutorial.changes.title", "File changes"),
+    (
+        "tutorial.changes.body",
+        "Move files between staged and unstaged, then select one to inspect its diff. Use the header icon to switch tree and full-path views.",
+    ),
+    (
+        "tutorial.worktree_shortcuts.title",
+        "Selection and staging shortcuts",
+    ),
+    (
+        "tutorial.worktree_shortcuts.body",
+        "Ctrl-click selects multiple files; Shift-click selects a range. Ctrl+Shift++ stages selected files, and Ctrl+Shift+- unstages them.\nCtrl+Shift+C toggles Stage All / Unstage All; Ctrl-click also selects multiple diff lines.",
+    ),
+    ("tutorial.commit.title", "Create a commit"),
+    (
+        "tutorial.commit.body",
+        "Enter a message and commit the staged changes. You can also push immediately, amend the last commit, or open more commit options.",
+    ),
+    ("tutorial.commit_shortcuts.title", "Commit shortcuts"),
+    (
+        "tutorial.commit_shortcuts.body",
+        "With the message editor focused: Ctrl+Enter commits, Ctrl+P toggles Push immediately, and Ctrl+L toggles Amend last commit.\nWithout editor focus, Ctrl+P / Ctrl+L open Push / Pull options instead.",
+    ),
+    ("tutorial.tools.title", "Global tools"),
+    (
+        "tutorial.tools.body",
+        "Open Git Flow, Remotes, Command Mode, Resource Manager, and repository-specific settings from this area.",
+    ),
     ("update.title", "Check for Updates"),
     ("update.current_version", "Current version"),
     ("update.latest_version", "Latest version"),
