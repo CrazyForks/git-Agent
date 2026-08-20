@@ -113,7 +113,7 @@ pub struct Remote {
     pub push_url: String,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryConfig {
     pub config_path: PathBuf,
     pub gitignore_path: PathBuf,
@@ -121,6 +121,29 @@ pub struct RepositoryConfig {
     pub user_email: String,
     pub uses_global_user: bool,
     pub identity_warning_suppressed: bool,
+    #[serde(default = "default_true")]
+    pub auto_refresh: bool,
+    #[serde(default = "default_true")]
+    pub background_remote_refresh: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for RepositoryConfig {
+    fn default() -> Self {
+        Self {
+            config_path: PathBuf::new(),
+            gitignore_path: PathBuf::new(),
+            user_name: String::new(),
+            user_email: String::new(),
+            uses_global_user: false,
+            identity_warning_suppressed: false,
+            auto_refresh: true,
+            background_remote_refresh: true,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -2563,7 +2586,16 @@ pub fn delete_tag(root: impl AsRef<Path>, name: &str) -> Result<()> {
 }
 
 pub fn stage_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
-    git_output(root.as_ref(), &["add", "--", path]).map(|_| ())
+    stage_paths(root, &[path.to_owned()])
+}
+
+pub fn stage_paths(root: impl AsRef<Path>, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["add".to_owned(), "--".to_owned()];
+    args.extend(paths.iter().cloned());
+    run_git_args(root.as_ref(), args).map(|_| ())
 }
 
 pub fn stage_all(root: impl AsRef<Path>) -> Result<()> {
@@ -2571,7 +2603,16 @@ pub fn stage_all(root: impl AsRef<Path>) -> Result<()> {
 }
 
 pub fn unstage_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
-    git_output(root.as_ref(), &["restore", "--staged", "--", path]).map(|_| ())
+    unstage_paths(root, &[path.to_owned()])
+}
+
+pub fn unstage_paths(root: impl AsRef<Path>, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["restore".to_owned(), "--staged".to_owned(), "--".to_owned()];
+    args.extend(paths.iter().cloned());
+    run_git_args(root.as_ref(), args).map(|_| ())
 }
 
 pub fn unstage_all(root: impl AsRef<Path>) -> Result<()> {
@@ -3707,6 +3748,9 @@ fn load_repository_config(root: &Path) -> RepositoryConfig {
         ],
     )
     .eq_ignore_ascii_case("true");
+    let auto_refresh = repository_refresh_config(root, "git-agent.autoRefresh");
+    let background_remote_refresh =
+        repository_refresh_config(root, "git-agent.backgroundRemoteRefresh");
 
     RepositoryConfig {
         config_path,
@@ -3715,7 +3759,39 @@ fn load_repository_config(root: &Path) -> RepositoryConfig {
         user_email: effective_user_email,
         uses_global_user: local_user_name.is_empty() && local_user_email.is_empty(),
         identity_warning_suppressed,
+        auto_refresh,
+        background_remote_refresh,
     }
+}
+
+fn repository_refresh_config(root: &Path, key: &str) -> bool {
+    let value = git_config_value(root, &["config", "--local", "--bool", "--get", key]);
+    value.is_empty() || value.eq_ignore_ascii_case("true")
+}
+
+pub fn set_repository_auto_refresh(root: impl AsRef<Path>, enabled: bool) -> Result<()> {
+    set_repository_refresh_config(root.as_ref(), "git-agent.autoRefresh", enabled)
+}
+
+pub fn set_repository_background_remote_refresh(
+    root: impl AsRef<Path>,
+    enabled: bool,
+) -> Result<()> {
+    set_repository_refresh_config(root.as_ref(), "git-agent.backgroundRemoteRefresh", enabled)
+}
+
+fn set_repository_refresh_config(root: &Path, key: &str, enabled: bool) -> Result<()> {
+    git_output(
+        root,
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            key,
+            if enabled { "true" } else { "false" },
+        ],
+    )
+    .map(|_| ())
 }
 
 fn git_config_value(root: &Path, args: &[&str]) -> String {
@@ -5006,6 +5082,56 @@ mod tests {
     }
 
     #[test]
+    fn stage_and_unstage_paths_update_every_requested_file() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-stage-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        for path in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join(path), "base\n")?;
+        }
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        for path in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join(path), "changed\n")?;
+        }
+
+        let selected = vec!["a.txt".to_owned(), "b.txt".to_owned()];
+        stage_paths(&root, &selected)?;
+        assert_eq!(
+            git_output(&root, &["diff", "--cached", "--name-only"])?
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["a.txt", "b.txt"]
+        );
+
+        unstage_paths(&root, &selected)?;
+        assert!(
+            git_output(&root, &["diff", "--cached", "--name-only"])?
+                .trim()
+                .is_empty()
+        );
+        assert_eq!(
+            git_output(&root, &["diff", "--name-only"])?
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["a.txt", "b.txt", "c.txt"]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
     fn create_and_apply_worktree_patch_round_trip() -> Result<()> {
         let root =
             std::env::temp_dir().join(format!("git-agent-worktree-patch-{}", std::process::id()));
@@ -6032,9 +6158,44 @@ summary add second
         assert_eq!(config.user_email, "test.author@example.com");
         assert!(!config.uses_global_user);
         assert!(!config.identity_warning_suppressed);
+        assert!(config.auto_refresh);
+        assert!(config.background_remote_refresh);
         assert!(config.config_path.ends_with("config"));
 
+        set_repository_auto_refresh(&root, false).unwrap();
+        set_repository_background_remote_refresh(&root, false).unwrap();
+        let config = load_repository_config(&root);
+        assert!(!config.auto_refresh);
+        assert!(!config.background_remote_refresh);
+        assert_eq!(
+            git_output(
+                &root,
+                &["config", "--local", "--get", "git-agent.autoRefresh"]
+            )
+            .unwrap()
+            .trim(),
+            "false"
+        );
+
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn legacy_cached_repository_config_keeps_refresh_defaults_enabled() {
+        let config: RepositoryConfig = serde_json::from_str(
+            r#"{
+                "config_path":".git/config",
+                "gitignore_path":".gitignore",
+                "user_name":"",
+                "user_email":"",
+                "uses_global_user":true,
+                "identity_warning_suppressed":false
+            }"#,
+        )
+        .unwrap();
+
+        assert!(config.auto_refresh);
+        assert!(config.background_remote_refresh);
     }
 
     #[test]

@@ -62,8 +62,12 @@ const TOP_BAR_GLOBAL_ACTION_SAFETY_PADDING: f32 = 12.0;
 
 const DEFAULT_ACTIVE_REPO_REFRESH_SECONDS: u64 = 20;
 const DEFAULT_INACTIVE_REPO_REFRESH_SECONDS: u64 = 60;
+const DEFAULT_REMOTE_REPO_REFRESH_SECONDS: u64 = 60;
 const MIN_REPO_REFRESH_SECONDS: u64 = 1;
 const MAX_REPO_REFRESH_SECONDS: u64 = 3600;
+const MIN_REMOTE_REPO_REFRESH_SECONDS: u64 = 15;
+const BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY: Duration = Duration::from_secs(5);
+const BACKGROUND_REMOTE_REFRESH_BUSY_RETRY: Duration = Duration::from_secs(5);
 const REPOSITORY_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TOOLBAR_BACKGROUND_STATUS_GRACE: Duration = Duration::from_millis(450);
 // Windows can transiently fail to start git.exe while the system is under memory pressure.
@@ -80,6 +84,14 @@ fn sanitize_repo_refresh_seconds(seconds: u64) -> u64 {
 
 fn repo_refresh_duration(seconds: u64) -> Duration {
     Duration::from_secs(sanitize_repo_refresh_seconds(seconds))
+}
+
+fn sanitize_remote_repo_refresh_seconds(seconds: u64) -> u64 {
+    seconds.clamp(MIN_REMOTE_REPO_REFRESH_SECONDS, MAX_REPO_REFRESH_SECONDS)
+}
+
+fn remote_repo_refresh_duration(seconds: u64) -> Duration {
+    Duration::from_secs(sanitize_remote_repo_refresh_seconds(seconds))
 }
 
 fn repository_snapshot_error_is_retryable(error: &anyhow::Error) -> bool {
@@ -825,6 +837,11 @@ pub struct GitAgentApp {
     foreground_repo_history_loads: HashSet<String>,
     active_repo_refresh_seconds: u64,
     inactive_repo_refresh_seconds: u64,
+    background_remote_refresh_enabled: bool,
+    remote_repo_refresh_seconds: u64,
+    next_background_remote_refresh_at: Instant,
+    background_remote_git_task: Option<Receiver<BackgroundRemoteGitTaskResult>>,
+    background_remote_git_root: Option<PathBuf>,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
     remote_git_status_key: Option<&'static str>,
     remote_git_root: Option<PathBuf>,
@@ -1009,6 +1026,7 @@ fn workspace_repository_display_order(
 }
 
 type RemoteGitTaskResult = (PathBuf, anyhow::Result<()>);
+type BackgroundRemoteGitTaskResult = (PathBuf, anyhow::Result<Option<RepositorySnapshot>>);
 type CreatePatchTaskResult = (PathBuf, anyhow::Result<Vec<PathBuf>>);
 type BranchCheckoutTaskResult = (PathBuf, String, BranchCheckoutStrategy, anyhow::Result<()>);
 type MergeToolTaskResult = (PathBuf, anyhow::Result<bool>);
@@ -2543,6 +2561,19 @@ fn worktree_selection_range(files: &[WorktreeFile], anchor: &str, path: &str) ->
         .collect()
 }
 
+fn worktree_action_paths_for_row(
+    selection: &WorktreeSelectionState,
+    staged: bool,
+    row_path: &str,
+) -> Vec<String> {
+    if !selection.contains(staged, row_path) {
+        return vec![row_path.to_owned()];
+    }
+    let mut paths = selection.paths(staged).iter().cloned().collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HistoryRowsCacheKey {
     scope: HistoryBranchScope,
@@ -2710,6 +2741,8 @@ struct AppSettings {
     workspaces: Vec<PathBuf>,
     active_repo_refresh_seconds: u64,
     inactive_repo_refresh_seconds: u64,
+    background_remote_refresh_enabled: bool,
+    remote_repo_refresh_seconds: u64,
     remote_accounts: Vec<RemoteAccountSettings>,
     commit_identities: Vec<CommitIdentitySettings>,
     custom_actions: Vec<CustomGitActionSettings>,
@@ -2937,6 +2970,8 @@ impl Default for AppSettings {
             workspaces: Vec::new(),
             active_repo_refresh_seconds: DEFAULT_ACTIVE_REPO_REFRESH_SECONDS,
             inactive_repo_refresh_seconds: DEFAULT_INACTIVE_REPO_REFRESH_SECONDS,
+            background_remote_refresh_enabled: true,
+            remote_repo_refresh_seconds: DEFAULT_REMOTE_REPO_REFRESH_SECONDS,
             remote_accounts: vec![RemoteAccountSettings::default()],
             commit_identities: Vec::new(),
             custom_actions: Vec::new(),
@@ -4042,6 +4077,9 @@ impl GitAgentApp {
             sanitize_repo_refresh_seconds(app_settings.active_repo_refresh_seconds);
         let inactive_repo_refresh_seconds =
             sanitize_repo_refresh_seconds(app_settings.inactive_repo_refresh_seconds);
+        let background_remote_refresh_enabled = app_settings.background_remote_refresh_enabled;
+        let remote_repo_refresh_seconds =
+            sanitize_remote_repo_refresh_seconds(app_settings.remote_repo_refresh_seconds);
         let (repository_refresh_scheduler, automatic_repository_refresh_results) =
             RepositoryRefreshScheduler::new(cc.egui_ctx.clone());
         let tabs_state = RepoTabsState::load();
@@ -4108,6 +4146,12 @@ impl GitAgentApp {
             foreground_repo_history_loads: HashSet::new(),
             active_repo_refresh_seconds,
             inactive_repo_refresh_seconds,
+            background_remote_refresh_enabled,
+            remote_repo_refresh_seconds,
+            next_background_remote_refresh_at: Instant::now()
+                + BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY,
+            background_remote_git_task: None,
+            background_remote_git_root: None,
             remote_git_task: None,
             remote_git_status_key: None,
             remote_git_root: None,
@@ -4301,6 +4345,7 @@ impl GitAgentApp {
     }
 
     fn load_repository_with_cache_mode(&mut self, path: PathBuf, use_cache: bool) {
+        let repository_transition = !self.active_repo_root_matches(&path);
         let can_keep_current_snapshot = self
             .snapshot
             .as_ref()
@@ -4312,6 +4357,10 @@ impl GitAgentApp {
             self.save_commit_message_draft_for_active_repo();
         }
         self.ensure_repo_tab(path.clone());
+        if repository_transition && self.background_remote_refresh_enabled {
+            self.next_background_remote_refresh_at =
+                Instant::now() + BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY;
+        }
         self.load_commit_state_for_active_repo();
         self.load_commit_message_draft_for_active_repo();
         let applied_cached_snapshot = use_cache && self.apply_cached_snapshot_for(&path);
@@ -4520,13 +4569,17 @@ impl GitAgentApp {
             .repo_tabs
             .iter()
             .enumerate()
-            .map(|(index, tab)| ScheduledRepositoryRefresh {
-                path: tab.root.clone(),
-                key: repo_state_key(&tab.root),
-                active: self.active_repo_tab == Some(index),
-                fingerprint: self
-                    .workspace_repository_snapshot_for(&tab.root)
-                    .map(git::repository_snapshot_refresh_fingerprint),
+            .filter_map(|(index, tab)| {
+                let snapshot = self.workspace_repository_snapshot_for(&tab.root);
+                if snapshot.is_some_and(|snapshot| !snapshot.config.auto_refresh) {
+                    return None;
+                }
+                Some(ScheduledRepositoryRefresh {
+                    path: tab.root.clone(),
+                    key: repo_state_key(&tab.root),
+                    active: self.active_repo_tab == Some(index),
+                    fingerprint: snapshot.map(git::repository_snapshot_refresh_fingerprint),
+                })
             })
             .collect();
         let mut blocked_keys = self
@@ -4536,6 +4589,7 @@ impl GitAgentApp {
             .collect::<HashSet<_>>();
         for root in [
             self.remote_git_root.as_deref(),
+            self.background_remote_git_root.as_deref(),
             self.branch_checkout_root.as_deref(),
             self.repository_undo_root.as_deref(),
             self.conflict_merge_reload_root.as_deref(),
@@ -4566,6 +4620,83 @@ impl GitAgentApp {
                 .update_schedule(schedule.clone());
             self.last_repository_refresh_schedule = Some(schedule);
         }
+    }
+
+    fn maybe_start_background_remote_refresh(&mut self, ctx: &egui::Context) {
+        if !self.background_remote_refresh_enabled {
+            return;
+        }
+
+        let now = Instant::now();
+        if now < self.next_background_remote_refresh_at {
+            ctx.request_repaint_after(self.next_background_remote_refresh_at - now);
+            return;
+        }
+
+        let interval = remote_repo_refresh_duration(self.remote_repo_refresh_seconds);
+        if self.branch_actions_busy() {
+            self.next_background_remote_refresh_at = now + BACKGROUND_REMOTE_REFRESH_BUSY_RETRY;
+            ctx.request_repaint_after(BACKGROUND_REMOTE_REFRESH_BUSY_RETRY);
+            return;
+        }
+
+        let Some(active_root) = self.active_repo_root() else {
+            self.next_background_remote_refresh_at = now + interval;
+            ctx.request_repaint_after(interval);
+            return;
+        };
+        let Some(snapshot) = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| paths_equal(&snapshot.root, &active_root))
+        else {
+            self.next_background_remote_refresh_at = now + BACKGROUND_REMOTE_REFRESH_BUSY_RETRY;
+            ctx.request_repaint_after(BACKGROUND_REMOTE_REFRESH_BUSY_RETRY);
+            return;
+        };
+        if snapshot.remotes.is_empty() {
+            self.next_background_remote_refresh_at = now + interval;
+            ctx.request_repaint_after(interval);
+            return;
+        }
+        if !snapshot.config.background_remote_refresh {
+            self.next_background_remote_refresh_at = now + interval;
+            ctx.request_repaint_after(interval);
+            return;
+        }
+
+        let root = snapshot.root.clone();
+        let known_fingerprint = git::repository_snapshot_refresh_fingerprint(snapshot);
+        let (sender, receiver) = mpsc::channel();
+        self.background_remote_git_task = Some(receiver);
+        self.background_remote_git_root = Some(root.clone());
+        self.next_background_remote_refresh_at = now + interval;
+        self.pending_toolbar_single_click = None;
+
+        let scheduler = self.repository_refresh_scheduler.clone();
+        let scheduler_key = repo_state_key(&root);
+        let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
+        thread::spawn(move || {
+            let result = exclusive_access
+                .recv()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Repository refresh scheduler stopped before background fetch began"
+                    )
+                })
+                .and_then(|()| {
+                    git::fetch_with_options(&root, git::FetchOptions::default())?;
+                    let current_fingerprint = git::repository_refresh_fingerprint(&root)?;
+                    if current_fingerprint == known_fingerprint {
+                        Ok(None)
+                    } else {
+                        git::open_repository_core(&root).map(Some)
+                    }
+                });
+            scheduler.release_exclusive(scheduler_key);
+            let _ = sender.send((root, result));
+        });
+        ctx.request_repaint();
     }
 
     fn open_repository_source_tab(&mut self) {
@@ -5350,9 +5481,9 @@ impl GitAgentApp {
             ActionsMenuCommand::OpenTerminal => self.open_command_mode(),
             ActionsMenuCommand::ExternalDiff => self.open_selected_worktree_external_diff(),
             ActionsMenuCommand::StageSelected => {
-                if let Some(file) = self.selected_worktree_action_state() {
-                    self.handle_worktree_action(WorktreeMenuAction::Stage { path: file.path });
-                }
+                self.handle_worktree_action(WorktreeMenuAction::Stage {
+                    paths: self.selected_worktree_action_paths(),
+                })
             }
             ActionsMenuCommand::RemoveSelected => {
                 if let Some(file) = self.selected_worktree_action_state() {
@@ -5360,9 +5491,9 @@ impl GitAgentApp {
                 }
             }
             ActionsMenuCommand::UnstageSelected => {
-                if let Some(file) = self.selected_worktree_action_state() {
-                    self.handle_worktree_action(WorktreeMenuAction::Unstage { path: file.path });
-                }
+                self.handle_worktree_action(WorktreeMenuAction::Unstage {
+                    paths: self.selected_worktree_action_paths(),
+                })
             }
             ActionsMenuCommand::ToggleStageRepository => {
                 self.stage_toggle_current_repository();
@@ -5395,6 +5526,13 @@ impl GitAgentApp {
 
     fn selected_worktree_action_state(&self) -> Option<SelectedWorktreeFile> {
         self.selected_worktree_file.clone()
+    }
+
+    fn selected_worktree_action_paths(&self) -> Vec<String> {
+        let Some(selected) = self.selected_worktree_file.as_ref() else {
+            return Vec::new();
+        };
+        worktree_action_paths_for_row(&self.worktree_selection, selected.staged, &selected.path)
     }
 
     fn selected_worktree_absolute_path(&self) -> Option<PathBuf> {
@@ -6111,6 +6249,11 @@ impl GitAgentApp {
             && self.task_root_matches_active_repo(self.remote_git_root.as_deref())
     }
 
+    fn active_background_remote_git_busy(&self) -> bool {
+        self.background_remote_git_task.is_some()
+            && self.task_root_matches_active_repo(self.background_remote_git_root.as_deref())
+    }
+
     fn active_repository_undo_busy(&self) -> bool {
         self.repository_undo_busy()
             && self.task_root_matches_active_repo(self.repository_undo_root.as_deref())
@@ -6276,6 +6419,9 @@ impl GitAgentApp {
                     .map(|key| self.tr(key))
                     .unwrap_or_else(|| self.tr("status.running_git_action")),
             );
+        }
+        if self.active_background_remote_git_busy() {
+            return Some(self.tr("status.fetching"));
         }
         if self.create_patch_task.is_some() {
             return Some(self.tr("status.creating_patch"));
@@ -6765,7 +6911,9 @@ impl GitAgentApp {
     }
 
     fn remote_git_busy(&self) -> bool {
-        self.remote_git_task.is_some() || self.credential_login_task.is_some()
+        self.remote_git_task.is_some()
+            || self.background_remote_git_task.is_some()
+            || self.credential_login_task.is_some()
     }
 
     fn repository_undo_busy(&self) -> bool {
@@ -8288,6 +8436,44 @@ impl GitAgentApp {
             }
         }
 
+        if let Some(receiver) = self.background_remote_git_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(snapshot))) => {
+                    self.background_remote_git_root = None;
+                    if let Some(snapshot) = snapshot {
+                        let active_repo = self.active_repo_root_matches(&root);
+                        let unchanged = active_repo
+                            && self.active_snapshot_matches_background_core_refresh(&snapshot);
+                        self.cache_repository_snapshot(&snapshot);
+                        if active_repo && !unchanged {
+                            self.apply_repository_snapshot(snapshot);
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Ok((root, Err(error))) => {
+                    self.background_remote_git_root = None;
+                    diagnostics::repository_refresh_trace(
+                        "remote.error",
+                        &format!("root={} error={error:#}", root.display()),
+                    );
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.background_remote_git_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.background_remote_git_root = None;
+                    diagnostics::repository_refresh_trace(
+                        "remote.disconnected",
+                        "background remote refresh worker stopped unexpectedly",
+                    );
+                    ctx.request_repaint();
+                }
+            }
+        }
+
         if let Some(receiver) = self.remote_git_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
@@ -9069,6 +9255,8 @@ impl GitAgentApp {
             workspaces: self.repository_workspaces.clone(),
             active_repo_refresh_seconds: self.active_repo_refresh_seconds,
             inactive_repo_refresh_seconds: self.inactive_repo_refresh_seconds,
+            background_remote_refresh_enabled: self.background_remote_refresh_enabled,
+            remote_repo_refresh_seconds: self.remote_repo_refresh_seconds,
             remote_accounts: self.remote_accounts.clone(),
             commit_identities: self.commit_identities.clone(),
             custom_actions: self.custom_actions.clone(),
@@ -9147,6 +9335,64 @@ impl GitAgentApp {
         if self.inactive_repo_refresh_seconds != seconds {
             self.inactive_repo_refresh_seconds = seconds;
             self.save_app_settings();
+        }
+    }
+
+    fn set_background_remote_refresh_enabled(&mut self, enabled: bool) {
+        if self.background_remote_refresh_enabled != enabled {
+            self.background_remote_refresh_enabled = enabled;
+            if enabled {
+                self.next_background_remote_refresh_at =
+                    Instant::now() + BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY;
+            }
+            self.save_app_settings();
+        }
+    }
+
+    fn set_remote_repo_refresh_seconds(&mut self, seconds: u64) {
+        let seconds = sanitize_remote_repo_refresh_seconds(seconds);
+        if self.remote_repo_refresh_seconds != seconds {
+            self.remote_repo_refresh_seconds = seconds;
+            self.next_background_remote_refresh_at =
+                Instant::now() + remote_repo_refresh_duration(seconds);
+            self.save_app_settings();
+        }
+    }
+
+    fn set_active_repository_auto_refresh(&mut self, enabled: bool) {
+        let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
+            return;
+        };
+        if let Err(error) = git::set_repository_auto_refresh(&root, enabled) {
+            self.error = Some(error.to_string());
+            return;
+        }
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            snapshot.config.auto_refresh = enabled;
+        }
+        if let Some(snapshot) = self.snapshot.clone() {
+            self.cache_repository_snapshot(&snapshot);
+        }
+        self.last_repository_refresh_schedule = None;
+    }
+
+    fn set_active_repository_background_remote_refresh(&mut self, enabled: bool) {
+        let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
+            return;
+        };
+        if let Err(error) = git::set_repository_background_remote_refresh(&root, enabled) {
+            self.error = Some(error.to_string());
+            return;
+        }
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            snapshot.config.background_remote_refresh = enabled;
+        }
+        if let Some(snapshot) = self.snapshot.clone() {
+            self.cache_repository_snapshot(&snapshot);
+        }
+        if enabled && self.background_remote_refresh_enabled {
+            self.next_background_remote_refresh_at =
+                Instant::now() + BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY;
         }
     }
 
@@ -9718,6 +9964,7 @@ impl App for GitAgentApp {
             return;
         }
         self.sync_repository_refresh_scheduler(ctx);
+        self.maybe_start_background_remote_refresh(ctx);
         self.maybe_start_clone_url_validation(ctx);
         self.handle_global_shortcuts(ctx);
         self.flush_pending_toolbar_single_click(ctx);
@@ -14181,14 +14428,14 @@ impl GitAgentApp {
                     self.error = Some(format!("{}: {error}", self.tr("worktree.reveal_failed")));
                 }
             }
-            WorktreeMenuAction::Stage { path } => {
-                self.execute_git_action(move |root| git::stage_path(root, &path));
+            WorktreeMenuAction::Stage { paths } => {
+                self.execute_git_action(move |root| git::stage_paths(root, &paths));
             }
             WorktreeMenuAction::StageAll => {
                 self.execute_git_action(|root| git::stage_all(root));
             }
-            WorktreeMenuAction::Unstage { path } => {
-                self.execute_git_action(move |root| git::unstage_path(root, &path));
+            WorktreeMenuAction::Unstage { paths } => {
+                self.execute_git_action(move |root| git::unstage_paths(root, &paths));
             }
             WorktreeMenuAction::UnstageAll => {
                 self.execute_git_action(|root| git::unstage_all(root));
@@ -20917,6 +21164,35 @@ impl GitAgentApp {
     fn global_refresh_settings(&mut self, ui: &mut Ui) {
         let language = self.language;
         settings_section_title(ui, i18n::t(language, "settings.auto_refresh"));
+        let mut refresh_remote = self.background_remote_refresh_enabled;
+        settings_checkbox_row(
+            ui,
+            &mut refresh_remote,
+            i18n::t(language, "repo.settings.background_remote_refresh"),
+        );
+        if refresh_remote != self.background_remote_refresh_enabled {
+            self.set_background_remote_refresh_enabled(refresh_remote);
+        }
+        ui.add_space(8.0);
+        let mut remote_seconds = self.remote_repo_refresh_seconds;
+        settings_field(
+            ui,
+            i18n::t(language, "settings.refresh_remote_repo_seconds"),
+            |ui| {
+                if ui
+                    .add_enabled(
+                        self.background_remote_refresh_enabled,
+                        egui::DragValue::new(&mut remote_seconds)
+                            .range(MIN_REMOTE_REPO_REFRESH_SECONDS..=MAX_REPO_REFRESH_SECONDS)
+                            .suffix(" s"),
+                    )
+                    .changed()
+                {
+                    self.set_remote_repo_refresh_seconds(remote_seconds);
+                }
+            },
+        );
+        ui.add_space(8.0);
         let mut active_seconds = self.active_repo_refresh_seconds;
         settings_field(
             ui,
@@ -21177,8 +21453,8 @@ impl GitAgentApp {
         });
         ui.add_space(LAYOUT_GAP as f32);
         repo_settings_card(ui, self.tr("repo.settings.options"), |ui| {
-            let mut auto_refresh = true;
-            let mut refresh_remote = true;
+            let mut auto_refresh = config.auto_refresh;
+            let mut refresh_remote = config.background_remote_refresh;
             settings_checkbox_row(
                 ui,
                 &mut auto_refresh,
@@ -21189,6 +21465,12 @@ impl GitAgentApp {
                 &mut refresh_remote,
                 i18n::t(language, "repo.settings.background_remote_refresh"),
             );
+            if auto_refresh != config.auto_refresh {
+                self.set_active_repository_auto_refresh(auto_refresh);
+            }
+            if refresh_remote != config.background_remote_refresh {
+                self.set_active_repository_background_remote_refresh(refresh_remote);
+            }
         });
     }
 
@@ -21487,9 +21769,9 @@ fn repo_settings_commit_links_panel(ui: &mut Ui, language: Language) {
 enum WorktreeMenuAction {
     OpenFile { path: String },
     RevealFile { path: String },
-    Stage { path: String },
+    Stage { paths: Vec<String> },
     StageAll,
-    Unstage { path: String },
+    Unstage { paths: Vec<String> },
     UnstageAll,
     Discard { path: String, untracked: bool },
     Remove { path: String },
@@ -28066,10 +28348,10 @@ fn global_settings_dialog_height(
         }
         SettingsTab::CustomActions => (330.0 + custom_action_count.min(6) as f32 * 24.0).min(500.0),
         SettingsTab::HostingAccounts => {
-            (280.0 + remote_account_count.saturating_sub(1).min(5) as f32 * 24.0).min(420.0)
+            (380.0 + remote_account_count.saturating_sub(1).min(5) as f32 * 28.0).min(520.0)
         }
         SettingsTab::CommitAuthors => 460.0,
-        SettingsTab::Git => 330.0,
+        SettingsTab::Git => 430.0,
         SettingsTab::Ai => 410.0,
         SettingsTab::Verification => 240.0,
         _ => 300.0,
@@ -29180,6 +29462,31 @@ fn worktree_table(
             ui.horizontal(|ui| {
                 ui.label(RichText::new(title).strong().color(theme::text()));
                 ui.label(RichText::new(format!("({})", files.len())).color(theme::muted()));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let mut selected_paths =
+                        selection.paths(staged).iter().cloned().collect::<Vec<_>>();
+                    selected_paths.sort();
+                    let label = i18n::t(
+                        language,
+                        if staged {
+                            "worktree.unstage"
+                        } else {
+                            "worktree.stage"
+                        },
+                    );
+                    let has_selection = !selected_paths.is_empty();
+                    if worktree_header_action_button(ui, None, label, has_selection).clicked() {
+                        *action = Some(if staged {
+                            WorktreeMenuAction::Unstage {
+                                paths: selected_paths,
+                            }
+                        } else {
+                            WorktreeMenuAction::Stage {
+                                paths: selected_paths,
+                            }
+                        });
+                    }
+                });
             });
             ui.add_space(8.0);
             if files.is_empty() {
@@ -29225,6 +29532,7 @@ fn worktree_table(
                                             file,
                                             staged,
                                             row_selected,
+                                            selection,
                                             language,
                                             action,
                                             *depth,
@@ -29232,6 +29540,13 @@ fn worktree_table(
                                         );
                                         if response.clicked() {
                                             select_worktree_row(ui, file, staged, selected);
+                                        } else if response.secondary_clicked() && !row_selected {
+                                            select_worktree_row_with_modifiers(
+                                                file,
+                                                staged,
+                                                WorktreeSelectionModifiers::default(),
+                                                selected,
+                                            );
                                         }
                                     }
                                 }
@@ -29255,6 +29570,7 @@ fn worktree_table(
                                     file,
                                     staged,
                                     row_selected,
+                                    selection,
                                     language,
                                     action,
                                     0,
@@ -29262,6 +29578,13 @@ fn worktree_table(
                                 );
                                 if response.clicked() {
                                     select_worktree_row(ui, file, staged, selected);
+                                } else if response.secondary_clicked() && !row_selected {
+                                    select_worktree_row_with_modifiers(
+                                        file,
+                                        staged,
+                                        WorktreeSelectionModifiers::default(),
+                                        selected,
+                                    );
                                 }
                             }
                         });
@@ -30734,6 +31057,15 @@ fn select_worktree_row(
         ctrl: input.modifiers.ctrl,
         shift: input.modifiers.shift,
     });
+    select_worktree_row_with_modifiers(file, staged, modifiers, selected);
+}
+
+fn select_worktree_row_with_modifiers(
+    file: &WorktreeFile,
+    staged: bool,
+    modifiers: WorktreeSelectionModifiers,
+    selected: &mut Option<WorktreeRowClick>,
+) {
     *selected = Some(WorktreeRowClick {
         file: SelectedWorktreeFile {
             path: file.path.clone(),
@@ -30814,11 +31146,13 @@ fn worktree_file_row(
     file: &WorktreeFile,
     staged: bool,
     selected: bool,
+    selection: &WorktreeSelectionState,
     language: Language,
     action: &mut Option<WorktreeMenuAction>,
     depth: usize,
     path_label: &str,
 ) -> egui::Response {
+    let action_paths = worktree_action_paths_for_row(selection, staged, &file.path);
     let status = if file.is_conflicted() {
         "U".to_owned()
     } else if staged {
@@ -30896,7 +31230,7 @@ fn worktree_file_row(
                 .clicked()
             {
                 *action = Some(WorktreeMenuAction::Unstage {
-                    path: file.path.clone(),
+                    paths: action_paths.clone(),
                 });
                 ui.close_menu();
             }
@@ -30906,7 +31240,7 @@ fn worktree_file_row(
                 .clicked()
             {
                 *action = Some(WorktreeMenuAction::Stage {
-                    path: file.path.clone(),
+                    paths: action_paths.clone(),
                 });
                 ui.close_menu();
             }
@@ -36195,6 +36529,31 @@ mod ui_tests {
         assert_worktree_selection(&selection, false, &[]);
     }
 
+    #[test]
+    fn worktree_row_actions_target_the_full_selection_only_when_the_row_is_selected() {
+        let mut selection = WorktreeSelectionState::default();
+        selection
+            .unstaged
+            .extend(["b.txt".to_owned(), "a.txt".to_owned()]);
+
+        assert_eq!(
+            worktree_action_paths_for_row(&selection, false, "b.txt"),
+            vec!["a.txt".to_owned(), "b.txt".to_owned()]
+        );
+        assert_eq!(
+            worktree_action_paths_for_row(&selection, false, "c.txt"),
+            vec!["c.txt".to_owned()]
+        );
+
+        selection
+            .staged
+            .extend(["src/second.rs".to_owned(), "src/first.rs".to_owned()]);
+        assert_eq!(
+            worktree_action_paths_for_row(&selection, true, "src/first.rs"),
+            vec!["src/first.rs".to_owned(), "src/second.rs".to_owned()]
+        );
+    }
+
     fn assert_worktree_selection(
         selection: &WorktreeSelectionState,
         staged: bool,
@@ -36278,6 +36637,8 @@ mod ui_tests {
             workspaces: vec![PathBuf::from(r"D:\code"), PathBuf::from(r"D:\work")],
             active_repo_refresh_seconds: 30,
             inactive_repo_refresh_seconds: 90,
+            background_remote_refresh_enabled: true,
+            remote_repo_refresh_seconds: 60,
             remote_accounts: vec![RemoteAccountSettings::default()],
             commit_identities: vec![CommitIdentitySettings {
                 name: "Example Developer".to_owned(),
@@ -36313,6 +36674,8 @@ mod ui_tests {
         assert!(raw.contains("\"workspaces\""));
         assert!(raw.contains("\"active_repo_refresh_seconds\":30"));
         assert!(raw.contains("\"inactive_repo_refresh_seconds\":90"));
+        assert!(raw.contains("\"background_remote_refresh_enabled\":true"));
+        assert!(raw.contains("\"remote_repo_refresh_seconds\":60"));
         assert!(raw.contains("\"commit_identities\""));
         assert!(raw.contains("\"ssh_client\":\"OpenSsh\""));
         assert!(raw.contains("id_ed25519"));
@@ -37275,6 +37638,8 @@ mod ui_tests {
         assert!(row_source.contains("WorktreeMenuAction::OpenFile"));
         assert!(row_source.contains("worktree.reveal_file"));
         assert!(row_source.contains("WorktreeMenuAction::RevealFile"));
+        assert!(row_source.contains("worktree_action_paths_for_row"));
+        assert!(row_source.contains("paths: action_paths.clone()"));
 
         let handler_start = implementation_source
             .find("fn handle_worktree_action(&mut self")
@@ -37294,6 +37659,29 @@ mod ui_tests {
             i18n::t(Language::Chinese, "worktree.reveal_file"),
             "打开所在文件夹"
         );
+    }
+
+    #[test]
+    fn worktree_sections_offer_stage_and_unstage_selected_actions() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let table_start = implementation_source.find("fn worktree_table(").unwrap();
+        let table_end = implementation_source[table_start..]
+            .find("fn worktree_directory_row(")
+            .unwrap();
+        let table_source = &implementation_source[table_start..table_start + table_end];
+
+        assert!(table_source.contains("\"worktree.unstage\""));
+        assert!(table_source.contains("\"worktree.stage\""));
+        assert!(table_source.contains("selection.paths(staged)"));
+        assert!(table_source.contains("let has_selection = !selected_paths.is_empty()"));
+        assert!(table_source.contains("WorktreeMenuAction::Unstage {"));
+        assert!(table_source.contains("WorktreeMenuAction::Stage {"));
+        assert!(table_source.contains("paths: selected_paths"));
+        assert!(!table_source.contains("WorktreeMenuAction::UnstageAll"));
+        assert!(!table_source.contains("WorktreeMenuAction::StageAll"));
+        assert_eq!(i18n::t(Language::Chinese, "worktree.stage"), "暂存");
+        assert_eq!(i18n::t(Language::Chinese, "worktree.unstage"), "取消暂存");
     }
 
     #[test]
@@ -46530,7 +46918,23 @@ diff --git a/file.txt b/file.txt
         }
         assert_eq!(
             global_settings_dialog_height(SettingsTab::HostingAccounts, 0, 1, 0),
-            280.0
+            380.0
+        );
+        assert_eq!(
+            global_settings_dialog_height(SettingsTab::HostingAccounts, 0, 8, 0),
+            520.0
+        );
+        assert_eq!(
+            global_settings_dialog_height(SettingsTab::Git, 0, 0, 0),
+            430.0
+        );
+        assert!(
+            global_settings_content_max_height(global_settings_dialog_height(
+                SettingsTab::Git,
+                0,
+                0,
+                0,
+            )) >= 250.0
         );
         assert_eq!(
             global_settings_dialog_height(SettingsTab::Verification, 0, 0, 0),
@@ -46876,6 +47280,55 @@ diff --git a/file.txt b/file.txt
             settings_tab_label(Language::Chinese, SettingsTab::HostingAccounts),
             "\u{6258}\u{7ba1}\u{8d26}\u{6237}"
         );
+    }
+
+    #[test]
+    fn background_remote_refresh_is_persisted_throttled_and_shares_the_git_gate() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let refresh_start = implementation_source
+            .find("fn maybe_start_background_remote_refresh(")
+            .unwrap();
+        let refresh_end = implementation_source[refresh_start..]
+            .find("fn open_repository_source_tab(")
+            .unwrap();
+        let refresh_source = &implementation_source[refresh_start..refresh_start + refresh_end];
+
+        for required in [
+            "background_remote_refresh_enabled: bool",
+            "remote_repo_refresh_seconds: u64",
+            "background_remote_refresh_enabled: true",
+            "DEFAULT_REMOTE_REPO_REFRESH_SECONDS: u64 = 60",
+            "self.maybe_start_background_remote_refresh(ctx)",
+            "scheduler.acquire_exclusive(scheduler_key.clone())",
+            "git::fetch_with_options(&root, git::FetchOptions::default())",
+            "git::repository_refresh_fingerprint(&root)",
+            "git::open_repository_core(&root).map(Some)",
+            "self.background_remote_git_task.is_some()",
+            "self.active_background_remote_git_busy()",
+            "!snapshot.config.auto_refresh",
+            "!snapshot.config.background_remote_refresh",
+            "git::set_repository_auto_refresh(&root, enabled)",
+            "git::set_repository_background_remote_refresh(&root, enabled)",
+            "fn set_active_repository_auto_refresh(",
+            "fn set_active_repository_background_remote_refresh(",
+        ] {
+            assert!(
+                implementation_source.contains(required),
+                "missing {required}"
+            );
+        }
+        assert!(refresh_source.contains("snapshot.remotes.is_empty()"));
+        assert!(refresh_source.contains("BACKGROUND_REMOTE_REFRESH_BUSY_RETRY"));
+
+        let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
+        let poll_end = implementation_source[poll_start..]
+            .find("fn poll_external_diff_tool_task(")
+            .unwrap();
+        let poll_source = &implementation_source[poll_start..poll_start + poll_end];
+        assert!(poll_source.contains("self.background_remote_git_task.take()"));
+        assert!(poll_source.contains("self.cache_repository_snapshot(&snapshot)"));
+        assert!(poll_source.contains("self.apply_repository_snapshot(snapshot)"));
     }
 
     #[test]

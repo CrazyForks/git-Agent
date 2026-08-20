@@ -25,6 +25,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\git-agent.exe
+SetupIconFile=..\..\assets\icons\git-agent.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -39,7 +40,7 @@ Source: "{#SourceDir}\git-agent-diff.exe"; DestDir: "{app}"; Flags: ignoreversio
 Source: "..\..\theme.json"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Git Agent"; Filename: "{app}\git-agent.exe"; WorkingDir: "{app}"
+Name: "{group}\Git Agent"; Filename: "{app}\git-agent.exe"; WorkingDir: "{app}"; IconFilename: "{app}\git-agent.exe"
 Name: "{group}\Uninstall Git Agent"; Filename: "{uninstallexe}"
 
 [Run]
