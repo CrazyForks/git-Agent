@@ -3,4 +3,9 @@ version = 1
 name = "git-Agent"
 
 [setup]
-script = "powershell -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1"
+script = ""
+
+[[actions]]
+name = "本地开发"
+icon = "tool"
+command = "powershell -ExecutionPolicy Bypass -File .\\scripts\\dev.ps1"
