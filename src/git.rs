@@ -493,6 +493,25 @@ pub fn repository_snapshot_refresh_fingerprint(
     }
 }
 
+pub fn repository_tag_refs_fingerprint(root: impl AsRef<Path>) -> Result<Vec<(String, String)>> {
+    load_tags(root.as_ref()).map(|tags| tag_refs_fingerprint(&tags))
+}
+
+pub fn repository_snapshot_tag_refs_fingerprint(
+    snapshot: &RepositorySnapshot,
+) -> Vec<(String, String)> {
+    tag_refs_fingerprint(&snapshot.tags)
+}
+
+fn tag_refs_fingerprint(tags: &[Tag]) -> Vec<(String, String)> {
+    let mut refs = tags
+        .iter()
+        .map(|tag| (tag.name.clone(), tag.target.clone()))
+        .collect::<Vec<_>>();
+    refs.sort_unstable();
+    refs
+}
+
 fn parse_repository_refresh_fingerprint(output: &str) -> RepositoryRefreshFingerprint {
     let mut lines = output.lines();
     let header = lines.next().filter(|line| line.starts_with("## "));
@@ -3145,6 +3164,7 @@ impl Default for PullOptions {
 pub struct FetchOptions {
     pub all_remotes: bool,
     pub prune_tracking: bool,
+    pub prune_tags: bool,
     pub fetch_tags: bool,
     pub force_tags: bool,
 }
@@ -3154,8 +3174,21 @@ impl Default for FetchOptions {
         Self {
             all_remotes: true,
             prune_tracking: true,
+            prune_tags: false,
             fetch_tags: false,
             force_tags: false,
+        }
+    }
+}
+
+impl FetchOptions {
+    pub fn background_remote_refresh(prune_tags: bool) -> Self {
+        Self {
+            all_remotes: true,
+            prune_tracking: true,
+            prune_tags,
+            fetch_tags: true,
+            force_tags: true,
         }
     }
 }
@@ -3276,6 +3309,9 @@ fn fetch_args(options: FetchOptions) -> Vec<String> {
     }
     if options.prune_tracking {
         args.push("--prune".to_owned());
+    }
+    if options.prune_tags {
+        args.push("--prune-tags".to_owned());
     }
     if options.fetch_tags {
         args.push("--tags".to_owned());
@@ -4117,6 +4153,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_COMMIT_PATCH_REPO: AtomicU64 = AtomicU64::new(0);
+    static NEXT_REMOTE_TAG_REPO: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn refresh_fingerprint_uses_one_branch_status_payload() {
@@ -4725,9 +4762,25 @@ mod tests {
             vec!["fetch", "--all", "--prune"]
         );
         assert_eq!(
+            fetch_args(FetchOptions::background_remote_refresh(true)),
+            vec![
+                "fetch",
+                "--all",
+                "--prune",
+                "--prune-tags",
+                "--tags",
+                "--force"
+            ]
+        );
+        assert_eq!(
+            fetch_args(FetchOptions::background_remote_refresh(false)),
+            vec!["fetch", "--all", "--prune", "--tags", "--force"]
+        );
+        assert_eq!(
             fetch_args(FetchOptions {
                 all_remotes: false,
                 prune_tracking: false,
+                prune_tags: false,
                 fetch_tags: true,
                 force_tags: false,
             }),
@@ -4737,11 +4790,53 @@ mod tests {
             fetch_args(FetchOptions {
                 all_remotes: true,
                 prune_tracking: true,
+                prune_tags: false,
                 fetch_tags: true,
                 force_tags: true,
             }),
             vec!["fetch", "--all", "--prune", "--tags", "--force"]
         );
+    }
+
+    #[test]
+    fn background_remote_refresh_prunes_deleted_remote_tags() -> Result<()> {
+        let nonce = NEXT_REMOTE_TAG_REPO.fetch_add(1, Ordering::Relaxed);
+        let base = env::temp_dir().join(format!(
+            "git-agent-remote-tag-refresh-{}-{nonce}",
+            std::process::id()
+        ));
+        let remote = base.join("remote.git");
+        let seed = base.join("seed");
+        let clone = base.join("clone");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&remote)?;
+        fs::create_dir_all(&seed)?;
+
+        git_output(&remote, &["init", "--bare"])?;
+        git_output(&seed, &["init"])?;
+        git_output(&seed, &["config", "user.email", "tester@example.com"])?;
+        git_output(&seed, &["config", "user.name", "Git Agent Test"])?;
+        fs::write(seed.join("story.txt"), "tagged release")?;
+        git_output(&seed, &["add", "."])?;
+        git_output(&seed, &["commit", "-m", "base"])?;
+        git_output(&seed, &["tag", "release-1"])?;
+
+        let remote_arg = remote.to_string_lossy().into_owned();
+        let clone_arg = clone.to_string_lossy().into_owned();
+        git_output(&seed, &["remote", "add", "origin", &remote_arg])?;
+        git_output(&seed, &["push", "origin", "HEAD:master", "--tags"])?;
+        git_output(&base, &["clone", &remote_arg, &clone_arg])?;
+        let initial_tags = repository_tag_refs_fingerprint(&clone)?;
+        assert_eq!(initial_tags.len(), 1);
+        assert_eq!(initial_tags[0].0, "release-1");
+        assert!(!initial_tags[0].1.is_empty());
+
+        git_output(&seed, &["push", "origin", ":refs/tags/release-1"])?;
+        fetch_with_options(&clone, FetchOptions::background_remote_refresh(true))?;
+
+        assert!(repository_tag_refs_fingerprint(&clone)?.is_empty());
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
     }
 
     #[test]

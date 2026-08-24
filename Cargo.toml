@@ -1,6 +1,6 @@
 [package]
 name = "git-agent"
-version = "1.3.2"
+version = "1.3.3"
 edition = "2024"
 
 [dependencies]
@@ -12,6 +12,7 @@ egui_extras = { version = "0.31", features = ["svg"] }
 getrandom = "0.2"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 rfd = "0.15"
+regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = "1.0"

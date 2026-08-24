@@ -1599,6 +1599,62 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "repo.settings.commit_links",
         "\u{63d0}\u{4ea4}\u{6587}\u{672c}\u{94fe}\u{63a5}",
     ),
+    (
+        "repo.settings.commit_link.empty",
+        "\u{5c1a}\u{672a}\u{914d}\u{7f6e}\u{63d0}\u{4ea4}\u{6587}\u{672c}\u{94fe}\u{63a5}\u{89c4}\u{5219}\u{3002}",
+    ),
+    (
+        "repo.settings.commit_link.add",
+        "\u{6dfb}\u{52a0}\u{63d0}\u{4ea4}\u{6587}\u{672c}\u{94fe}\u{63a5}",
+    ),
+    (
+        "repo.settings.commit_link.edit",
+        "\u{7f16}\u{8f91}\u{63d0}\u{4ea4}\u{6587}\u{672c}\u{94fe}\u{63a5}",
+    ),
+    (
+        "repo.settings.commit_link.pattern",
+        "\u{5339}\u{914d}\u{6b63}\u{5219}",
+    ),
+    (
+        "repo.settings.commit_link.pattern_hint",
+        "\u{4f8b}\u{5982}\u{ff1a}BUG-(\\d+)",
+    ),
+    (
+        "repo.settings.commit_link.url_template",
+        "URL \u{6a21}\u{677f}",
+    ),
+    (
+        "repo.settings.commit_link.url_hint",
+        "\u{4f8b}\u{5982}\u{ff1a}https://example.com/issues/$1",
+    ),
+    (
+        "repo.settings.commit_link.capture_hint",
+        "URL \u{6a21}\u{677f}\u{53ef}\u{4f7f}\u{7528} $0\u{3001}$1\u{3001}$2 \u{5f15}\u{7528}\u{6b63}\u{5219}\u{5339}\u{914d}\u{5185}\u{5bb9}\u{3002}",
+    ),
+    (
+        "repo.settings.commit_link.pattern_required",
+        "\u{8bf7}\u{8f93}\u{5165}\u{5339}\u{914d}\u{6b63}\u{5219}\u{3002}",
+    ),
+    (
+        "repo.settings.commit_link.pattern_invalid",
+        "\u{5339}\u{914d}\u{6b63}\u{5219}\u{65e0}\u{6548}",
+    ),
+    (
+        "repo.settings.commit_link.pattern_empty_match",
+        "\u{5339}\u{914d}\u{6b63}\u{5219}\u{4e0d}\u{80fd}\u{5339}\u{914d}\u{7a7a}\u{6587}\u{672c}\u{3002}",
+    ),
+    (
+        "repo.settings.commit_link.url_required",
+        "\u{8bf7}\u{8f93}\u{5165} URL \u{6a21}\u{677f}\u{3002}",
+    ),
+    (
+        "repo.settings.commit_link.url_scheme",
+        "URL \u{6a21}\u{677f}\u{5fc5}\u{987b}\u{4ee5} http:// \u{6216} https:// \u{5f00}\u{5934}\u{3002}",
+    ),
+    (
+        "repo.settings.commit_link.duplicate",
+        "\u{5df2}\u{5b58}\u{5728}\u{76f8}\u{540c}\u{7684}\u{5339}\u{914d}\u{6b63}\u{5219}\u{3002}",
+    ),
     ("repo.settings.options", "\u{6742}\u{9879}"),
     (
         "repo.settings.auto_refresh",
@@ -2248,6 +2304,50 @@ const EN: &[(&str, &str)] = &[
     ("repo.settings.full_name", "Full name"),
     ("repo.settings.email", "Email address"),
     ("repo.settings.commit_links", "Commit text links"),
+    (
+        "repo.settings.commit_link.empty",
+        "No commit text link rules configured.",
+    ),
+    ("repo.settings.commit_link.add", "Add commit text link"),
+    ("repo.settings.commit_link.edit", "Edit commit text link"),
+    ("repo.settings.commit_link.pattern", "Match regex"),
+    (
+        "repo.settings.commit_link.pattern_hint",
+        r"For example: BUG-(\d+)",
+    ),
+    ("repo.settings.commit_link.url_template", "URL template"),
+    (
+        "repo.settings.commit_link.url_hint",
+        "For example: https://example.com/issues/$1",
+    ),
+    (
+        "repo.settings.commit_link.capture_hint",
+        "Use $0, $1, and $2 in the URL template to insert regex captures.",
+    ),
+    (
+        "repo.settings.commit_link.pattern_required",
+        "Enter a match regex.",
+    ),
+    (
+        "repo.settings.commit_link.pattern_invalid",
+        "The match regex is invalid",
+    ),
+    (
+        "repo.settings.commit_link.pattern_empty_match",
+        "The match regex cannot match empty text.",
+    ),
+    (
+        "repo.settings.commit_link.url_required",
+        "Enter a URL template.",
+    ),
+    (
+        "repo.settings.commit_link.url_scheme",
+        "The URL template must start with http:// or https://.",
+    ),
+    (
+        "repo.settings.commit_link.duplicate",
+        "A rule with the same match regex already exists.",
+    ),
     ("repo.settings.options", "Options"),
     (
         "repo.settings.auto_refresh",
@@ -2961,6 +3061,7 @@ const EN: &[(&str, &str)] = &[
     ),
     ("dialog.cancel", "Cancel"),
     ("dialog.ok", "OK"),
+    ("dialog.save", "Save"),
     ("dialog.create", "Create"),
     ("dialog.checkout", "Checkout"),
     ("dialog.discard", "Discard"),
@@ -3180,6 +3281,7 @@ const ZH: &[(&str, &str)] = &[
     ),
     ("dialog.cancel", "取消"),
     ("dialog.ok", "确定"),
+    ("dialog.save", "保存"),
     ("dialog.create", "创建"),
     ("dialog.checkout", "检出"),
     ("dialog.discard", "丢弃"),
