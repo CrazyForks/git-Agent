@@ -100,6 +100,11 @@ fn title_drag_candidate_rect(rect: Rect) -> Rect {
   `!primary_down || elapsed >= 600ms` 作为保存条件；尺寸变更停留 600ms 后，下一次按下标题栏会在
   `StartDrag` 之前触发配置序列化、加密和系统密钥库访问，造成拖动迟钝甚至错过原生拖动时机。只可在
   鼠标松开且静默期结束后保存，并用 `request_repaint_after` 等待该时刻。
+- Windows 上不得依赖 winit 0.30 的 `drag_window()` 状态门来启动无边框窗口拖动。一次没有进入
+  `WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE` 的标题栏短按可能让其内部 `dragging` 标志永久停留为
+  `true`，随后所有 `StartDrag` / `BeginResize` 请求都会被丢弃。Windows 路径应在按下帧直接
+  `ReleaseCapture` 并投递 `WM_NCLBUTTONDOWN`（标题栏使用 `HTCAPTION`，缩放使用对应边角命中值）；
+  其他平台继续使用 egui 的 viewport 命令。
 
 ## 修改后的验收
 

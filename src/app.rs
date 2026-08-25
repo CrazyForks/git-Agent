@@ -10186,12 +10186,12 @@ impl App for GitAgentApp {
         Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let primary_down = ctx.input(|input| input.pointer.primary_down());
-        if !self.request_native_window_resize_on_pointer_down(ctx)
+        if !self.request_native_window_resize_on_pointer_down(ctx, frame)
             && self.beginner_tutorial_step.is_none()
         {
-            self.request_native_title_drag_on_pointer_down(ctx);
+            self.request_native_title_drag_on_pointer_down(ctx, frame);
         }
         self.remember_window_size(ctx, primary_down);
         if !primary_down {
@@ -11081,7 +11081,11 @@ impl GitAgentApp {
         ui.interact(rect, ui.id().with(id_salt), Sense::click_and_drag())
     }
 
-    fn request_native_window_resize_on_pointer_down(&self, ctx: &egui::Context) -> bool {
+    fn request_native_window_resize_on_pointer_down(
+        &self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+    ) -> bool {
         let pointer_pos = ctx.input(|input| {
             input
                 .pointer
@@ -11104,7 +11108,7 @@ impl GitAgentApp {
         let Some(direction) = window_resize_direction(screen, pointer_pos) else {
             return false;
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        request_native_window_resize(ctx, frame, direction);
         true
     }
 
@@ -11131,7 +11135,11 @@ impl GitAgentApp {
         }
     }
 
-    fn request_native_title_drag_on_pointer_down(&self, ctx: &egui::Context) {
+    fn request_native_title_drag_on_pointer_down(
+        &self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+    ) {
         let pointer_pos = ctx.input(|input| {
             input
                 .pointer
@@ -11181,7 +11189,7 @@ impl GitAgentApp {
                 outer_min.y,
             );
             if hit == TitleBarDragHit::Drag {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                request_native_window_drag(ctx, frame);
             }
             return;
         }
@@ -11210,7 +11218,7 @@ impl GitAgentApp {
                     outer_min.x,
                     outer_min.y,
                 );
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                request_native_window_drag(ctx, frame);
                 return;
             }
         }
@@ -22887,6 +22895,12 @@ enum TextActionTone {
     Destructive,
 }
 
+fn disabled_primary_action_foreground() -> Color32 {
+    // Keep disabled confirmation buttons legible on every accent hue without making them look
+    // as active as the pure-white enabled state.
+    Color32::from_gray(210)
+}
+
 fn destructive_action_color() -> Color32 {
     Color32::from_rgb(220, 76, 70)
 }
@@ -22904,7 +22918,11 @@ fn text_action_button(
     size: Vec2,
 ) -> egui::Response {
     let foreground = if !enabled {
-        theme::muted()
+        if tone == TextActionTone::Primary {
+            disabled_primary_action_foreground()
+        } else {
+            theme::muted()
+        }
     } else {
         match tone {
             TextActionTone::Primary => Color32::WHITE,
@@ -23401,6 +23419,92 @@ fn safe_ui_length(value: f32) -> f32 {
         value.max(0.0)
     } else {
         0.0
+    }
+}
+
+fn request_native_window_drag(ctx: &egui::Context, frame: &eframe::Frame) {
+    #[cfg(target_os = "windows")]
+    if post_windows_non_client_pointer_down(
+        frame,
+        windows_sys::Win32::UI::WindowsAndMessaging::HTCAPTION as usize,
+    ) {
+        return;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = frame;
+    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+}
+
+fn request_native_window_resize(
+    ctx: &egui::Context,
+    frame: &eframe::Frame,
+    direction: egui::ResizeDirection,
+) {
+    #[cfg(target_os = "windows")]
+    if post_windows_non_client_pointer_down(frame, windows_resize_hit_test(direction)) {
+        return;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = frame;
+    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+}
+
+#[cfg(target_os = "windows")]
+fn windows_resize_hit_test(direction: egui::ResizeDirection) -> usize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    };
+
+    match direction {
+        egui::ResizeDirection::North => HTTOP as usize,
+        egui::ResizeDirection::NorthEast => HTTOPRIGHT as usize,
+        egui::ResizeDirection::East => HTRIGHT as usize,
+        egui::ResizeDirection::SouthEast => HTBOTTOMRIGHT as usize,
+        egui::ResizeDirection::South => HTBOTTOM as usize,
+        egui::ResizeDirection::SouthWest => HTBOTTOMLEFT as usize,
+        egui::ResizeDirection::West => HTLEFT as usize,
+        egui::ResizeDirection::NorthWest => HTTOPLEFT as usize,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn win32_point_lparam(x: i32, y: i32) -> isize {
+    let x = u32::from(x as i16 as u16);
+    let y = u32::from(y as i16 as u16);
+    ((y << 16) | x) as isize
+}
+
+#[cfg(target_os = "windows")]
+fn post_windows_non_client_pointer_down(frame: &eframe::Frame, hit_test: usize) -> bool {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::{
+        Foundation::POINT,
+        UI::{
+            Input::KeyboardAndMouse::ReleaseCapture,
+            WindowsAndMessaging::{GetCursorPos, PostMessageW, WM_NCLBUTTONDOWN},
+        },
+    };
+
+    let Ok(window_handle) = frame.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::Win32(handle) = window_handle.as_raw() else {
+        return false;
+    };
+    let mut cursor = POINT { x: 0, y: 0 };
+    unsafe {
+        if GetCursorPos(&mut cursor) == 0 {
+            return false;
+        }
+        ReleaseCapture();
+        PostMessageW(
+            handle.hwnd.get() as _,
+            WM_NCLBUTTONDOWN,
+            hit_test,
+            win32_point_lparam(cursor.x, cursor.y),
+        ) != 0
     }
 }
 
@@ -39968,14 +40072,15 @@ mod ui_tests {
             .unwrap();
         let drag_source = &implementation_source[drag_start..drag_start + drag_end];
 
-        assert!(drag_source.contains("ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);"));
+        assert!(drag_source.contains("request_native_window_drag(ctx, frame);"));
+        assert!(implementation_source.contains("ViewportCommand::StartDrag"));
         assert!(drag_source.contains(".primary_pressed()"));
         assert!(implementation_source.contains("title_bar_hit_map: Option<TitleBarHitMap>"));
         assert!(drag_source.contains("drag_rect.contains(pointer_pos)"));
         assert!(!update_source.contains("if self.window_drag_requested_this_frame"));
         assert!(
             update_source
-                .find("self.request_native_title_drag_on_pointer_down(ctx);")
+                .find("self.request_native_title_drag_on_pointer_down(ctx, frame);")
                 .unwrap()
                 < update_source.find("theme::apply_if_needed(").unwrap()
         );
@@ -40032,12 +40137,32 @@ mod ui_tests {
         let update_source = &implementation_source[update_start..update_start + update_end];
         assert!(
             update_source
-                .find("self.request_native_window_resize_on_pointer_down(ctx)")
+                .find("self.request_native_window_resize_on_pointer_down(ctx, frame)")
                 .unwrap()
                 < update_source
-                    .find("self.request_native_title_drag_on_pointer_down(ctx)")
+                    .find("self.request_native_title_drag_on_pointer_down(ctx, frame)")
                     .unwrap()
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_drag_bypasses_winit_stuck_dragging_state() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let helper_start = implementation_source
+            .find("fn post_windows_non_client_pointer_down(")
+            .unwrap();
+        let helper_end = implementation_source[helper_start..]
+            .find("fn safe_set_min_size(")
+            .unwrap();
+        let helper = &implementation_source[helper_start..helper_start + helper_end];
+
+        assert!(helper.contains("ReleaseCapture();"));
+        assert!(helper.contains("PostMessageW("));
+        assert!(helper.contains("WM_NCLBUTTONDOWN"));
+        assert_eq!(win32_point_lparam(-12, 34) as u32 & 0xffff, 0xfff4);
+        assert_eq!((win32_point_lparam(-12, 34) as u32 >> 16) & 0xffff, 34);
     }
 
     #[test]
@@ -43633,6 +43758,7 @@ mod ui_tests {
         assert!(primary_source.contains("theme::accent_deep()"));
         assert!(primary_source.contains("theme::accent()"));
         assert!(primary_source.contains("Color32::WHITE"));
+        assert!(primary_source.contains("disabled_primary_action_foreground()"));
         assert!(primary_source.contains("TextActionTone::Primary"));
         assert!(primary_source.contains("Stroke::NONE"));
 
@@ -43676,6 +43802,23 @@ mod ui_tests {
         let push_row_source = &implementation_source[push_row_start..push_row_start + push_row_end];
         assert!(push_row_source.contains("action_icon_checkbox("));
         assert!(!push_row_source.contains("egui::Checkbox::new("));
+    }
+
+    #[test]
+    fn disabled_primary_button_text_is_bright_but_distinct_from_enabled_text() {
+        let disabled = disabled_primary_action_foreground();
+        assert_eq!(disabled, Color32::from_gray(210));
+        assert_ne!(disabled, Color32::WHITE);
+
+        for mode in [theme::ThemeMode::Light, theme::ThemeMode::Dark] {
+            for accent in theme::all_accents() {
+                let palette = theme::palette_for(mode, accent);
+                assert!(
+                    color_brightness(disabled) > color_brightness(palette.muted),
+                    "{mode:?} {accent:?}"
+                );
+            }
+        }
     }
 
     #[test]
