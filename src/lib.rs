@@ -7,5 +7,6 @@ mod graph;
 pub mod i18n;
 pub mod merge_tool;
 mod patch;
+pub mod syntax;
 pub mod theme;
 mod updater;

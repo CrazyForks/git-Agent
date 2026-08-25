@@ -16,7 +16,11 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
-use crate::{diagnostics, patch::numbered_patch_paths};
+use crate::{
+    diagnostics,
+    patch::numbered_patch_paths,
+    syntax::{self, HighlightedDocument},
+};
 
 const HISTORY_COMMIT_LIMIT: usize = 50_000;
 
@@ -369,6 +373,14 @@ pub struct CommitDetails {
 pub struct FileDiff {
     pub key: String,
     pub text: String,
+    #[serde(default)]
+    pub repository_root: PathBuf,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub old_highlight: Option<HighlightedDocument>,
+    #[serde(default)]
+    pub new_highlight: Option<HighlightedDocument>,
 }
 
 pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
@@ -1068,8 +1080,9 @@ fn literal_git_regex(query: &str) -> String {
 }
 
 pub fn load_file_diff(root: impl AsRef<Path>, hash: &str, path: &str) -> Result<FileDiff> {
+    let root = root.as_ref();
     let text = git_output(
-        root.as_ref(),
+        root,
         &[
             "show",
             "--format=",
@@ -1081,8 +1094,24 @@ pub fn load_file_diff(root: impl AsRef<Path>, hash: &str, path: &str) -> Result<
         ],
     )?;
     let key = diff_key(hash, path);
+    let (old_path, new_path) = unified_diff_paths(&text, path);
+    let old_source = old_path
+        .as_deref()
+        .and_then(|old_path| git_blob_text(root, &format!("{hash}^"), old_path))
+        .unwrap_or_default();
+    let new_source = new_path
+        .as_deref()
+        .and_then(|new_path| git_blob_text(root, hash, new_path))
+        .unwrap_or_default();
 
-    Ok(FileDiff { key, text })
+    Ok(file_diff_with_highlighting(
+        root,
+        key,
+        path,
+        text,
+        &old_source,
+        &new_source,
+    ))
 }
 
 pub fn diff_key(hash: &str, path: &str) -> String {
@@ -1104,7 +1133,112 @@ pub fn load_worktree_diff(
         git_output(root, &["diff", "--", path])?
     };
     let key = worktree_diff_key(path, staged);
-    Ok(FileDiff { key, text })
+    let old_source;
+    let new_source;
+    if untracked && !staged {
+        old_source = String::new();
+        new_source = fs::read_to_string(root.join(path)).unwrap_or_default();
+    } else if staged {
+        old_source = git_blob_text(root, "HEAD", path).unwrap_or_default();
+        new_source = git_index_text(root, path).unwrap_or_default();
+    } else {
+        old_source = git_index_text(root, path).unwrap_or_default();
+        new_source = fs::read_to_string(root.join(path)).unwrap_or_default();
+    }
+    Ok(file_diff_with_highlighting(
+        root,
+        key,
+        path,
+        text,
+        &old_source,
+        &new_source,
+    ))
+}
+
+fn file_diff_with_highlighting(
+    root: &Path,
+    key: String,
+    path: &str,
+    text: String,
+    old_source: &str,
+    new_source: &str,
+) -> FileDiff {
+    let highlightable =
+        !text.contains('\0') && !old_source.contains('\0') && !new_source.contains('\0');
+    let (old_highlight, new_highlight) = if highlightable {
+        (
+            syntax::highlight_document(root, path, old_source),
+            syntax::highlight_document(root, path, new_source),
+        )
+    } else {
+        (None, None)
+    };
+    FileDiff {
+        key,
+        text,
+        repository_root: root.to_path_buf(),
+        path: path.to_owned(),
+        old_highlight,
+        new_highlight,
+    }
+}
+
+fn git_blob_text(root: &Path, revision: &str, path: &str) -> Option<String> {
+    git_output_optional(root, &["show", &format!("{revision}:{path}")])
+}
+
+fn git_index_text(root: &Path, path: &str) -> Option<String> {
+    git_output_optional(root, &["show", &format!(":{path}")])
+}
+
+fn git_output_optional(root: &Path, args: &[&str]) -> Option<String> {
+    let output = git_command().arg("-C").arg(root).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn unified_diff_paths(text: &str, fallback: &str) -> (Option<String>, Option<String>) {
+    let mut old_path = None;
+    let mut new_path = None;
+    for line in text.lines() {
+        if old_path.is_none()
+            && let Some(path) = line.strip_prefix("--- ")
+        {
+            old_path = diff_header_path(path);
+        }
+        if new_path.is_none()
+            && let Some(path) = line.strip_prefix("+++ ")
+        {
+            new_path = diff_header_path(path);
+        }
+        if old_path.is_some() && new_path.is_some() {
+            break;
+        }
+    }
+    if !text.contains("--- /dev/null") && old_path.is_none() {
+        old_path = Some(fallback.to_owned());
+    }
+    if !text.contains("+++ /dev/null") && new_path.is_none() {
+        new_path = Some(fallback.to_owned());
+    }
+    (old_path, new_path)
+}
+
+fn diff_header_path(value: &str) -> Option<String> {
+    let value = value.split('\t').next().unwrap_or(value).trim();
+    if value == "/dev/null" {
+        return None;
+    }
+    let value = value.trim_matches('"');
+    Some(
+        value
+            .strip_prefix("a/")
+            .or_else(|| value.strip_prefix("b/"))
+            .unwrap_or(value)
+            .to_owned(),
+    )
 }
 
 pub fn blame_file(root: impl AsRef<Path>, path: &str) -> Result<Vec<BlameLine>> {
@@ -4574,8 +4708,32 @@ mod tests {
         assert!(diff.text.contains("+fn main() {"));
         assert!(diff.text.contains("+    println!(\"hi\");"));
         assert!(diff.text.contains("+}"));
+        assert_eq!(diff.repository_root, root);
+        assert_eq!(diff.path, "src/new.rs");
+        assert!(diff.old_highlight.is_some());
+        assert!(diff.new_highlight.is_some());
+        assert!(
+            diff.new_highlight
+                .as_ref()
+                .and_then(|document| document.line("1"))
+                .is_some_and(|line| !line.spans.is_empty())
+        );
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unified_diff_paths_preserve_old_and_new_sides() {
+        let renamed = "diff --git a/src/old.ts b/src/new.ts\n--- a/src/old.ts\n+++ b/src/new.ts\n";
+        assert_eq!(
+            unified_diff_paths(renamed, "src/new.ts"),
+            (Some("src/old.ts".to_owned()), Some("src/new.ts".to_owned()))
+        );
+        let created = "--- /dev/null\n+++ b/src/new.ts\n";
+        assert_eq!(
+            unified_diff_paths(created, "src/new.ts"),
+            (None, Some("src/new.ts".to_owned()))
+        );
     }
 
     #[test]

@@ -20,7 +20,8 @@ use eframe::{
     App, CreationContext,
     egui::{
         self, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText,
-        ScrollArea, Sense, Shape, Stroke, TextEdit, Ui, Vec2, epaint::CubicBezierShape,
+        ScrollArea, Sense, Shape, Stroke, TextEdit, TextFormat, Ui, Vec2, epaint::CubicBezierShape,
+        text::LayoutJob,
     },
 };
 use egui_extras::{Column, TableBuilder};
@@ -42,6 +43,7 @@ use crate::{
         CommitPatchSelection, CreatePatchTab, PatchPathError, PatchSelectionGesture,
         numbered_patch_paths, selection_gesture, validate_patch_output_path,
     },
+    syntax::{HighlightedDocument, HighlightedLine},
     theme,
     updater::{self, InstallOutcome, UpdateRelease},
 };
@@ -9220,11 +9222,21 @@ impl GitAgentApp {
             match receiver.try_recv() {
                 Ok(Ok(diff)) => {
                     self.loading_diff_key = None;
-                    insert_bounded_diff_cache(
-                        &mut self.diff_cache,
-                        &mut self.diff_cache_order,
-                        diff,
-                    );
+                    let belongs_to_active_repository = self
+                        .active_repo_root()
+                        .is_some_and(|root| diff_belongs_to_repository(&diff, &root));
+                    if belongs_to_active_repository {
+                        insert_bounded_diff_cache(
+                            &mut self.diff_cache,
+                            &mut self.diff_cache_order,
+                            diff,
+                        );
+                    } else {
+                        diagnostics::app_info(
+                            "diff.result.stale",
+                            &format!("root={}", diff.repository_root.display()),
+                        );
+                    }
                     ctx.request_repaint();
                 }
                 Ok(Err(error)) => {
@@ -15748,7 +15760,7 @@ impl GitAgentApp {
             mode,
             self.language,
             &mut self.selected_diff_rows,
-            is_truncated.then_some(truncated_label),
+            DiffRenderOptions::new(diff, is_truncated.then_some(truncated_label)),
         );
     }
 
@@ -15792,7 +15804,7 @@ impl GitAgentApp {
             mode,
             self.language,
             &mut self.search_selected_diff_rows,
-            is_truncated.then_some(truncated_label),
+            DiffRenderOptions::new(diff, is_truncated.then_some(truncated_label)),
         );
     }
 
@@ -15832,7 +15844,10 @@ impl GitAgentApp {
                 DiffDisplayMode::Full,
                 self.language,
                 &mut selected_rows,
-                (diff.text.lines().count() > 1_200).then_some(truncated_label),
+                DiffRenderOptions::new(
+                    diff,
+                    (diff.text.lines().count() > 1_200).then_some(truncated_label),
+                ),
             );
         });
         let diff_rect = diff_response.response.rect;
@@ -17633,7 +17648,10 @@ impl GitAgentApp {
                     dialog.diff_display_mode,
                     self.language,
                     &mut dialog.selected_diff_rows,
-                    (diff.text.lines().count() > 1_200).then_some(self.tr("diff.truncated")),
+                    DiffRenderOptions::new(
+                        diff,
+                        (diff.text.lines().count() > 1_200).then_some(self.tr("diff.truncated")),
+                    ),
                 );
             });
         });
@@ -18369,7 +18387,10 @@ impl GitAgentApp {
                     dialog.preview_diff_display_mode,
                     self.language,
                     &mut dialog.preview_selected_diff_rows,
-                    (diff.text.lines().count() > 1_200).then_some(self.tr("diff.truncated")),
+                    DiffRenderOptions::new(
+                        diff,
+                        (diff.text.lines().count() > 1_200).then_some(self.tr("diff.truncated")),
+                    ),
                 );
             });
         });
@@ -30654,6 +30675,11 @@ fn insert_bounded_diff_cache(
     }
 }
 
+fn diff_belongs_to_repository(diff: &FileDiff, repository_root: &Path) -> bool {
+    !diff.repository_root.as_os_str().is_empty()
+        && paths_equal(&diff.repository_root, repository_root)
+}
+
 fn selected_or_first_conflict<'a>(
     conflicts: &'a [WorktreeFile],
     selected: Option<&SelectedWorktreeFile>,
@@ -33057,6 +33083,23 @@ fn file_status_icon(kind: char) -> UiIcon {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct DiffRenderOptions<'a> {
+    truncated_label: Option<&'a str>,
+    old_highlight: Option<&'a HighlightedDocument>,
+    new_highlight: Option<&'a HighlightedDocument>,
+}
+
+impl<'a> DiffRenderOptions<'a> {
+    fn new(diff: &'a FileDiff, truncated_label: Option<&'a str>) -> Self {
+        Self {
+            truncated_label,
+            old_highlight: diff.old_highlight.as_ref(),
+            new_highlight: diff.new_highlight.as_ref(),
+        }
+    }
+}
+
 fn fill_diff_scroll_area(
     ui: &mut Ui,
     id_salt: impl std::hash::Hash,
@@ -33064,7 +33107,7 @@ fn fill_diff_scroll_area(
     mode: DiffDisplayMode,
     language: Language,
     selected_rows: &mut Vec<DiffLineKey>,
-    truncated_label: Option<&str>,
+    options: DiffRenderOptions<'_>,
 ) {
     let body_size = safe_ui_size(ui.available_size());
     let (body_rect, _) = ui.allocate_exact_size(body_size, Sense::hover());
@@ -33077,8 +33120,8 @@ fn fill_diff_scroll_area(
             .max_height(body_rect.height())
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                render_unified_diff(ui, text, mode, language, selected_rows);
-                if let Some(label) = truncated_label {
+                render_unified_diff(ui, text, mode, language, selected_rows, options);
+                if let Some(label) = options.truncated_label {
                     ui.label(RichText::new(label).color(theme::muted()));
                 }
             });
@@ -33091,6 +33134,7 @@ fn render_unified_diff(
     mode: DiffDisplayMode,
     language: Language,
     selected_rows: &mut Vec<DiffLineKey>,
+    options: DiffRenderOptions<'_>,
 ) {
     let previous_item_spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.y = 0.0;
@@ -33118,7 +33162,7 @@ fn render_unified_diff(
             }
             DiffRenderItem::Omitted => diff_omitted_row(ui),
             DiffRenderItem::Line(line) => {
-                diff_row(ui, &line, gutter_layout, language, selected_rows);
+                diff_row(ui, &line, gutter_layout, language, selected_rows, options);
             }
         }
     }
@@ -33470,6 +33514,7 @@ fn diff_row(
     gutter_layout: DiffGutterLayout,
     language: Language,
     selected_rows: &mut Vec<DiffLineKey>,
+    options: DiffRenderOptions<'_>,
 ) {
     let key = line.key();
     let width = ui.available_width().max(560.0);
@@ -33598,13 +33643,74 @@ fn diff_row(
         draw_diff_indent_guides(ui, text_rect, &line.body);
     }
     let text_clip = text_rect.intersect(row_clip);
-    ui.painter().with_clip_rect(text_clip).text(
-        text_rect.left_center(),
-        Align2::LEFT_CENTER,
-        &line.body,
-        FontId::monospace(12.0),
-        text_color,
-    );
+    let text_painter = ui.painter().with_clip_rect(text_clip);
+    let highlighted_line = match line.kind {
+        DiffKind::Removed => options
+            .old_highlight
+            .and_then(|document| document.line(&line.left_no)),
+        DiffKind::Added | DiffKind::Context => options
+            .new_highlight
+            .and_then(|document| document.line(&line.right_no)),
+    };
+    if selected || highlighted_line.is_none() {
+        text_painter.text(
+            text_rect.left_center(),
+            Align2::LEFT_CENTER,
+            &line.body,
+            FontId::monospace(12.0),
+            text_color,
+        );
+    } else if let Some(highlighted_line) = highlighted_line {
+        let galley = text_painter.layout_job(diff_text_layout_job(
+            &line.body,
+            highlighted_line,
+            text_color,
+        ));
+        let position = Pos2::new(
+            text_rect.left(),
+            text_rect.center().y - galley.size().y * 0.5,
+        );
+        text_painter.galley(position, galley, text_color);
+    }
+}
+
+fn diff_text_layout_job(
+    body: &str,
+    highlighted_line: &HighlightedLine,
+    base_color: Color32,
+) -> LayoutJob {
+    let font_id = FontId::monospace(12.0);
+    let format = |color| TextFormat {
+        font_id: font_id.clone(),
+        color,
+        ..TextFormat::default()
+    };
+    let mut job = LayoutJob::default();
+    let mut cursor = 0usize;
+    for span in &highlighted_line.spans {
+        let start = span.start.min(body.len());
+        let end = span.end.min(body.len());
+        if start < cursor
+            || start >= end
+            || !body.is_char_boundary(start)
+            || !body.is_char_boundary(end)
+        {
+            continue;
+        }
+        if cursor < start {
+            job.append(&body[cursor..start], 0.0, format(base_color));
+        }
+        job.append(
+            &body[start..end],
+            0.0,
+            format(theme::syntax_color(span.role)),
+        );
+        cursor = end;
+    }
+    if cursor < body.len() {
+        job.append(&body[cursor..], 0.0, format(base_color));
+    }
+    job
 }
 
 fn diff_row_clip_rect(ui: &Ui, rect: Rect) -> Rect {
@@ -37991,6 +38097,7 @@ mod ui_tests {
                 FileDiff {
                     key: format!("file-{index}"),
                     text: format!("diff-{index}"),
+                    ..FileDiff::default()
                 },
             );
         }
@@ -38006,6 +38113,7 @@ mod ui_tests {
             FileDiff {
                 key: "file-5".to_owned(),
                 text: "updated".to_owned(),
+                ..FileDiff::default()
             },
         );
         insert_bounded_diff_cache(
@@ -38014,12 +38122,27 @@ mod ui_tests {
             FileDiff {
                 key: "file-25".to_owned(),
                 text: "new".to_owned(),
+                ..FileDiff::default()
             },
         );
 
         assert!(cache.contains_key("file-5"));
         assert!(!cache.contains_key("file-6"));
         assert_eq!(cache["file-5"].text, "updated");
+    }
+
+    #[test]
+    fn async_diff_results_are_owned_by_the_repository_that_created_them() {
+        let first = PathBuf::from("C:/repos/first");
+        let second = PathBuf::from("C:/repos/second");
+        let diff = FileDiff {
+            repository_root: first.clone(),
+            ..FileDiff::default()
+        };
+
+        assert!(diff_belongs_to_repository(&diff, &first));
+        assert!(!diff_belongs_to_repository(&diff, &second));
+        assert!(!diff_belongs_to_repository(&FileDiff::default(), &first));
     }
 
     #[test]
@@ -39463,6 +39586,23 @@ mod ui_tests {
             "pretty",
             &hashes,
         ));
+    }
+
+    #[test]
+    fn syntax_layout_preserves_source_text_and_plain_gaps() {
+        let line = HighlightedLine {
+            spans: vec![crate::syntax::HighlightSpan {
+                start: 0,
+                end: 5,
+                role: crate::syntax::SyntaxRole::Keyword,
+            }],
+        };
+        let job = diff_text_layout_job("const value = 1;", &line, Color32::BLACK);
+
+        assert_eq!(job.text, "const value = 1;");
+        assert_eq!(job.sections.len(), 2);
+        assert_eq!(job.sections[0].byte_range, 0..5);
+        assert_eq!(job.sections[1].byte_range, 5..16);
     }
 
     #[test]

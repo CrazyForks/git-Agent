@@ -164,6 +164,19 @@ pub struct Palette {
     pub diff_selected_gutter: Color32,
     pub diff_selected_gutter_text: Color32,
     pub diff_indent_guide: Color32,
+    pub syntax_comment: Color32,
+    pub syntax_string: Color32,
+    pub syntax_number: Color32,
+    pub syntax_keyword: Color32,
+    pub syntax_type: Color32,
+    pub syntax_function: Color32,
+    pub syntax_constant: Color32,
+    pub syntax_variable: Color32,
+    pub syntax_tag: Color32,
+    pub syntax_attribute: Color32,
+    pub syntax_operator: Color32,
+    pub syntax_punctuation: Color32,
+    pub syntax_invalid: Color32,
 }
 
 const EMBEDDED_THEME_JSON: &str = include_str!("../theme.json");
@@ -352,6 +365,19 @@ fn apply_theme_pool(palette: &mut Palette, mode: ThemeMode, accent: ThemeAccent)
     set!(diff_selected_gutter, "--diff-selected-gutter");
     set!(diff_selected_gutter_text, "--diff-selected-gutter-text");
     set!(diff_indent_guide, "--diff-indent-guide");
+    set!(syntax_comment, "--syntax-comment");
+    set!(syntax_string, "--syntax-string");
+    set!(syntax_number, "--syntax-number");
+    set!(syntax_keyword, "--syntax-keyword");
+    set!(syntax_type, "--syntax-type");
+    set!(syntax_function, "--syntax-function");
+    set!(syntax_constant, "--syntax-constant");
+    set!(syntax_variable, "--syntax-variable");
+    set!(syntax_tag, "--syntax-tag");
+    set!(syntax_attribute, "--syntax-attribute");
+    set!(syntax_operator, "--syntax-operator");
+    set!(syntax_punctuation, "--syntax-punctuation");
+    set!(syntax_invalid, "--syntax-invalid");
 }
 
 pub const BG: Color32 = Color32::from_rgb(16, 18, 24);
@@ -637,6 +663,19 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
             diff_selected_gutter: hsl_to_rgb(hsl.h, (hsl.s * 0.42).clamp(0.0, 1.0), 0.24),
             diff_selected_gutter_text: muted_neutral(0.96),
             diff_indent_guide: muted_neutral(0.30),
+            syntax_comment: Color32::from_rgb(140, 166, 134),
+            syntax_string: Color32::from_rgb(224, 168, 112),
+            syntax_number: Color32::from_rgb(196, 146, 232),
+            syntax_keyword: Color32::from_rgb(126, 166, 255),
+            syntax_type: Color32::from_rgb(91, 201, 191),
+            syntax_function: Color32::from_rgb(232, 202, 126),
+            syntax_constant: Color32::from_rgb(204, 157, 238),
+            syntax_variable: muted_neutral(0.90),
+            syntax_tag: Color32::from_rgb(116, 201, 145),
+            syntax_attribute: Color32::from_rgb(236, 181, 116),
+            syntax_operator: Color32::from_rgb(185, 196, 215),
+            syntax_punctuation: muted_neutral(0.72),
+            syntax_invalid: Color32::from_rgb(255, 116, 126),
         },
         ThemeMode::Light => Palette {
             bg: neutral(0.948),
@@ -674,6 +713,19 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
             diff_selected_gutter: hsl_to_rgb(hsl.h, (hsl.s * 0.52).clamp(0.0, 1.0), 0.48),
             diff_selected_gutter_text: Color32::from_rgb(235, 247, 255),
             diff_indent_guide: muted_neutral(0.74),
+            syntax_comment: Color32::from_rgb(88, 112, 82),
+            syntax_string: Color32::from_rgb(157, 72, 13),
+            syntax_number: Color32::from_rgb(117, 71, 164),
+            syntax_keyword: Color32::from_rgb(25, 83, 156),
+            syntax_type: Color32::from_rgb(0, 111, 111),
+            syntax_function: Color32::from_rgb(112, 78, 9),
+            syntax_constant: Color32::from_rgb(111, 66, 151),
+            syntax_variable: muted_neutral(0.20),
+            syntax_tag: Color32::from_rgb(24, 111, 65),
+            syntax_attribute: Color32::from_rgb(126, 72, 10),
+            syntax_operator: Color32::from_rgb(67, 78, 94),
+            syntax_punctuation: muted_neutral(0.36),
+            syntax_invalid: Color32::from_rgb(184, 24, 42),
         },
     };
     apply_theme_pool(&mut palette, mode, accent);
@@ -808,6 +860,26 @@ pub fn diff_selected_gutter_text() -> Color32 {
 
 pub fn diff_indent_guide() -> Color32 {
     palette(current_mode()).diff_indent_guide
+}
+
+pub fn syntax_color(role: crate::syntax::SyntaxRole) -> Color32 {
+    let palette = palette(current_mode());
+    match role {
+        crate::syntax::SyntaxRole::Plain => palette.text,
+        crate::syntax::SyntaxRole::Comment => palette.syntax_comment,
+        crate::syntax::SyntaxRole::String => palette.syntax_string,
+        crate::syntax::SyntaxRole::Number => palette.syntax_number,
+        crate::syntax::SyntaxRole::Keyword => palette.syntax_keyword,
+        crate::syntax::SyntaxRole::Type => palette.syntax_type,
+        crate::syntax::SyntaxRole::Function => palette.syntax_function,
+        crate::syntax::SyntaxRole::Constant => palette.syntax_constant,
+        crate::syntax::SyntaxRole::Variable => palette.syntax_variable,
+        crate::syntax::SyntaxRole::Tag => palette.syntax_tag,
+        crate::syntax::SyntaxRole::Attribute => palette.syntax_attribute,
+        crate::syntax::SyntaxRole::Operator => palette.syntax_operator,
+        crate::syntax::SyntaxRole::Punctuation => palette.syntax_punctuation,
+        crate::syntax::SyntaxRole::Invalid => palette.syntax_invalid,
+    }
 }
 
 pub fn all_accents() -> [ThemeAccent; 8] {
