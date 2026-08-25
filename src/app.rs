@@ -177,6 +177,7 @@ const REPO_SETTINGS_DIALOG_HEIGHT: f32 = 650.0;
 const REPO_SETTINGS_REMOTE_DIALOG_WIDTH: f32 = 520.0;
 const SETTINGS_DIALOG_TITLE_HEIGHT: f32 = 32.0;
 const SETTINGS_DIALOG_TITLE_SIZE: f32 = 18.0;
+const UI_SCALE_OPTIONS: [f32; 4] = [0.9, 1.0, 1.1, 1.25];
 const ACTION_DIALOG_WIDTH: f32 = 392.0;
 const REBASE_CONTROL_DIALOG_HEIGHT: f32 = 300.0;
 const FETCH_DIALOG_WIDTH: f32 = 392.0;
@@ -861,7 +862,9 @@ pub struct GitAgentApp {
     undo_entries: HashMap<String, RepositoryUndoEntry>,
     redo_entries: HashMap<String, RepositoryUndoEntry>,
     create_patch_task: Option<Receiver<CreatePatchTaskResult>>,
+    create_patch_root: Option<PathBuf>,
     repository_benchmark_task: Option<Receiver<RepositoryBenchmarkTaskResult>>,
+    repository_benchmark_root: Option<PathBuf>,
     repository_benchmark_progress: Option<git::RepositoryBenchmarkStepProgress>,
     ssh_tool_task: Option<Receiver<SshToolTaskResult>>,
     ssh_tool_action: Option<SshToolAction>,
@@ -876,6 +879,7 @@ pub struct GitAgentApp {
     branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
     branch_checkout_root: Option<PathBuf>,
     merge_tool_task: Option<Receiver<MergeToolTaskResult>>,
+    merge_tool_root: Option<PathBuf>,
     conflict_merge_reload_root: Option<PathBuf>,
     external_diff_tool_task: Option<Receiver<ExternalDiffToolTaskResult>>,
     external_diff_tool_root: Option<PathBuf>,
@@ -993,6 +997,15 @@ pub struct GitAgentApp {
     theme_mode: theme::ThemeMode,
     theme_accent: theme::ThemeAccent,
     background_pattern_enabled: bool,
+    text_contrast: theme::TextContrast,
+    ui_font_family: Option<String>,
+    ui_font_weight: theme::FontWeight,
+    code_font_family: Option<String>,
+    ui_scale: f32,
+    font_catalog: Vec<theme::SystemFontFamily>,
+    font_catalog_task: Option<Receiver<Vec<theme::SystemFontFamily>>>,
+    font_apply_task: Option<Receiver<Result<theme::LoadedFontSet, String>>>,
+    font_apply_error: Option<String>,
     layout_prefs: LayoutPrefs,
     history_show_remote_refs: bool,
     history_show_branch_refs: bool,
@@ -2816,6 +2829,11 @@ struct AppSettings {
     theme: SettingsThemeMode,
     theme_accent: SettingsThemeAccent,
     background_pattern_enabled: bool,
+    text_contrast: SettingsTextContrast,
+    ui_font_family: Option<String>,
+    ui_font_weight: SettingsFontWeight,
+    code_font_family: Option<String>,
+    ui_scale: f32,
     beginner_tutorial_seen: bool,
     language: SettingsLanguage,
     workspaces: Vec<PathBuf>,
@@ -2857,6 +2875,16 @@ impl WindowSize {
             && self.width <= 16_384.0
             && self.height <= 16_384.0
     }
+}
+
+fn sanitize_ui_scale(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 1.0;
+    }
+    UI_SCALE_OPTIONS
+        .into_iter()
+        .min_by(|left, right| (value - *left).abs().total_cmp(&(value - *right).abs()))
+        .unwrap_or(1.0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3021,6 +3049,23 @@ enum SettingsThemeAccent {
     ForestGreen,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+enum SettingsFontWeight {
+    #[default]
+    Regular,
+    Medium,
+    Semibold,
+    Bold,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+enum SettingsTextContrast {
+    Soft,
+    #[default]
+    Standard,
+    Strong,
+}
+
 impl Default for SettingsThemeAccent {
     fn default() -> Self {
         Self::Blue
@@ -3045,6 +3090,11 @@ impl Default for AppSettings {
             theme: SettingsThemeMode::Light,
             theme_accent: SettingsThemeAccent::Blue,
             background_pattern_enabled: false,
+            text_contrast: SettingsTextContrast::Standard,
+            ui_font_family: None,
+            ui_font_weight: SettingsFontWeight::Regular,
+            code_font_family: None,
+            ui_scale: 1.0,
             beginner_tutorial_seen: false,
             language: SettingsLanguage::Chinese,
             workspaces: Vec::new(),
@@ -3694,6 +3744,48 @@ impl From<theme::ThemeAccent> for SettingsThemeAccent {
     }
 }
 
+impl From<SettingsFontWeight> for theme::FontWeight {
+    fn from(value: SettingsFontWeight) -> Self {
+        match value {
+            SettingsFontWeight::Regular => Self::Regular,
+            SettingsFontWeight::Medium => Self::Medium,
+            SettingsFontWeight::Semibold => Self::Semibold,
+            SettingsFontWeight::Bold => Self::Bold,
+        }
+    }
+}
+
+impl From<theme::FontWeight> for SettingsFontWeight {
+    fn from(value: theme::FontWeight) -> Self {
+        match value {
+            theme::FontWeight::Regular => Self::Regular,
+            theme::FontWeight::Medium => Self::Medium,
+            theme::FontWeight::Semibold => Self::Semibold,
+            theme::FontWeight::Bold => Self::Bold,
+        }
+    }
+}
+
+impl From<SettingsTextContrast> for theme::TextContrast {
+    fn from(value: SettingsTextContrast) -> Self {
+        match value {
+            SettingsTextContrast::Soft => Self::Soft,
+            SettingsTextContrast::Standard => Self::Standard,
+            SettingsTextContrast::Strong => Self::Strong,
+        }
+    }
+}
+
+impl From<theme::TextContrast> for SettingsTextContrast {
+    fn from(value: theme::TextContrast) -> Self {
+        match value {
+            theme::TextContrast::Soft => Self::Soft,
+            theme::TextContrast::Standard => Self::Standard,
+            theme::TextContrast::Strong => Self::Strong,
+        }
+    }
+}
+
 impl From<SettingsLanguage> for Language {
     fn from(value: SettingsLanguage) -> Self {
         match value {
@@ -4259,9 +4351,16 @@ fn layout_prefs_path() -> Option<PathBuf> {
 
 impl GitAgentApp {
     pub fn new(cc: &CreationContext<'_>) -> Self {
+        let app_settings = AppSettings::load();
         theme::install(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        let app_settings = AppSettings::load();
+        theme::set_text_contrast(&cc.egui_ctx, app_settings.text_contrast.into());
+        let ui_scale = sanitize_ui_scale(app_settings.ui_scale);
+        cc.egui_ctx.set_zoom_factor(ui_scale);
+        let (font_catalog_sender, font_catalog_task) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = font_catalog_sender.send(theme::scan_system_fonts());
+        });
         let show_beginner_tutorial_on_start = !app_settings.beginner_tutorial_seen;
         BACKGROUND_PATTERN_ENABLED
             .store(app_settings.background_pattern_enabled, Ordering::Relaxed);
@@ -4356,7 +4455,9 @@ impl GitAgentApp {
             undo_entries: HashMap::new(),
             redo_entries: HashMap::new(),
             create_patch_task: None,
+            create_patch_root: None,
             repository_benchmark_task: None,
+            repository_benchmark_root: None,
             repository_benchmark_progress: None,
             ssh_tool_task: None,
             ssh_tool_action: None,
@@ -4371,6 +4472,7 @@ impl GitAgentApp {
             branch_checkout_task: None,
             branch_checkout_root: None,
             merge_tool_task: None,
+            merge_tool_root: None,
             conflict_merge_reload_root: None,
             external_diff_tool_task: None,
             external_diff_tool_root: None,
@@ -4498,6 +4600,15 @@ impl GitAgentApp {
             },
             theme_accent: app_settings.theme_accent.into(),
             background_pattern_enabled: app_settings.background_pattern_enabled,
+            text_contrast: app_settings.text_contrast.into(),
+            ui_font_family: app_settings.ui_font_family.clone(),
+            ui_font_weight: app_settings.ui_font_weight.into(),
+            code_font_family: app_settings.code_font_family.clone(),
+            ui_scale,
+            font_catalog: Vec::new(),
+            font_catalog_task: Some(font_catalog_task),
+            font_apply_task: None,
+            font_apply_error: None,
             layout_prefs: LayoutPrefs::load(),
             history_show_remote_refs: true,
             history_show_branch_refs: true,
@@ -4790,6 +4901,7 @@ impl GitAgentApp {
             self.background_remote_git_root.as_deref(),
             self.branch_checkout_root.as_deref(),
             self.repository_undo_root.as_deref(),
+            self.merge_tool_root.as_deref(),
             self.conflict_merge_reload_root.as_deref(),
         ]
         .into_iter()
@@ -5188,6 +5300,10 @@ impl GitAgentApp {
         self.details_cache.clear();
         self.diff_cache.clear();
         self.diff_cache_order.clear();
+        self.details_task = None;
+        self.diff_task = None;
+        self.loading_details_hash = None;
+        self.loading_diff_key = None;
         self.file_search_task = None;
         self.blame_task = None;
         self.pending_blame_action = None;
@@ -6498,6 +6614,22 @@ impl GitAgentApp {
         self.merge_tool_task.is_some() || self.conflict_merge_reload_root.is_some()
     }
 
+    fn active_merge_tool_busy(&self) -> bool {
+        (self.merge_tool_task.is_some()
+            && self.task_root_matches_active_repo(self.merge_tool_root.as_deref()))
+            || self.task_root_matches_active_repo(self.conflict_merge_reload_root.as_deref())
+    }
+
+    fn active_create_patch_busy(&self) -> bool {
+        self.create_patch_task.is_some()
+            && self.task_root_matches_active_repo(self.create_patch_root.as_deref())
+    }
+
+    fn active_repository_benchmark_busy(&self) -> bool {
+        self.repository_benchmark_task.is_some()
+            && self.task_root_matches_active_repo(self.repository_benchmark_root.as_deref())
+    }
+
     fn finish_conflict_merge_reload_for(&mut self, root: &Path) {
         if self
             .conflict_merge_reload_root
@@ -6524,7 +6656,7 @@ impl GitAgentApp {
     }
 
     fn start_repository_benchmark(&mut self) {
-        if self.branch_actions_busy() {
+        if self.repository_benchmark_task.is_some() || self.branch_actions_busy() {
             return;
         }
         let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
@@ -6532,6 +6664,7 @@ impl GitAgentApp {
         };
         let (sender, receiver) = mpsc::channel();
         self.repository_benchmark_task = Some(receiver);
+        self.repository_benchmark_root = Some(root.clone());
         self.repository_benchmark_progress = Some(git::RepositoryBenchmarkStepProgress {
             completed: 0,
             total: git::REPOSITORY_BENCHMARK_TOTAL_STEPS,
@@ -6585,19 +6718,21 @@ impl GitAgentApp {
     }
 
     fn branch_actions_busy(&self) -> bool {
-        self.loading_repo
-            || self.branch_checkout_busy()
-            || self.remote_git_busy()
-            || self.repository_undo_busy()
-            || self.create_patch_busy()
-            || self.merge_tool_busy()
+        self.active_repo_has_pending_load()
+            || self.active_branch_checkout_busy()
+            || self.active_remote_git_busy()
+            || self.active_background_remote_git_busy()
+            || self.active_credential_login_busy()
+            || self.active_repository_undo_busy()
+            || self.active_create_patch_busy()
+            || self.active_merge_tool_busy()
             || self.active_external_diff_tool_busy()
-            || self.repository_benchmark_task.is_some()
+            || self.active_repository_benchmark_busy()
     }
 
     fn repo_toolbar_loading_busy(&self) -> bool {
         self.active_branch_checkout_busy()
-            || self.merge_tool_busy()
+            || self.active_merge_tool_busy()
             || self.active_external_diff_tool_busy()
             || self.repo_source_task.is_some()
             || self.active_repo_has_pending_load()
@@ -6616,7 +6751,7 @@ impl GitAgentApp {
                 .map(|key| self.tr(key))
                 .unwrap_or_else(|| self.tr("status.running_git_action"));
         }
-        if self.merge_tool_busy() {
+        if self.active_merge_tool_busy() {
             return self.tr("status.resolving_conflicts");
         }
         if self.active_external_diff_tool_busy() {
@@ -6653,10 +6788,10 @@ impl GitAgentApp {
         if self.active_background_remote_git_busy() {
             return Some(self.tr("status.fetching"));
         }
-        if self.create_patch_task.is_some() {
+        if self.active_create_patch_busy() {
             return Some(self.tr("status.creating_patch"));
         }
-        if self.repository_benchmark_task.is_some() {
+        if self.active_repository_benchmark_busy() {
             return Some(self.tr("status.benchmarking_repository"));
         }
         if self.active_repository_undo_busy() {
@@ -7045,7 +7180,7 @@ impl GitAgentApp {
     }
 
     fn start_branch_checkout(&mut self, name: String, strategy: BranchCheckoutStrategy) {
-        if self.branch_actions_busy() {
+        if self.branch_checkout_busy() || self.branch_actions_busy() {
             return;
         }
         let Some(snapshot) = self.snapshot.as_ref() else {
@@ -7193,7 +7328,7 @@ impl GitAgentApp {
         inspect_after_status: bool,
         action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
     ) {
-        if self.branch_actions_busy() {
+        if self.repository_undo_busy() || self.branch_actions_busy() {
             return;
         }
         let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
@@ -7564,7 +7699,7 @@ impl GitAgentApp {
     }
 
     fn start_create_patch_task(&mut self, request: git::CreatePatchRequest) {
-        if self.branch_actions_busy() {
+        if self.create_patch_busy() || self.branch_actions_busy() {
             return;
         }
         let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
@@ -7573,6 +7708,7 @@ impl GitAgentApp {
 
         let (sender, receiver) = mpsc::channel();
         self.create_patch_task = Some(receiver);
+        self.create_patch_root = Some(root.clone());
         self.error = None;
         self.last_notice = None;
 
@@ -8154,13 +8290,13 @@ impl GitAgentApp {
                                 ),
                             );
                         }
+                        if was_foreground {
+                            self.finish_conflict_merge_reload_for(&requested_root);
+                        }
                         if active_repo && !stale_checkout_snapshot {
                             let applied_branch = snapshot.branch.clone();
                             if !unchanged_background_snapshot {
                                 self.apply_repository_snapshot(snapshot);
-                            }
-                            if was_foreground {
-                                self.finish_conflict_merge_reload_for(&requested_root);
                             }
                             diagnostics::trace(
                                 "snapshot.apply",
@@ -8195,8 +8331,10 @@ impl GitAgentApp {
                         if !retry_queued {
                             self.repo_snapshot_retry_attempts.remove(&repo_task_key);
                         }
-                        if was_foreground && self.active_repo_root_matches(&requested_root) {
+                        if was_foreground {
                             self.finish_conflict_merge_reload_for(&requested_root);
+                        }
+                        if was_foreground && self.active_repo_root_matches(&requested_root) {
                             diagnostics::finish_branch_switch(
                                 "snapshot_error",
                                 &format!("root={} error={error:#}", requested_root.display()),
@@ -8235,8 +8373,10 @@ impl GitAgentApp {
                     continue;
                 }
                 let was_foreground = self.foreground_repo_loads.remove(&key);
-                if was_foreground && self.active_repo_key_matches(&key) {
+                if was_foreground {
                     self.finish_conflict_merge_reload_for_key(&key);
+                }
+                if was_foreground && self.active_repo_key_matches(&key) {
                     let checkout_matches = self
                         .branch_checkout_root
                         .as_ref()
@@ -8499,6 +8639,7 @@ impl GitAgentApp {
                     }
                     Ok(RepositoryBenchmarkTaskMessage::Finished(root, Ok(report))) => {
                         keep_receiver = false;
+                        self.repository_benchmark_root = None;
                         self.repository_benchmark_progress = None;
                         self.error = None;
                         self.save_repository_benchmark_report(&root, &report);
@@ -8507,6 +8648,7 @@ impl GitAgentApp {
                     }
                     Ok(RepositoryBenchmarkTaskMessage::Finished(_, Err(error))) => {
                         keep_receiver = false;
+                        self.repository_benchmark_root = None;
                         self.repository_benchmark_progress = None;
                         self.error = Some(error.to_string());
                         self.last_notice = None;
@@ -8519,6 +8661,7 @@ impl GitAgentApp {
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         keep_receiver = false;
+                        self.repository_benchmark_root = None;
                         self.repository_benchmark_progress = None;
                         self.error = Some(self.tr("benchmark.stopped").to_owned());
                         self.last_notice = None;
@@ -8636,6 +8779,7 @@ impl GitAgentApp {
         if let Some(receiver) = self.create_patch_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(paths))) => {
+                    self.create_patch_root = None;
                     self.pending_create_patch_action = None;
                     self.error = None;
                     self.last_notice = None;
@@ -8647,6 +8791,7 @@ impl GitAgentApp {
                     ctx.request_repaint();
                 }
                 Ok((_, Err(error))) => {
+                    self.create_patch_root = None;
                     self.error = Some(error.to_string());
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -8656,6 +8801,7 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.create_patch_root = None;
                     self.error = Some(self.tr("patch.create.disconnected").to_owned());
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -9462,6 +9608,95 @@ impl GitAgentApp {
         }
     }
 
+    fn set_text_contrast(&mut self, ctx: &egui::Context, contrast: theme::TextContrast) {
+        if self.text_contrast != contrast {
+            self.text_contrast = contrast;
+            theme::set_text_contrast(ctx, contrast);
+            self.save_app_settings();
+        }
+    }
+
+    fn font_selection(&self) -> theme::FontSelection {
+        theme::FontSelection {
+            ui_family: self.ui_font_family.clone(),
+            ui_weight: self.ui_font_weight,
+            code_family: self.code_font_family.clone(),
+        }
+    }
+
+    fn font_controls_busy(&self) -> bool {
+        self.font_catalog_task.is_some() || self.font_apply_task.is_some()
+    }
+
+    fn start_font_apply(&mut self, ctx: &egui::Context) {
+        if self.font_catalog.is_empty() || self.font_apply_task.is_some() {
+            return;
+        }
+        let selection = self.font_selection();
+        let catalog = self.font_catalog.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.font_apply_error = None;
+        self.font_apply_task = Some(receiver);
+        thread::spawn(move || {
+            let _ = sender.send(theme::load_font_set(&selection, &catalog));
+        });
+        ctx.request_repaint();
+    }
+
+    fn save_and_apply_font_selection(&mut self, ctx: &egui::Context) {
+        self.save_app_settings();
+        self.start_font_apply(ctx);
+    }
+
+    fn set_ui_scale(&mut self, ctx: &egui::Context, scale: f32) {
+        let scale = sanitize_ui_scale(scale);
+        if (self.ui_scale - scale).abs() <= f32::EPSILON {
+            return;
+        }
+        self.ui_scale = scale;
+        ctx.set_zoom_factor(scale);
+        self.save_app_settings();
+    }
+
+    fn poll_font_tasks(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = self.font_catalog_task.take() {
+            match receiver.try_recv() {
+                Ok(catalog) => {
+                    self.font_catalog = catalog;
+                    self.start_font_apply(ctx);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.font_catalog_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.font_apply_error =
+                        Some(self.tr("settings.font_catalog_failed").to_owned());
+                }
+            }
+        }
+
+        if let Some(receiver) = self.font_apply_task.take() {
+            match receiver.try_recv() {
+                Ok(Ok(fonts)) => {
+                    theme::apply_loaded_font_set(ctx, fonts);
+                    self.font_apply_error = None;
+                    ctx.request_repaint();
+                }
+                Ok(Err(error)) => {
+                    self.font_apply_error = Some(error);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.font_apply_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.font_apply_error = Some(self.tr("settings.font_apply_failed").to_owned());
+                }
+            }
+        }
+    }
+
     fn set_language(&mut self, language: Language) {
         if self.language != language {
             self.language = language;
@@ -9477,6 +9712,11 @@ impl GitAgentApp {
             theme: self.theme_mode.into(),
             theme_accent: self.theme_accent.into(),
             background_pattern_enabled: self.background_pattern_enabled,
+            text_contrast: self.text_contrast.into(),
+            ui_font_family: self.ui_font_family.clone(),
+            ui_font_weight: self.ui_font_weight.into(),
+            code_font_family: self.code_font_family.clone(),
+            ui_scale: self.ui_scale,
             beginner_tutorial_seen: self.beginner_tutorial_seen,
             language: self.language.into(),
             workspaces: self.repository_workspaces.clone(),
@@ -9778,10 +10018,7 @@ impl GitAgentApp {
     }
 
     fn commit_current_message(&mut self, staged_count: usize) {
-        if self.loading_repo
-            || self.remote_git_busy()
-            || self.pending_commit_identity_warning.is_some()
-        {
+        if self.branch_actions_busy() || self.pending_commit_identity_warning.is_some() {
             return;
         }
         if (staged_count == 0 && !self.commit_state.amend) || self.commit_message.trim().is_empty()
@@ -10203,6 +10440,7 @@ impl App for GitAgentApp {
         }
         self.update_window_resize_cursor(ctx);
         theme::apply_if_needed(ctx, self.theme_mode, self.theme_accent);
+        self.poll_font_tasks(ctx);
         self.poll_tasks(ctx);
         self.clear_focus_before_repository_snapshot_ui(ctx);
         if self.exit_after_update_launch {
@@ -10850,7 +11088,7 @@ impl GitAgentApp {
     }
 
     fn repository_benchmark_progress_modal(&mut self, ctx: &egui::Context) {
-        if self.repository_benchmark_task.is_none() {
+        if !self.active_repository_benchmark_busy() {
             return;
         }
         compact_action_dialog(ctx, self.tr("benchmark.title"), 360.0, |ui| {
@@ -11327,7 +11565,7 @@ impl GitAgentApp {
     fn desktop_menu_bar(&mut self, ui: &mut Ui, has_repo: bool, has_remote: bool) -> Option<Rect> {
         let requested_top_menu = self.requested_top_menu.take();
         let mut menu_rect = None;
-        let repo_action_busy = self.loading_repo || self.remote_git_busy();
+        let repo_action_busy = self.branch_actions_busy();
         let repo_action_enabled = !repo_action_busy && has_repo;
         let remote_action_enabled = repo_action_enabled && has_remote;
         let git_dialog_enabled = !self.branch_actions_busy() && has_repo;
@@ -12274,7 +12512,6 @@ impl GitAgentApp {
         let new_tab_label = self.tr("repo.source.new_tab").to_owned();
         let close_tab_label = self.tr("repo.source.close_tab").to_owned();
         let more_label = self.tr("common.more").to_owned();
-        let loading_repo = self.loading_repo;
         let mut activate_source_tab = false;
         let mut open_source_tab = false;
 
@@ -12383,7 +12620,7 @@ impl GitAgentApp {
                         &mut activate_source_tab,
                     );
                 }
-                if icon_button(ui, UiIcon::Plus, &new_tab_label, !loading_repo).clicked() {
+                if icon_button(ui, UiIcon::Plus, &new_tab_label, true).clicked() {
                     open_source_tab = true;
                 }
             });
@@ -12473,7 +12710,7 @@ impl GitAgentApp {
                 let repo_toolbar_loading_label = self.repo_toolbar_loading_label().to_owned();
                 let repo_toolbar_background_status =
                     self.displayed_repo_toolbar_background_status(ctx);
-                let repo_action_busy = self.loading_repo || self.remote_git_busy();
+                let repo_action_busy = self.branch_actions_busy();
                 let branch_actions_enabled = !self.branch_actions_busy();
                 let upstream_counts = upstream_sync_counts(self.snapshot.as_ref());
                 let pull_label = toolbar_sync_label(
@@ -14788,12 +15025,14 @@ impl GitAgentApp {
         if let Some(receiver) = self.merge_tool_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(_success))) => {
+                    self.merge_tool_root = None;
                     self.last_notice = None;
                     self.conflict_merge_reload_root = Some(root.clone());
                     self.load_repository_uncached(root);
                     ctx.request_repaint();
                 }
                 Ok((_, Err(error))) => {
+                    self.merge_tool_root = None;
                     self.conflict_merge_reload_root = None;
                     self.error = Some(error.to_string());
                     self.last_notice = None;
@@ -14804,6 +15043,7 @@ impl GitAgentApp {
                     ctx.request_repaint_after(Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.merge_tool_root = None;
                     self.conflict_merge_reload_root = None;
                     self.last_notice = None;
                     self.error = Some("Merge tool stopped unexpectedly".to_owned());
@@ -14898,7 +15138,7 @@ impl GitAgentApp {
 
         let root_for_reload = root.clone();
         let (sender, receiver) = mpsc::channel();
-        self.conflict_merge_reload_root = Some(root.clone());
+        self.merge_tool_root = Some(root.clone());
         self.merge_tool_task = Some(receiver);
         thread::spawn(move || {
             let result = child
@@ -15224,8 +15464,7 @@ impl GitAgentApp {
                 );
                 let can_commit = (staged_count > 0 || self.commit_state.amend)
                     && !self.commit_message.trim().is_empty()
-                    && !self.loading_repo
-                    && !self.remote_git_busy()
+                    && !self.branch_actions_busy()
                     && self.pending_commit_identity_warning.is_none();
                 let commit_clicked = self.commit_action_row(ui, can_commit);
                 if commit_clicked {
@@ -20572,6 +20811,8 @@ impl GitAgentApp {
                 self.set_background_pattern_enabled(background_pattern_enabled);
             }
             ui.add_space(8.0);
+            self.global_font_settings(ui);
+            ui.add_space(8.0);
             settings_field(ui, i18n::t(language, "settings.language"), |ui| {
                 if settings_choice_button(
                     ui,
@@ -20594,6 +20835,174 @@ impl GitAgentApp {
         self.global_refresh_settings(ui);
         ui.add_space(12.0);
         self.global_repository_workspaces_settings(ui);
+    }
+
+    fn global_font_settings(&mut self, ui: &mut Ui) {
+        let language = self.language;
+        let controls_enabled = !self.font_controls_busy() && !self.font_catalog.is_empty();
+        let mut selected_contrast = self.text_contrast;
+        settings_field(ui, i18n::t(language, "settings.text_contrast"), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for contrast in theme::TextContrast::ALL {
+                    if settings_choice_button(
+                        ui,
+                        selected_contrast == contrast,
+                        text_contrast_label(language, contrast),
+                        76.0,
+                    )
+                    .clicked()
+                    {
+                        selected_contrast = contrast;
+                    }
+                }
+            });
+        });
+        if selected_contrast != self.text_contrast {
+            self.set_text_contrast(ui.ctx(), selected_contrast);
+        }
+        ui.add_space(8.0);
+
+        let mut ui_family_choices = vec![(
+            String::new(),
+            i18n::t(language, "settings.font_auto").to_owned(),
+        )];
+        ui_family_choices.extend(
+            theme::font_family_names(&self.font_catalog, false)
+                .into_iter()
+                .map(|family| (family.clone(), family)),
+        );
+        let mut code_family_choices = vec![(
+            String::new(),
+            i18n::t(language, "settings.font_auto").to_owned(),
+        )];
+        code_family_choices.extend(
+            theme::font_family_names(&self.font_catalog, true)
+                .into_iter()
+                .map(|family| (family.clone(), family)),
+        );
+
+        let mut selected_ui_family = self.ui_font_family.clone().unwrap_or_default();
+        settings_field(ui, i18n::t(language, "settings.ui_font"), |ui| {
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                let width = ui.available_width().min(320.0);
+                searchable_branch_dropdown(
+                    ui,
+                    egui::Id::new("settings_ui_font_family"),
+                    &mut selected_ui_family,
+                    &ui_family_choices,
+                    width,
+                    i18n::t(language, "settings.font_auto"),
+                    i18n::t(language, "settings.font_search"),
+                );
+            });
+        });
+        let selected_ui_family = (!selected_ui_family.is_empty()).then_some(selected_ui_family);
+        if selected_ui_family != self.ui_font_family {
+            self.ui_font_family = selected_ui_family;
+            let available =
+                theme::available_font_weights(&self.font_catalog, self.ui_font_family.as_deref());
+            if !available.contains(&self.ui_font_weight) {
+                self.ui_font_weight = available.first().copied().unwrap_or_default();
+            }
+            self.save_and_apply_font_selection(ui.ctx());
+        }
+
+        ui.add_space(8.0);
+        let available_weights =
+            theme::available_font_weights(&self.font_catalog, self.ui_font_family.as_deref());
+        let mut selected_weight = self.ui_font_weight;
+        settings_field(ui, i18n::t(language, "settings.font_weight"), |ui| {
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for weight in theme::FontWeight::ALL {
+                        if available_weights.contains(&weight)
+                            && settings_choice_button(
+                                ui,
+                                selected_weight == weight,
+                                font_weight_label(language, weight),
+                                76.0,
+                            )
+                            .clicked()
+                        {
+                            selected_weight = weight;
+                        }
+                    }
+                });
+            });
+        });
+        if selected_weight != self.ui_font_weight {
+            self.ui_font_weight = selected_weight;
+            self.save_and_apply_font_selection(ui.ctx());
+        }
+
+        ui.add_space(8.0);
+        let mut selected_code_family = self.code_font_family.clone().unwrap_or_default();
+        settings_field(ui, i18n::t(language, "settings.code_font"), |ui| {
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                let width = ui.available_width().min(320.0);
+                searchable_branch_dropdown(
+                    ui,
+                    egui::Id::new("settings_code_font_family"),
+                    &mut selected_code_family,
+                    &code_family_choices,
+                    width,
+                    i18n::t(language, "settings.font_auto"),
+                    i18n::t(language, "settings.font_search"),
+                );
+            });
+        });
+        let selected_code_family =
+            (!selected_code_family.is_empty()).then_some(selected_code_family);
+        if selected_code_family != self.code_font_family {
+            self.code_font_family = selected_code_family;
+            self.save_and_apply_font_selection(ui.ctx());
+        }
+
+        ui.add_space(8.0);
+        let mut selected_scale = self.ui_scale;
+        settings_field(ui, i18n::t(language, "settings.ui_scale"), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for scale in UI_SCALE_OPTIONS {
+                    let label = format!("{}%", (scale * 100.0).round() as i32);
+                    if settings_choice_button(
+                        ui,
+                        (selected_scale - scale).abs() <= f32::EPSILON,
+                        &label,
+                        68.0,
+                    )
+                    .clicked()
+                    {
+                        selected_scale = scale;
+                    }
+                }
+            });
+        });
+        if (selected_scale - self.ui_scale).abs() > f32::EPSILON {
+            self.set_ui_scale(ui.ctx(), selected_scale);
+        }
+
+        if self.font_catalog_task.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new(i18n::t(language, "settings.font_scanning"))
+                        .small()
+                        .color(theme::muted()),
+                );
+            });
+        } else if self.font_apply_task.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new(i18n::t(language, "settings.font_applying"))
+                        .small()
+                        .color(theme::muted()),
+                );
+            });
+        }
+        if let Some(error) = self.font_apply_error.as_deref() {
+            ui.label(RichText::new(error).small().color(theme::warning()));
+        }
     }
 
     fn global_hosting_accounts_settings(&mut self, ui: &mut Ui) {
@@ -25513,6 +25922,30 @@ fn theme_accent_label(language: Language, accent: theme::ThemeAccent) -> &'stati
         (_, theme::ThemeAccent::SunRed) => "Sun Red",
         (_, theme::ThemeAccent::DeepSeaBlue) => "Deep Sea Blue",
         (_, theme::ThemeAccent::ForestGreen) => "Forest Green",
+    }
+}
+
+fn font_weight_label(language: Language, weight: theme::FontWeight) -> &'static str {
+    match (language, weight) {
+        (Language::Chinese, theme::FontWeight::Regular) => "常规",
+        (Language::Chinese, theme::FontWeight::Medium) => "中等",
+        (Language::Chinese, theme::FontWeight::Semibold) => "半粗",
+        (Language::Chinese, theme::FontWeight::Bold) => "粗体",
+        (_, theme::FontWeight::Regular) => "Regular",
+        (_, theme::FontWeight::Medium) => "Medium",
+        (_, theme::FontWeight::Semibold) => "Semibold",
+        (_, theme::FontWeight::Bold) => "Bold",
+    }
+}
+
+fn text_contrast_label(language: Language, contrast: theme::TextContrast) -> &'static str {
+    match (language, contrast) {
+        (Language::Chinese, theme::TextContrast::Soft) => "柔和",
+        (Language::Chinese, theme::TextContrast::Standard) => "标准",
+        (Language::Chinese, theme::TextContrast::Strong) => "清晰",
+        (_, theme::TextContrast::Soft) => "Soft",
+        (_, theme::TextContrast::Standard) => "Standard",
+        (_, theme::TextContrast::Strong) => "Clear",
     }
 }
 
@@ -37242,8 +37675,9 @@ mod ui_tests {
             "fn create_patch_busy(&self) -> bool",
             "fn start_create_patch_task(",
             "self.create_patch_task = Some(receiver)",
+            "self.create_patch_root = Some(root.clone())",
             "git::create_patch(&root, &request)",
-            "|| self.create_patch_busy()",
+            "self.active_create_patch_busy()",
         ] {
             assert!(implementation.contains(required), "missing {required}");
         }
@@ -37749,6 +38183,11 @@ mod ui_tests {
             theme: SettingsThemeMode::Light,
             theme_accent: SettingsThemeAccent::Purple,
             background_pattern_enabled: false,
+            text_contrast: SettingsTextContrast::Soft,
+            ui_font_family: Some("Microsoft YaHei UI".to_owned()),
+            ui_font_weight: SettingsFontWeight::Medium,
+            code_font_family: Some("Cascadia Mono".to_owned()),
+            ui_scale: 1.1,
             beginner_tutorial_seen: true,
             language: SettingsLanguage::English,
             workspaces: vec![PathBuf::from(r"D:\code"), PathBuf::from(r"D:\work")],
@@ -37786,6 +38225,11 @@ mod ui_tests {
         assert!(raw.contains("\"theme\":\"Light\""));
         assert!(raw.contains("\"theme_accent\":\"Purple\""));
         assert!(raw.contains("\"background_pattern_enabled\":false"));
+        assert!(raw.contains("\"text_contrast\":\"Soft\""));
+        assert!(raw.contains("\"ui_font_family\":\"Microsoft YaHei UI\""));
+        assert!(raw.contains("\"ui_font_weight\":\"Medium\""));
+        assert!(raw.contains("\"code_font_family\":\"Cascadia Mono\""));
+        assert!(raw.contains("\"ui_scale\":1.1"));
         assert!(raw.contains("\"beginner_tutorial_seen\":true"));
         assert!(raw.contains("\"language\":\"English\""));
         assert!(raw.contains("\"workspaces\""));
@@ -37810,6 +38254,11 @@ mod ui_tests {
             [app_settings_default_start..app_settings_default_start + app_settings_default_end];
         assert!(app_settings_default_source.contains("theme: SettingsThemeMode::Light"));
         assert!(app_settings_default_source.contains("theme_accent: SettingsThemeAccent::Blue"));
+        assert!(
+            app_settings_default_source.contains("text_contrast: SettingsTextContrast::Standard")
+        );
+        assert!(app_settings_default_source.contains("ui_font_family: None"));
+        assert!(app_settings_default_source.contains("ui_scale: 1.0"));
 
         let app_data_start = source.find("fn app_data_dir()").unwrap();
         let app_data_end = source[app_data_start..]
@@ -37825,6 +38274,40 @@ mod ui_tests {
         assert_eq!(frame.fill, Color32::TRANSPARENT);
         assert_eq!(frame.stroke, Stroke::NONE);
         assert_eq!(frame.inner_margin.left, 0);
+    }
+
+    #[test]
+    fn interface_scale_is_limited_to_supported_layout_steps() {
+        assert_eq!(sanitize_ui_scale(f32::NAN), 1.0);
+        assert_eq!(sanitize_ui_scale(0.91), 0.9);
+        assert_eq!(sanitize_ui_scale(1.04), 1.0);
+        assert_eq!(sanitize_ui_scale(1.08), 1.1);
+        assert_eq!(sanitize_ui_scale(1.24), 1.25);
+        assert_eq!(AppSettings::default().ui_scale, 1.0);
+    }
+
+    #[test]
+    fn font_settings_use_async_loading_and_wrapped_compact_controls() {
+        let source = include_str!("app.rs");
+        let start = source.find("fn global_font_settings(&mut self").unwrap();
+        let end = source[start..]
+            .find("fn global_hosting_accounts_settings")
+            .unwrap();
+        let font_settings = &source[start..start + end];
+        assert!(font_settings.matches("horizontal_wrapped").count() >= 2);
+        assert!(font_settings.contains("UI_SCALE_OPTIONS"));
+        assert!(font_settings.contains("font_controls_busy"));
+
+        let poll_start = source.find("fn poll_font_tasks(&mut self").unwrap();
+        let poll_end = source[poll_start..].find("fn set_language").unwrap();
+        let polling = &source[poll_start..poll_start + poll_end];
+        assert!(polling.contains("try_recv"));
+        assert!(polling.contains("apply_loaded_font_set"));
+
+        let update_start = source.find("fn update(&mut self, ctx:").unwrap();
+        let update_end = source[update_start..].find("fn save(&mut self").unwrap();
+        let update = &source[update_start..update_start + update_end];
+        assert!(update.contains("self.poll_font_tasks(ctx)"));
     }
 
     #[test]
@@ -39533,8 +40016,7 @@ mod ui_tests {
             .find("fn show_toast(")
             .unwrap();
         let commit_source = &implementation_source[commit_start..commit_start + commit_end];
-        assert!(commit_source.contains("self.loading_repo"));
-        assert!(commit_source.contains("self.remote_git_busy()"));
+        assert!(commit_source.contains("self.branch_actions_busy()"));
         assert!(commit_source.contains("self.pending_commit_identity_warning.is_some()"));
         assert!(commit_source.contains("current_named_local_branch(snapshot)"));
         assert!(commit_source.contains("push.detached_error"));
@@ -39549,8 +40031,7 @@ mod ui_tests {
             .find("fn commit_action_row(")
             .unwrap();
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
-        assert!(panel_source.contains("&& !self.loading_repo"));
-        assert!(panel_source.contains("&& !self.remote_git_busy()"));
+        assert!(panel_source.contains("&& !self.branch_actions_busy()"));
     }
 
     #[test]
@@ -45600,10 +46081,10 @@ diff --git a/file.txt b/file.txt
                 .contains("remote_git_task: Option<Receiver<RemoteGitTaskResult>>")
         );
         assert!(implementation_source.contains("fn remote_git_busy(&self) -> bool"));
+        assert!(implementation_source.contains("fn active_remote_git_busy(&self) -> bool"));
         assert!(implementation_source.contains("fn start_remote_git_action("));
         assert!(
-            implementation_source
-                .contains("let repo_action_busy = self.loading_repo || self.remote_git_busy()")
+            implementation_source.contains("let repo_action_busy = self.branch_actions_busy()")
         );
         assert!(implementation_source.contains("!repo_action_busy && has_repo && has_remote"));
         assert!(implementation_source.contains("if self.remote_git_busy()"));
@@ -46954,10 +47435,10 @@ diff --git a/file.txt b/file.txt
             .find("fn repo_toolbar_loading_busy(")
             .unwrap();
         let busy_source = &implementation_source[busy_start..busy_start + busy_end];
-        assert!(busy_source.contains("self.loading_repo"));
-        assert!(busy_source.contains("self.branch_checkout_busy()"));
-        assert!(busy_source.contains("self.remote_git_busy()"));
-        assert!(busy_source.contains("self.merge_tool_busy()"));
+        assert!(busy_source.contains("self.active_repo_has_pending_load()"));
+        assert!(busy_source.contains("self.active_branch_checkout_busy()"));
+        assert!(busy_source.contains("self.active_remote_git_busy()"));
+        assert!(busy_source.contains("self.active_merge_tool_busy()"));
         assert!(
             implementation_source
                 .contains("let branch_actions_enabled = !self.branch_actions_busy();")
@@ -47001,6 +47482,85 @@ diff --git a/file.txt b/file.txt
             &implementation_source[remote_row_start..remote_row_start + remote_row_end];
         assert!(remote_row_source.contains("enabled: bool"));
         assert!(remote_row_source.contains("if enabled && response.double_clicked()"));
+    }
+
+    #[test]
+    fn repository_task_busy_state_is_scoped_to_the_active_repository() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for owner in [
+            "remote_git_root: Option<PathBuf>",
+            "repository_undo_root: Option<PathBuf>",
+            "branch_checkout_root: Option<PathBuf>",
+            "create_patch_root: Option<PathBuf>",
+            "repository_benchmark_root: Option<PathBuf>",
+            "merge_tool_root: Option<PathBuf>",
+            "external_diff_tool_root: Option<PathBuf>",
+        ] {
+            assert!(implementation.contains(owner), "missing task owner {owner}");
+        }
+
+        let busy_start = implementation
+            .find("fn branch_actions_busy(&self) -> bool")
+            .unwrap();
+        let busy_end = implementation[busy_start..]
+            .find("fn repo_toolbar_loading_busy(")
+            .unwrap();
+        let busy = &implementation[busy_start..busy_start + busy_end];
+        for active_gate in [
+            "self.active_branch_checkout_busy()",
+            "self.active_remote_git_busy()",
+            "self.active_background_remote_git_busy()",
+            "self.active_credential_login_busy()",
+            "self.active_repository_undo_busy()",
+            "self.active_create_patch_busy()",
+            "self.active_merge_tool_busy()",
+            "self.active_external_diff_tool_busy()",
+            "self.active_repository_benchmark_busy()",
+        ] {
+            assert!(
+                busy.contains(active_gate),
+                "missing active gate {active_gate}"
+            );
+        }
+        for global_gate in [
+            "self.branch_checkout_busy()",
+            "self.remote_git_busy()",
+            "self.repository_undo_busy()",
+            "self.create_patch_busy()",
+            "self.merge_tool_busy()",
+            "self.repository_benchmark_task.is_some()",
+        ] {
+            assert!(
+                !busy.contains(global_gate),
+                "active-repository gate leaked global state: {global_gate}"
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_reload_releases_its_owner_even_after_switching_tabs() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let poll_start = implementation.find("fn poll_tasks(").unwrap();
+        let poll_end = implementation[poll_start..]
+            .find("fn poll_merge_tool_task(")
+            .unwrap();
+        let poll = &implementation[poll_start..poll_start + poll_end];
+
+        assert!(poll.contains(
+            "if was_foreground {\n                            self.finish_conflict_merge_reload_for(&requested_root);"
+        ));
+        assert!(poll.contains(
+            "if was_foreground {\n                    self.finish_conflict_merge_reload_for_key(&key);"
+        ));
+        assert!(!poll.contains(
+            "if was_foreground && self.active_repo_root_matches(&requested_root) {\n                            self.finish_conflict_merge_reload_for"
+        ));
+        assert!(!poll.contains(
+            "if was_foreground && self.active_repo_key_matches(&key) {\n                    self.finish_conflict_merge_reload_for_key"
+        ));
     }
 
     #[test]
@@ -47170,6 +47730,17 @@ diff --git a/file.txt b/file.txt
         assert!(
             clear_view_source.contains("self.preserve_commit_message_focus_on_snapshot = false")
         );
+        for cancelled_task in [
+            "self.details_task = None",
+            "self.diff_task = None",
+            "self.file_search_task = None",
+            "self.blame_task = None",
+        ] {
+            assert!(
+                clear_view_source.contains(cancelled_task),
+                "repository transition must cancel stale task {cancelled_task}"
+            );
+        }
 
         let focus_start = implementation_source
             .find("fn clear_focus_before_repository_snapshot_ui(")

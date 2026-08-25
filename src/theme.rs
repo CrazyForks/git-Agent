@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -15,6 +15,7 @@ use serde::Deserialize;
 
 static THEME_MODE: AtomicU8 = AtomicU8::new(1);
 static THEME_ACCENT: AtomicU8 = AtomicU8::new(1);
+static TEXT_CONTRAST: AtomicU8 = AtomicU8::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThemeMode {
@@ -33,6 +34,103 @@ pub enum ThemeAccent {
     DeepSeaBlue,
     ForestGreen,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextContrast {
+    Soft,
+    #[default]
+    Standard,
+    Strong,
+}
+
+impl TextContrast {
+    pub const ALL: [Self; 3] = [Self::Soft, Self::Standard, Self::Strong];
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FontWeight {
+    #[default]
+    Regular,
+    Medium,
+    Semibold,
+    Bold,
+}
+
+impl FontWeight {
+    pub const ALL: [Self; 4] = [Self::Regular, Self::Medium, Self::Semibold, Self::Bold];
+
+    fn numeric(self) -> u16 {
+        match self {
+            Self::Regular => 400,
+            Self::Medium => 500,
+            Self::Semibold => 600,
+            Self::Bold => 700,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FontSelection {
+    pub ui_family: Option<String>,
+    pub ui_weight: FontWeight,
+    pub code_family: Option<String>,
+}
+
+impl Default for FontSelection {
+    fn default() -> Self {
+        Self {
+            ui_family: None,
+            ui_weight: FontWeight::Regular,
+            code_family: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SystemFontFace {
+    weight: FontWeight,
+    path: PathBuf,
+    index: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct SystemFontFamily {
+    pub name: String,
+    pub monospaced: bool,
+    faces: Vec<SystemFontFace>,
+}
+
+impl SystemFontFamily {
+    pub fn weights(&self) -> Vec<FontWeight> {
+        let mut weights = self
+            .faces
+            .iter()
+            .map(|face| face.weight)
+            .collect::<Vec<_>>();
+        weights.sort_unstable();
+        weights.dedup();
+        weights
+    }
+}
+
+pub fn font_family_names(catalog: &[SystemFontFamily], monospaced_only: bool) -> Vec<String> {
+    catalog
+        .iter()
+        .filter(|family| !monospaced_only || family.monospaced)
+        .map(|family| family.name.clone())
+        .collect()
+}
+
+pub fn available_font_weights(
+    catalog: &[SystemFontFamily],
+    family: Option<&str>,
+) -> Vec<FontWeight> {
+    resolve_font_family(catalog, family, false)
+        .map(SystemFontFamily::weights)
+        .unwrap_or_else(|| vec![FontWeight::Regular])
+}
+
+pub struct LoadedFontSet(FontDefinitions);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
@@ -289,7 +387,7 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
         Ordering::Relaxed,
     );
     THEME_ACCENT.store(accent_index(accent), Ordering::Relaxed);
-    let palette = palette_for(mode, accent);
+    let palette = palette_with_text_contrast(mode, accent, current_text_contrast());
     let mut visuals = match mode {
         ThemeMode::Dark => Visuals::dark(),
         ThemeMode::Light => Visuals::light(),
@@ -391,7 +489,64 @@ pub fn current_accent() -> ThemeAccent {
 }
 
 pub fn palette(mode: ThemeMode) -> Palette {
-    palette_for(mode, current_accent())
+    palette_with_text_contrast(mode, current_accent(), current_text_contrast())
+}
+
+pub fn current_text_contrast() -> TextContrast {
+    match TEXT_CONTRAST.load(Ordering::Relaxed) {
+        0 => TextContrast::Soft,
+        2 => TextContrast::Strong,
+        _ => TextContrast::Standard,
+    }
+}
+
+pub fn set_text_contrast(ctx: &egui::Context, contrast: TextContrast) {
+    let value = match contrast {
+        TextContrast::Soft => 0,
+        TextContrast::Standard => 1,
+        TextContrast::Strong => 2,
+    };
+    if TEXT_CONTRAST.swap(value, Ordering::Relaxed) != value {
+        apply(ctx, current_mode(), current_accent());
+    }
+}
+
+fn palette_with_text_contrast(
+    mode: ThemeMode,
+    accent: ThemeAccent,
+    contrast: TextContrast,
+) -> Palette {
+    let mut palette = palette_for(mode, accent);
+    let contrast_target = match (mode, contrast) {
+        (_, TextContrast::Standard) => return palette,
+        (ThemeMode::Light, TextContrast::Soft) => palette.panel,
+        (ThemeMode::Dark, TextContrast::Soft) => palette.panel,
+        (ThemeMode::Light, TextContrast::Strong) => Color32::BLACK,
+        (ThemeMode::Dark, TextContrast::Strong) => Color32::WHITE,
+    };
+    let (text_amount, muted_amount) = match contrast {
+        TextContrast::Soft => (0.18, 0.12),
+        TextContrast::Strong => (0.12, 0.08),
+        TextContrast::Standard => unreachable!(),
+    };
+    palette.text = mix_color(palette.text, contrast_target, text_amount);
+    palette.muted = mix_color(palette.muted, contrast_target, muted_amount);
+    palette
+}
+
+fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let mix = |from: u8, to: u8| {
+        (from as f32 + (to as f32 - from as f32) * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_unmultiplied(
+        mix(from.r(), to.r()),
+        mix(from.g(), to.g()),
+        mix(from.b(), to.b()),
+        mix(from.a(), to.a()),
+    )
 }
 
 pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
@@ -1068,39 +1223,364 @@ mod tests {
         assert!(!apply_if_needed(&ctx, ThemeMode::Dark, ThemeAccent::Blue));
         assert!(apply_if_needed(&ctx, ThemeMode::Dark, ThemeAccent::Orange));
     }
+
+    #[test]
+    fn supported_font_weights_only_expose_real_readable_faces() {
+        assert_eq!(supported_font_weight(400), Some(FontWeight::Regular));
+        assert_eq!(supported_font_weight(500), Some(FontWeight::Medium));
+        assert_eq!(supported_font_weight(600), Some(FontWeight::Semibold));
+        assert_eq!(supported_font_weight(700), Some(FontWeight::Bold));
+        assert_eq!(supported_font_weight(100), None);
+        assert_eq!(supported_font_weight(900), None);
+    }
+
+    #[test]
+    fn code_font_detection_accepts_mono_names_without_trusting_fixed_pitch_only() {
+        assert!(looks_like_monospace_font("Maple Mono NF CN"));
+        assert!(looks_like_monospace_font("MapleMono-NF-CN-Regular"));
+        assert!(looks_like_monospace_font("JetBrainsMono"));
+        assert!(looks_like_monospace_font("Some Fixed Pitch Font"));
+        assert!(!looks_like_monospace_font("Monotype Corsiva"));
+        assert!(!looks_like_monospace_font("Noto Sans SC"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn installed_maple_mono_is_available_to_the_code_font_pool() {
+        let Some(user_profile) = std::env::var_os("USERPROFILE") else {
+            return;
+        };
+        let user_font_dir = PathBuf::from(user_profile)
+            .join("AppData")
+            .join("Local")
+            .join("Microsoft")
+            .join("Windows")
+            .join("Fonts");
+        let maple_is_installed = fs::read_dir(user_font_dir).ok().is_some_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("maplemono")
+            })
+        });
+        if !maple_is_installed {
+            return;
+        }
+
+        let catalog = scan_system_fonts();
+        assert!(catalog.iter().any(|family| {
+            family.monospaced && family.name.to_lowercase().contains("maple mono")
+        }));
+    }
+
+    #[test]
+    fn automatic_font_resolution_prefers_ui_and_code_system_defaults() {
+        let family = |name: &str, monospaced: bool| SystemFontFamily {
+            name: name.to_owned(),
+            monospaced,
+            faces: vec![SystemFontFace {
+                weight: FontWeight::Regular,
+                path: PathBuf::from(format!("{name}.ttf")),
+                index: 0,
+            }],
+        };
+        let catalog = vec![
+            family("Arial", false),
+            family("Consolas", true),
+            family("Microsoft YaHei UI", false),
+            family("Noto Sans SC", false),
+            family("Cascadia Mono", true),
+        ];
+
+        assert_eq!(
+            resolve_font_family(&catalog, None, false).map(|font| font.name.as_str()),
+            Some("Noto Sans SC")
+        );
+        assert_eq!(
+            resolve_font_family(&catalog, None, true).map(|font| font.name.as_str()),
+            Some("Cascadia Mono")
+        );
+        assert_eq!(
+            resolve_font_family(&catalog, Some("Arial"), false).map(|font| font.name.as_str()),
+            Some("Arial")
+        );
+        assert_eq!(
+            resolve_font_family(&catalog, Some("Cascadia Mono"), false)
+                .map(|font| font.name.as_str()),
+            Some("Cascadia Mono")
+        );
+        assert!(font_family_names(&catalog, false).contains(&"Cascadia Mono".to_owned()));
+        assert!(!font_family_names(&catalog, true).contains(&"Arial".to_owned()));
+    }
+
+    #[test]
+    fn text_contrast_adjusts_text_without_changing_theme_tokens() {
+        let luminance = |color: Color32| {
+            0.2126 * color.r() as f32 + 0.7152 * color.g() as f32 + 0.0722 * color.b() as f32
+        };
+        let light_standard = palette_for(ThemeMode::Light, ThemeAccent::Blue);
+        let light_soft =
+            palette_with_text_contrast(ThemeMode::Light, ThemeAccent::Blue, TextContrast::Soft);
+        let light_strong =
+            palette_with_text_contrast(ThemeMode::Light, ThemeAccent::Blue, TextContrast::Strong);
+        assert!(luminance(light_soft.text) > luminance(light_standard.text));
+        assert!(luminance(light_strong.text) < luminance(light_standard.text));
+
+        let dark_standard = palette_for(ThemeMode::Dark, ThemeAccent::Blue);
+        let dark_soft =
+            palette_with_text_contrast(ThemeMode::Dark, ThemeAccent::Blue, TextContrast::Soft);
+        let dark_strong =
+            palette_with_text_contrast(ThemeMode::Dark, ThemeAccent::Blue, TextContrast::Strong);
+        assert!(luminance(dark_soft.text) < luminance(dark_standard.text));
+        assert!(luminance(dark_strong.text) > luminance(dark_standard.text));
+        assert_eq!(
+            palette_for(ThemeMode::Light, ThemeAccent::Blue).text,
+            light_standard.text
+        );
+    }
 }
 
 fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(default_font_definitions());
+}
+
+fn default_font_definitions() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
-
-    if let Some((name, bytes)) = load_system_cjk_font() {
-        fonts
-            .font_data
-            .insert(name.clone(), FontData::from_owned(bytes).into());
-
-        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+    if let Some(path) = system_cjk_font_path() {
+        if let Ok(bytes) = std::fs::read(path) {
+            let name = "system_cjk_fallback".to_owned();
+            fonts
+                .font_data
+                .insert(name.clone(), FontData::from_owned(bytes).into());
             fonts
                 .families
-                .entry(family)
+                .entry(FontFamily::Proportional)
                 .or_default()
                 .insert(0, name.clone());
+            fonts
+                .families
+                .entry(FontFamily::Monospace)
+                .or_default()
+                .push(name);
+        }
+    }
+    fonts
+}
+
+fn system_cjk_font_path() -> Option<PathBuf> {
+    [
+        r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+}
+
+pub fn scan_system_fonts() -> Vec<SystemFontFamily> {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    let mut families = BTreeMap::<(String, bool), SystemFontFamily>::new();
+
+    for face in database.faces() {
+        if face.style != fontdb::Style::Normal {
+            continue;
+        }
+        let path = match &face.source {
+            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path.clone(),
+            fontdb::Source::Binary(_) => continue,
+        };
+        let supports_basic_latin = database
+            .with_face_data(face.id, |data, index| {
+                ttf_parser::Face::parse(data, index)
+                    .ok()
+                    .is_some_and(|font| {
+                        ['A', 'a', '0']
+                            .into_iter()
+                            .all(|c| font.glyph_index(c).is_some())
+                    })
+            })
+            .unwrap_or(false);
+        if !supports_basic_latin {
+            continue;
+        }
+        let Some((family_name, _)) = face.families.first() else {
+            continue;
+        };
+        let monospaced = face.monospaced
+            || looks_like_monospace_font(family_name)
+            || looks_like_monospace_font(&face.post_script_name)
+            || path
+                .file_stem()
+                .is_some_and(|name| looks_like_monospace_font(&name.to_string_lossy()));
+        let Some(weight) = supported_font_weight(face.weight.0) else {
+            continue;
+        };
+        let key = (family_name.to_lowercase(), monospaced);
+        let family = families.entry(key).or_insert_with(|| SystemFontFamily {
+            name: family_name.clone(),
+            monospaced,
+            faces: Vec::new(),
+        });
+        if !family
+            .faces
+            .iter()
+            .any(|candidate| candidate.weight == weight)
+        {
+            family.faces.push(SystemFontFace {
+                weight,
+                path,
+                index: face.index,
+            });
         }
     }
 
-    ctx.set_fonts(fonts);
+    let mut families = families.into_values().collect::<Vec<_>>();
+    for family in &mut families {
+        family.faces.sort_by_key(|face| face.weight);
+    }
+    families.sort_by_key(|family| family.name.to_lowercase());
+    families
 }
 
-fn load_system_cjk_font() -> Option<(String, Vec<u8>)> {
-    [
-        ("noto_sans_sc", r"C:\Windows\Fonts\NotoSansSC-VF.ttf"),
-        ("microsoft_yahei", r"C:\Windows\Fonts\msyh.ttc"),
-        ("simhei", r"C:\Windows\Fonts\simhei.ttf"),
-        ("simsun", r"C:\Windows\Fonts\simsun.ttc"),
-    ]
-    .into_iter()
-    .find_map(|(name, path)| {
-        std::fs::read(path)
-            .ok()
-            .map(|bytes| (name.to_owned(), bytes))
-    })
+fn supported_font_weight(weight: u16) -> Option<FontWeight> {
+    match weight {
+        350..=450 => Some(FontWeight::Regular),
+        451..=550 => Some(FontWeight::Medium),
+        551..=650 => Some(FontWeight::Semibold),
+        651..=750 => Some(FontWeight::Bold),
+        _ => None,
+    }
+}
+
+fn looks_like_monospace_font(name: &str) -> bool {
+    let normalized = name.to_lowercase().replace(['_', '-'], " ");
+    (normalized.contains("mono") && !normalized.contains("monotype"))
+        || normalized.contains("fixed pitch")
+        || normalized.contains("code nerd font")
+}
+
+pub fn load_font_set(
+    selection: &FontSelection,
+    catalog: &[SystemFontFamily],
+) -> Result<LoadedFontSet, String> {
+    let mut fonts = FontDefinitions::default();
+    let mut registered = HashMap::<(PathBuf, u32), String>::new();
+
+    let ui_family = resolve_font_family(catalog, selection.ui_family.as_deref(), false);
+    if let Some(face) = ui_family.and_then(|family| closest_face(family, selection.ui_weight)) {
+        let name = register_font_face(&mut fonts, &mut registered, face)?;
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, name);
+    }
+
+    let code_family = resolve_font_family(catalog, selection.code_family.as_deref(), true);
+    if let Some(face) = code_family.and_then(|family| closest_face(family, FontWeight::Regular)) {
+        let name = register_font_face(&mut fonts, &mut registered, face)?;
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, name);
+    }
+
+    if let Some(path) = system_cjk_font_path() {
+        let fallback = SystemFontFace {
+            weight: FontWeight::Regular,
+            path,
+            index: 0,
+        };
+        if let Ok(name) = register_font_face(&mut fonts, &mut registered, &fallback) {
+            let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+            if ui_family.is_none() {
+                proportional.insert(0, name.clone());
+            } else if !proportional.contains(&name) {
+                proportional.push(name.clone());
+            }
+            let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
+            if !monospace.contains(&name) {
+                monospace.push(name);
+            }
+        }
+    }
+
+    Ok(LoadedFontSet(fonts))
+}
+
+pub fn apply_loaded_font_set(ctx: &egui::Context, fonts: LoadedFontSet) {
+    ctx.set_fonts(fonts.0);
+}
+
+fn resolve_font_family<'a>(
+    catalog: &'a [SystemFontFamily],
+    requested: Option<&str>,
+    monospaced_only: bool,
+) -> Option<&'a SystemFontFamily> {
+    if let Some(requested) = requested {
+        return catalog.iter().find(|family| {
+            (!monospaced_only || family.monospaced) && family.name.eq_ignore_ascii_case(requested)
+        });
+    }
+
+    let priorities: &[&str] = if monospaced_only {
+        &[
+            "Cascadia Mono",
+            "Cascadia Code",
+            "JetBrains Mono",
+            "Consolas",
+        ]
+    } else {
+        &[
+            "Noto Sans SC",
+            "Noto Sans CJK SC",
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "Segoe UI",
+        ]
+    };
+    priorities
+        .iter()
+        .find_map(|name| {
+            catalog.iter().find(|family| {
+                (!monospaced_only || family.monospaced) && family.name.eq_ignore_ascii_case(name)
+            })
+        })
+        .or_else(|| {
+            catalog
+                .iter()
+                .find(|family| !monospaced_only || family.monospaced)
+        })
+}
+
+fn closest_face(family: &SystemFontFamily, weight: FontWeight) -> Option<&SystemFontFace> {
+    family
+        .faces
+        .iter()
+        .min_by_key(|face| face.weight.numeric().abs_diff(weight.numeric()))
+}
+
+fn register_font_face(
+    fonts: &mut FontDefinitions,
+    registered: &mut HashMap<(PathBuf, u32), String>,
+    face: &SystemFontFace,
+) -> Result<String, String> {
+    let key = (face.path.clone(), face.index);
+    if let Some(name) = registered.get(&key) {
+        return Ok(name.clone());
+    }
+    let bytes = fs::read(&face.path)
+        .map_err(|error| format!("Unable to load font {}: {error}", face.path.display()))?;
+    let name = format!("system_font_{}", registered.len());
+    let mut data = FontData::from_owned(bytes);
+    data.index = face.index;
+    fonts.font_data.insert(name.clone(), data.into());
+    registered.insert(key, name.clone());
+    Ok(name)
 }
