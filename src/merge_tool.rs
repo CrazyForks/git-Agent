@@ -20,6 +20,7 @@ use eframe::{
     egui::{
         self, Align, Align2, Color32, ComboBox, CursorIcon, FontId, Layout, Pos2, Rect, RichText,
         ScrollArea, Sense, Ui, Vec2,
+        text::{LayoutJob, TextFormat},
     },
 };
 use similar::{Algorithm, DiffTag, capture_diff_slices};
@@ -27,7 +28,10 @@ use similar::{Algorithm, DiffTag, capture_diff_slices};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-use crate::dialog;
+use crate::{
+    dialog,
+    syntax::{HighlightedDocument, HighlightedLine, SyntaxRole},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MergeTheme {
@@ -69,6 +73,13 @@ struct MergeSourceText {
     base: String,
     local: String,
     remote: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MergeSyntaxHighlights {
+    local: Option<HighlightedDocument>,
+    remote: Option<HighlightedDocument>,
+    result: Option<HighlightedDocument>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +148,7 @@ struct PreparedMergeDocument {
     remote_scroll_anchors: Vec<(f32, f32)>,
     local_navigation_target: Option<MergeLineActionTarget>,
     remote_navigation_target: Option<MergeLineActionTarget>,
+    syntax_highlights: MergeSyntaxHighlights,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1333,6 +1345,10 @@ pub struct MergeToolApp {
     collapse_unchanged: bool,
     search: MergeSearchState,
     hovered_search_pane: Option<MergeSearchPane>,
+    syntax_highlights: MergeSyntaxHighlights,
+    result_highlight_task: Option<Receiver<(u64, Option<HighlightedDocument>)>>,
+    result_highlight_revision: u64,
+    result_highlight_due: Option<Instant>,
 }
 
 impl MergeToolApp {
@@ -1361,7 +1377,11 @@ impl MergeToolApp {
         let manual_result_lines = merge_result_display_rows(&document)
             .into_iter()
             .map(|row| row.text.to_owned())
-            .collect();
+            .collect::<Vec<_>>();
+        let result_highlight = highlight_merge_source(
+            &args,
+            &merge_highlight_source_from_lines(&manual_result_lines),
+        );
         let local_display_rows = cached_merge_side_display_rows(&document, MergeSide::Local);
         let remote_display_rows = cached_merge_side_display_rows(&document, MergeSide::Remote);
         let result_display_rows = merge_result_display_rows(&document);
@@ -1429,6 +1449,13 @@ impl MergeToolApp {
             collapse_unchanged: false,
             search: MergeSearchState::default(),
             hovered_search_pane: None,
+            syntax_highlights: MergeSyntaxHighlights {
+                result: result_highlight,
+                ..Default::default()
+            },
+            result_highlight_task: None,
+            result_highlight_revision: 0,
+            result_highlight_due: None,
         }
     }
 
@@ -1478,6 +1505,10 @@ impl MergeToolApp {
             collapse_unchanged: false,
             search: MergeSearchState::default(),
             hovered_search_pane: None,
+            syntax_highlights: prepared.syntax_highlights,
+            result_highlight_task: None,
+            result_highlight_revision: 0,
+            result_highlight_due: None,
         }
     }
 
@@ -1546,6 +1577,7 @@ impl MergeToolApp {
         self.ai_overlay_offsets = snapshot.ai_overlay_offsets;
         self.ai_logged_missing_anchors.clear();
         self.rebuild_display_rows();
+        self.schedule_result_highlight();
     }
 
     fn reset_from_sources(&mut self, ignore_mode: MergeIgnoreMode) {
@@ -1579,6 +1611,7 @@ impl MergeToolApp {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.rebuild_display_rows();
+        self.schedule_result_highlight();
     }
 
     fn finish_document_edit(&mut self, before: MergeEditSnapshot) {
@@ -1586,6 +1619,7 @@ impl MergeToolApp {
         if self.snapshot() != before {
             self.undo_stack.push(before);
             self.redo_stack.clear();
+            self.schedule_result_highlight();
         }
     }
 
@@ -2008,6 +2042,52 @@ impl MergeToolApp {
             self.result_text.push('\n');
         }
         self.finish_document_edit(before);
+    }
+
+    fn schedule_result_highlight(&mut self) {
+        self.result_highlight_revision = self.result_highlight_revision.wrapping_add(1);
+        self.result_highlight_due = Some(Instant::now() + Duration::from_millis(140));
+    }
+
+    fn poll_result_highlight(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = self.result_highlight_task.take() {
+            match receiver.try_recv() {
+                Ok((revision, highlight)) => {
+                    if revision == self.result_highlight_revision {
+                        self.syntax_highlights.result = highlight;
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.result_highlight_task = Some(receiver);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+
+        let Some(due) = self.result_highlight_due else {
+            return;
+        };
+        if self.result_highlight_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(30));
+            return;
+        }
+        if Instant::now() < due {
+            ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+            return;
+        }
+
+        self.result_highlight_due = None;
+        let revision = self.result_highlight_revision;
+        let args = self.args.clone();
+        let source = merge_highlight_source_from_lines(&self.manual_result_lines);
+        let (sender, receiver) = mpsc::channel();
+        self.result_highlight_task = Some(receiver);
+        thread::spawn(move || {
+            let highlight = highlight_merge_source(&args, &source);
+            let _ = sender.send((revision, highlight));
+        });
+        ctx.request_repaint_after(Duration::from_millis(30));
     }
 
     fn toggle_theme(&mut self, ctx: &egui::Context) {
@@ -4062,6 +4142,7 @@ fn normalize_merge_ai_code(value: &str) -> String {
 impl App for MergeToolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_load_task(ctx);
+        self.poll_result_highlight(ctx);
         self.poll_write_task(ctx);
         self.poll_ai_task(ctx);
         self.handle_close_request(ctx);
@@ -4155,6 +4236,7 @@ fn load_merge_document(
     });
     let prepare_started_at = Instant::now();
     let prepared = prepare_merge_document(
+        args,
         document,
         MergeSourceText {
             base,
@@ -4177,6 +4259,7 @@ fn load_merge_document(
 }
 
 fn prepare_merge_document(
+    args: &MergeArgs,
     document: MergeDocument,
     sources: MergeSourceText,
 ) -> PreparedMergeDocument {
@@ -4185,7 +4268,7 @@ fn prepare_merge_document(
     let manual_result_lines = result_display_rows
         .iter()
         .map(|row| row.text.to_owned())
-        .collect();
+        .collect::<Vec<_>>();
     let local_display_rows = cached_merge_side_display_rows(&document, MergeSide::Local);
     let remote_display_rows = cached_merge_side_display_rows(&document, MergeSide::Remote);
     let local_scroll_anchors = merge_cached_scroll_anchors(
@@ -4207,6 +4290,17 @@ fn prepare_merge_document(
         .first()
         .copied();
     let initial_document = document.clone();
+    let repository_root = merge_syntax_repository_root(args);
+    let path = merge_syntax_path(args);
+    let syntax_highlights = MergeSyntaxHighlights {
+        local: crate::syntax::highlight_document(&repository_root, &path, &sources.local),
+        remote: crate::syntax::highlight_document(&repository_root, &path, &sources.remote),
+        result: crate::syntax::highlight_document(
+            &repository_root,
+            &path,
+            &merge_highlight_source_from_lines(&manual_result_lines),
+        ),
+    };
     PreparedMergeDocument {
         initial_document,
         document,
@@ -4219,7 +4313,40 @@ fn prepare_merge_document(
         remote_scroll_anchors,
         local_navigation_target,
         remote_navigation_target,
+        syntax_highlights,
     }
+}
+
+fn merge_syntax_repository_root(args: &MergeArgs) -> PathBuf {
+    args.repo_root
+        .clone()
+        .or_else(|| args.output.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn merge_syntax_path(args: &MergeArgs) -> String {
+    let relative = args
+        .repo_root
+        .as_deref()
+        .and_then(|root| args.output.strip_prefix(root).ok())
+        .unwrap_or(&args.output);
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+fn highlight_merge_source(args: &MergeArgs, source: &str) -> Option<HighlightedDocument> {
+    crate::syntax::highlight_document(
+        &merge_syntax_repository_root(args),
+        &merge_syntax_path(args),
+        source,
+    )
+}
+
+fn merge_highlight_source_from_lines(lines: &[String]) -> String {
+    let mut source = lines.join("\n");
+    if !source.is_empty() {
+        source.push('\n');
+    }
+    source
 }
 
 fn parse_theme(value: &str) -> anyhow::Result<MergeTheme> {
@@ -5993,6 +6120,13 @@ fn merge_side_panel(
                         continue;
                     }
                     let row = &rows[display_index];
+                    let highlighted_line = row.line_number.and_then(|line_number| {
+                        let document = match side {
+                            MergeSide::Local => app.syntax_highlights.local.as_ref(),
+                            MergeSide::Remote => app.syntax_highlights.remote.as_ref(),
+                        }?;
+                        document.lines.get(line_number.saturating_sub(1))
+                    });
                     let background = merge_side_background_run(
                         rows,
                         display_index,
@@ -6007,6 +6141,7 @@ fn merge_side_panel(
                         row.line_number,
                         side,
                         &row.text,
+                        highlighted_line,
                         row.reference_text.as_deref(),
                         row.conflict_index,
                         row.side_resolved,
@@ -6164,10 +6299,16 @@ fn merge_result_panel(
                         .as_ref()
                         .and_then(|rows| rows.get(result_index))
                         .and_then(|row| row.reference_text);
+                    let highlighted_line = app
+                        .syntax_highlights
+                        .result
+                        .as_ref()
+                        .and_then(|document| document.lines.get(result_index));
                     let (rect, before_line) = merge_editable_result_row(
                         ui,
                         result_index,
                         &mut app.manual_result_lines[result_index],
+                        highlighted_line,
                         tone,
                         background,
                         app.highlight_mode,
@@ -6723,6 +6864,7 @@ fn merge_code_row(
     line_number: Option<usize>,
     side: MergeSide,
     text: &str,
+    highlighted_line: Option<&HighlightedLine>,
     reference_text: Option<&str>,
     conflict_index: Option<usize>,
     side_resolved: bool,
@@ -6813,14 +6955,18 @@ fn merge_code_row(
             text,
             reference_text.unwrap_or(""),
             text_color,
+            highlighted_line,
+            palette,
         );
     } else {
-        ui.painter().with_clip_rect(text_clip_rect).text(
-            text_rect.left_center(),
-            Align2::LEFT_CENTER,
+        paint_merge_syntax_text(
+            ui,
+            text_rect,
+            text_clip_rect,
             text,
-            FontId::monospace(MERGE_CODE_FONT_SIZE),
+            highlighted_line,
             text_color,
+            palette,
         );
     }
     rect
@@ -6833,16 +6979,98 @@ fn paint_word_highlight_text(
     text: &str,
     reference: &str,
     text_color: Color32,
+    highlighted_line: Option<&HighlightedLine>,
+    palette: MergePalette,
 ) {
-    let font = FontId::monospace(MERGE_CODE_FONT_SIZE);
     paint_word_highlight_backgrounds(ui, text_rect, text_clip_rect, text, reference, text_color);
-    ui.painter().with_clip_rect(text_clip_rect).text(
-        text_rect.left_center(),
-        Align2::LEFT_CENTER,
+    paint_merge_syntax_text(
+        ui,
+        text_rect,
+        text_clip_rect,
         text,
-        font,
+        highlighted_line,
         text_color,
+        palette,
     );
+}
+
+fn paint_merge_syntax_text(
+    ui: &Ui,
+    text_rect: Rect,
+    text_clip_rect: Rect,
+    text: &str,
+    highlighted_line: Option<&HighlightedLine>,
+    base_color: Color32,
+    palette: MergePalette,
+) {
+    let painter = ui.painter().with_clip_rect(text_clip_rect);
+    let galley = painter.layout_job(merge_syntax_layout_job(
+        text,
+        highlighted_line,
+        base_color,
+        palette,
+        MERGE_CODE_FONT_SIZE,
+    ));
+    painter.galley(
+        Pos2::new(
+            text_rect.left(),
+            text_rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        base_color,
+    );
+}
+
+fn merge_syntax_layout_job(
+    text: &str,
+    highlighted_line: Option<&HighlightedLine>,
+    base_color: Color32,
+    palette: MergePalette,
+    font_size: f32,
+) -> LayoutJob {
+    let font_id = FontId::monospace(font_size);
+    let format = |color| TextFormat {
+        font_id: font_id.clone(),
+        color,
+        ..TextFormat::default()
+    };
+    let mut job = LayoutJob::default();
+    let mut cursor = 0usize;
+    if let Some(highlighted_line) = highlighted_line {
+        for span in &highlighted_line.spans {
+            let start = span.start.min(text.len());
+            let end = span.end.min(text.len());
+            if start < cursor
+                || start >= end
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+            {
+                continue;
+            }
+            if cursor < start {
+                job.append(&text[cursor..start], 0.0, format(base_color));
+            }
+            job.append(
+                &text[start..end],
+                0.0,
+                format(merge_syntax_color(span.role, palette)),
+            );
+            cursor = end;
+        }
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, format(base_color));
+    }
+    job
+}
+
+fn merge_syntax_color(role: SyntaxRole, palette: MergePalette) -> Color32 {
+    let mode = if palette.bg.r() < 128 {
+        crate::theme::ThemeMode::Dark
+    } else {
+        crate::theme::ThemeMode::Light
+    };
+    crate::theme::syntax_color_for_mode(role, mode)
 }
 
 fn paint_word_highlight_backgrounds(
@@ -7555,6 +7783,7 @@ fn merge_editable_result_row(
     ui: &mut Ui,
     index: usize,
     text: &mut String,
+    highlighted_line: Option<&HighlightedLine>,
     tone: MergeSideLineTone,
     background: Option<(Color32, usize)>,
     highlight_mode: MergeHighlightMode,
@@ -7632,6 +7861,17 @@ fn merge_editable_result_row(
     let before = text.clone();
     let previous_clip_rect = ui.clip_rect();
     ui.set_clip_rect(previous_clip_rect.intersect(text_clip_rect));
+    let mut layouter = |ui: &Ui, value: &str, wrap_width: f32| {
+        let mut job = merge_syntax_layout_job(
+            value,
+            highlighted_line,
+            text_color,
+            palette,
+            MERGE_CODE_FONT_SIZE,
+        );
+        job.wrap.max_width = wrap_width;
+        ui.fonts(|fonts| fonts.layout_job(job))
+    };
     let changed = ui
         .put(
             text_rect,
@@ -7642,6 +7882,7 @@ fn merge_editable_result_row(
                 .margin(egui::Margin::ZERO)
                 .font(FontId::monospace(MERGE_CODE_FONT_SIZE))
                 .text_color(text_color)
+                .layouter(&mut layouter)
                 .desired_width(text_rect.width()),
         )
         .changed()
@@ -10839,7 +11080,7 @@ export function quote(total: number): number {
 
         let started_at = Instant::now();
         let document = three_way_merge(&sources.base, &sources.local, &sources.remote);
-        let prepared = prepare_merge_document(document, sources);
+        let prepared = prepare_merge_document(&test_merge_args(), document, sources);
         let elapsed = started_at.elapsed();
 
         assert_eq!(prepared.document.unresolved_conflict_count(), 3);
@@ -10849,6 +11090,36 @@ export function quote(total: number): number {
             elapsed < Duration::from_secs(15),
             "large sparse merge preparation took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn merge_preparation_highlights_both_sides_and_the_displayed_result() {
+        let base = "export const value = 1\n";
+        let local = "export const value = 2\n";
+        let remote = "export const value = 3\n";
+        let sources = MergeSourceText {
+            base: base.to_owned(),
+            local: local.to_owned(),
+            remote: remote.to_owned(),
+        };
+        let args = MergeArgs {
+            output: PathBuf::from("src/view.ts"),
+            ..test_merge_args()
+        };
+        let prepared = prepare_merge_document(&args, three_way_merge(base, local, remote), sources);
+
+        for document in [
+            prepared.syntax_highlights.local.as_ref(),
+            prepared.syntax_highlights.remote.as_ref(),
+            prepared.syntax_highlights.result.as_ref(),
+        ] {
+            assert!(document.is_some());
+            assert!(document.unwrap().lines.iter().any(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.role == SyntaxRole::Keyword)
+            }));
+        }
     }
 
     #[test]
@@ -11000,6 +11271,41 @@ export function quote(total: number): number {
         assert!(app.redo());
         assert!(app.manual_result_override);
         assert_eq!(app.result_text, "keep\nmanual result\nend\n");
+    }
+
+    #[test]
+    fn manual_result_edit_rehighlights_in_a_background_task() {
+        let args = MergeArgs {
+            output: PathBuf::from("src/view.ts"),
+            ..test_merge_args()
+        };
+        let document = three_way_merge(
+            "export const value = 1\n",
+            "export const value = 1\n",
+            "export const value = 1\n",
+        );
+        let mut app = MergeToolApp::new(args, document);
+        let before = app.snapshot();
+        app.manual_result_lines = vec!["export function updated() {}".to_owned()];
+        app.finish_manual_result_edit(before);
+        app.result_highlight_due = Some(Instant::now());
+
+        let ctx = egui::Context::default();
+        for _ in 0..100 {
+            app.poll_result_highlight(&ctx);
+            if app.result_highlight_task.is_none() && app.result_highlight_due.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let document = app.syntax_highlights.result.as_ref().unwrap();
+        assert!(
+            document.lines[0]
+                .spans
+                .iter()
+                .any(|span| span.role == SyntaxRole::Keyword)
+        );
     }
 
     #[test]

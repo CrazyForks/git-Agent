@@ -1187,6 +1187,10 @@ fn git_blob_text(root: &Path, revision: &str, path: &str) -> Option<String> {
     git_output_optional(root, &["show", &format!("{revision}:{path}")])
 }
 
+pub fn revision_file_text(root: impl AsRef<Path>, revision: &str, path: &str) -> Option<String> {
+    git_blob_text(root.as_ref(), revision, path)
+}
+
 fn git_index_text(root: &Path, path: &str) -> Option<String> {
     git_output_optional(root, &["show", &format!(":{path}")])
 }

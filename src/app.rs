@@ -4248,6 +4248,38 @@ fn conflict_temp_name(path: &str) -> String {
         .collect()
 }
 
+fn diff_syntax_session_against_worktree(
+    root: &Path,
+    revision: &str,
+    diff_text: &str,
+) -> crate::diff_tool::DiffSyntaxSession {
+    let files = crate::diff_tool::parse_side_by_side_diff(diff_text)
+        .into_iter()
+        .map(|file| {
+            let left_path = crate::diff_tool::diff_source_path(&file.left_path);
+            let right_path = crate::diff_tool::diff_source_path(&file.right_path);
+            let syntax_path = right_path.as_deref().or(left_path.as_deref()).unwrap_or("");
+            let left_highlight = left_path.as_deref().and_then(|path| {
+                git::revision_file_text(root, revision, path).and_then(|source| {
+                    crate::syntax::highlight_document(root, syntax_path, &source)
+                })
+            });
+            let right_highlight = right_path.as_deref().and_then(|path| {
+                fs::read_to_string(root.join(path)).ok().and_then(|source| {
+                    crate::syntax::highlight_document(root, syntax_path, &source)
+                })
+            });
+            crate::diff_tool::DiffSyntaxFile {
+                left_path: file.left_path,
+                right_path: file.right_path,
+                left_highlight,
+                right_highlight,
+            }
+        })
+        .collect();
+    crate::diff_tool::DiffSyntaxSession { files }
+}
+
 impl Default for LayoutPrefs {
     fn default() -> Self {
         Self {
@@ -6094,7 +6126,10 @@ impl GitAgentApp {
                 .join(format!("{}-{short_hash}", std::process::id()));
             fs::create_dir_all(&temp_dir)?;
             let diff_path = temp_dir.join("changes.patch");
-            fs::write(&diff_path, diff_text)?;
+            fs::write(&diff_path, &diff_text)?;
+            let syntax_session_path = temp_dir.join("syntax-session.json");
+            let syntax_session = diff_syntax_session_against_worktree(root, &hash, &diff_text);
+            fs::write(&syntax_session_path, serde_json::to_vec(&syntax_session)?)?;
             let diff_exe = env::current_exe()?.with_file_name(if cfg!(windows) {
                 "git-agent-diff.exe"
             } else {
@@ -6110,6 +6145,8 @@ impl GitAgentApp {
                 .arg("worktree")
                 .arg("--diff")
                 .arg(&diff_path)
+                .arg("--syntax-session")
+                .arg(&syntax_session_path)
                 .arg("--theme")
                 .arg(&theme)
                 .arg("--language")
@@ -6138,7 +6175,17 @@ impl GitAgentApp {
                 .join(format!("{}-worktree", std::process::id()));
             fs::create_dir_all(&temp_dir)?;
             let diff_path = temp_dir.join("changes.patch");
-            fs::write(&diff_path, diff.text)?;
+            fs::write(&diff_path, &diff.text)?;
+            let syntax_session_path = temp_dir.join("syntax-session.json");
+            let syntax_session = crate::diff_tool::DiffSyntaxSession {
+                files: vec![crate::diff_tool::DiffSyntaxFile {
+                    left_path: path.clone(),
+                    right_path: path.clone(),
+                    left_highlight: diff.old_highlight,
+                    right_highlight: diff.new_highlight,
+                }],
+            };
+            fs::write(&syntax_session_path, serde_json::to_vec(&syntax_session)?)?;
             let diff_exe = env::current_exe()?.with_file_name(if cfg!(windows) {
                 "git-agent-diff.exe"
             } else {
@@ -6156,6 +6203,8 @@ impl GitAgentApp {
                 .arg(right_label)
                 .arg("--diff")
                 .arg(&diff_path)
+                .arg("--syntax-session")
+                .arg(&syntax_session_path)
                 .arg("--theme")
                 .arg(&theme)
                 .arg("--language")

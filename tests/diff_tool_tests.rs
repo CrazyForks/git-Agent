@@ -17,6 +17,8 @@ fn parses_named_diff_tool_arguments() {
         "working tree",
         "--diff",
         "changes.patch",
+        "--syntax-session",
+        "syntax-session.json",
         "--theme",
         "light",
         "--language",
@@ -31,6 +33,7 @@ fn parses_named_diff_tool_arguments() {
             left_label: "abc123".to_owned(),
             right_label: "working tree".to_owned(),
             diff: PathBuf::from("changes.patch"),
+            syntax_session: Some(PathBuf::from("syntax-session.json")),
             theme: DiffTheme::Light,
             language: DiffLanguage::Chinese,
         }

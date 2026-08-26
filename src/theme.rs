@@ -864,6 +864,15 @@ pub fn diff_indent_guide() -> Color32 {
 
 pub fn syntax_color(role: crate::syntax::SyntaxRole) -> Color32 {
     let palette = palette(current_mode());
+    syntax_color_from_palette(role, &palette)
+}
+
+pub fn syntax_color_for_mode(role: crate::syntax::SyntaxRole, mode: ThemeMode) -> Color32 {
+    let palette = palette(mode);
+    syntax_color_from_palette(role, &palette)
+}
+
+fn syntax_color_from_palette(role: crate::syntax::SyntaxRole, palette: &Palette) -> Color32 {
     match role {
         crate::syntax::SyntaxRole::Plain => palette.text,
         crate::syntax::SyntaxRole::Comment => palette.syntax_comment,

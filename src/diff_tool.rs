@@ -7,8 +7,12 @@ use eframe::{
     egui::{
         self, Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rect, RichText, ScrollArea,
         Sense, Stroke, Vec2,
+        text::{LayoutJob, TextFormat},
     },
 };
+use serde::{Deserialize, Serialize};
+
+use crate::syntax::{HighlightedDocument, HighlightedLine, SyntaxRole};
 
 const DIFF_ROW_HEIGHT: f32 = 21.0;
 const DIFF_MINIMAP_WIDTH: f32 = 14.0;
@@ -58,6 +62,21 @@ pub struct DiffFile {
     pub left_path: String,
     pub right_path: String,
     pub rows: Vec<DiffRow>,
+    pub left_highlight: Option<HighlightedDocument>,
+    pub right_highlight: Option<HighlightedDocument>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DiffSyntaxSession {
+    pub files: Vec<DiffSyntaxFile>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DiffSyntaxFile {
+    pub left_path: String,
+    pub right_path: String,
+    pub left_highlight: Option<HighlightedDocument>,
+    pub right_highlight: Option<HighlightedDocument>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +85,7 @@ pub struct DiffArgs {
     pub left_label: String,
     pub right_label: String,
     pub diff: PathBuf,
+    pub syntax_session: Option<PathBuf>,
     pub theme: DiffTheme,
     pub language: DiffLanguage,
 }
@@ -82,7 +102,20 @@ impl DiffToolApp {
     pub fn from_args(args: DiffArgs) -> anyhow::Result<Self> {
         let diff_text = fs::read_to_string(&args.diff)
             .with_context(|| format!("failed to read {}", args.diff.display()))?;
-        let files = parse_side_by_side_diff(&diff_text);
+        let mut files = parse_side_by_side_diff(&diff_text);
+        if let Some(path) = args.syntax_session.as_deref() {
+            match fs::read(path)
+                .with_context(|| format!("failed to read syntax session {}", path.display()))
+                .and_then(|source| {
+                    serde_json::from_slice::<DiffSyntaxSession>(&source).map_err(Into::into)
+                }) {
+                Ok(session) => apply_diff_syntax_session(&mut files, session),
+                Err(error) => crate::diagnostics::diff_tool_error(
+                    "syntax_session.load",
+                    &format!("path={} error={error}", path.display()),
+                ),
+            }
+        }
         Ok(Self {
             args,
             diff_text,
@@ -97,7 +130,7 @@ impl DiffToolApp {
             Ok(args) => args,
             Err(error) => {
                 eprintln!(
-                    "Usage: git-agent-diff --title <title> --left <label> --right <label> --diff <patch> [--theme dark|light] [--language en|zh]\n{error}"
+                    "Usage: git-agent-diff --title <title> --left <label> --right <label> --diff <patch> [--syntax-session <json>] [--theme dark|light] [--language en|zh]\n{error}"
                 );
                 std::process::exit(2);
             }
@@ -123,6 +156,7 @@ impl DiffToolApp {
                         left_label: String::new(),
                         right_label: String::new(),
                         diff: PathBuf::new(),
+                        syntax_session: None,
                         theme: DiffTheme::Dark,
                         language: DiffLanguage::English,
                     },
@@ -198,6 +232,7 @@ where
     let mut left_label = None;
     let mut right_label = None;
     let mut diff = None;
+    let mut syntax_session = None;
     let mut theme = DiffTheme::Dark;
     let mut language = DiffLanguage::English;
     let mut iter = items.into_iter();
@@ -208,6 +243,7 @@ where
             "--left" => left_label = iter.next(),
             "--right" => right_label = iter.next(),
             "--diff" => diff = iter.next().map(PathBuf::from),
+            "--syntax-session" => syntax_session = iter.next().map(PathBuf::from),
             "--theme" => {
                 theme = match iter.next().as_deref() {
                     Some("light") => DiffTheme::Light,
@@ -233,6 +269,7 @@ where
         left_label: left_label.ok_or_else(|| anyhow!("missing --left"))?,
         right_label: right_label.ok_or_else(|| anyhow!("missing --right"))?,
         diff: diff.ok_or_else(|| anyhow!("missing --diff"))?,
+        syntax_session,
         theme,
         language,
     })
@@ -264,6 +301,8 @@ pub fn parse_side_by_side_diff(diff_text: &str) -> Vec<DiffFile> {
                 left_path,
                 right_path,
                 rows: Vec::new(),
+                left_highlight: None,
+                right_highlight: None,
             });
             in_hunk = false;
             left_line = 0;
@@ -351,6 +390,35 @@ pub fn parse_side_by_side_diff(diff_text: &str) -> Vec<DiffFile> {
     files
 }
 
+fn apply_diff_syntax_session(files: &mut [DiffFile], mut session: DiffSyntaxSession) {
+    for file in files {
+        let left_path = diff_source_path(&file.left_path);
+        let right_path = diff_source_path(&file.right_path);
+        let Some(index) = session.files.iter().position(|candidate| {
+            diff_source_path(&candidate.left_path) == left_path
+                && diff_source_path(&candidate.right_path) == right_path
+        }) else {
+            continue;
+        };
+        let candidate = session.files.remove(index);
+        file.left_highlight = candidate.left_highlight;
+        file.right_highlight = candidate.right_highlight;
+    }
+}
+
+pub fn diff_source_path(path: &str) -> Option<String> {
+    let path = path.trim().trim_matches('"');
+    if path.is_empty() || path == "/dev/null" {
+        return None;
+    }
+    Some(
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path)
+            .replace('\\', "/"),
+    )
+}
+
 pub fn diff_file_display_label(side_label: &str, path: &str) -> String {
     let label = side_label.trim().trim_end_matches('/');
     let path = path.trim();
@@ -374,6 +442,8 @@ fn current_file_mut(current: &mut Option<DiffFile>) -> &mut DiffFile {
             left_path: "left".to_owned(),
             right_path: "right".to_owned(),
             rows: Vec::new(),
+            left_highlight: None,
+            right_highlight: None,
         });
     }
     current.as_mut().expect("current diff file exists")
@@ -564,7 +634,11 @@ fn show_raw_diff(ui: &mut egui::Ui, diff_text: &str, palette: DiffPalette) {
 enum DiffDisplayRow<'a> {
     File(&'a DiffFile),
     Hunk(&'a str),
-    Line(&'a DiffLine),
+    Line {
+        line: &'a DiffLine,
+        left_highlight: Option<&'a HighlightedDocument>,
+        right_highlight: Option<&'a HighlightedDocument>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -613,7 +687,7 @@ fn show_side_by_side_diff(
     let longest_chars = rows
         .iter()
         .filter_map(|row| match row {
-            DiffDisplayRow::Line(line) => Some(
+            DiffDisplayRow::Line { line, .. } => Some(
                 line.left_text
                     .chars()
                     .count()
@@ -696,7 +770,11 @@ fn diff_display_rows(files: &[DiffFile]) -> Vec<DiffDisplayRow<'_>> {
                 // source reader. Keep it in the parser for fidelity but omit it from the viewer.
                 DiffRow::Meta(_) => {}
                 DiffRow::Hunk(text) => rows.push(DiffDisplayRow::Hunk(text)),
-                DiffRow::Line(line) => rows.push(DiffDisplayRow::Line(line)),
+                DiffRow::Line(line) => rows.push(DiffDisplayRow::Line {
+                    line,
+                    left_highlight: file.left_highlight.as_ref(),
+                    right_highlight: file.right_highlight.as_ref(),
+                }),
             }
         }
     }
@@ -739,9 +817,20 @@ fn draw_display_row(
             &format_hunk_summary(text, language),
             palette,
         ),
-        DiffDisplayRow::Line(line) => {
-            draw_line_row(ui, paint_rect, line, column_width, DIFF_PANE_GAP, palette)
-        }
+        DiffDisplayRow::Line {
+            line,
+            left_highlight,
+            right_highlight,
+        } => draw_line_row(
+            ui,
+            paint_rect,
+            line,
+            left_highlight,
+            right_highlight,
+            column_width,
+            DIFF_PANE_GAP,
+            palette,
+        ),
     }
 }
 
@@ -871,7 +960,7 @@ fn diff_overview_tone(row: DiffDisplayRow<'_>) -> DiffOverviewTone {
     match row {
         DiffDisplayRow::File(_) => DiffOverviewTone::File,
         DiffDisplayRow::Hunk(_) => DiffOverviewTone::Hunk,
-        DiffDisplayRow::Line(line) => match (line.left_kind, line.right_kind) {
+        DiffDisplayRow::Line { line, .. } => match (line.left_kind, line.right_kind) {
             (DiffCellKind::Removed, DiffCellKind::Added) => DiffOverviewTone::Changed,
             (DiffCellKind::Removed, _) => DiffOverviewTone::Removed,
             (_, DiffCellKind::Added) => DiffOverviewTone::Added,
@@ -984,6 +1073,8 @@ fn draw_line_row(
     ui: &mut egui::Ui,
     rect: Rect,
     line: &DiffLine,
+    left_highlight: Option<&HighlightedDocument>,
+    right_highlight: Option<&HighlightedDocument>,
     column_width: f32,
     gap: f32,
     palette: DiffPalette,
@@ -995,6 +1086,9 @@ fn draw_line_row(
         line.left_line,
         &line.left_text,
         line.left_kind,
+        line.left_line.and_then(|line_number| {
+            left_highlight.and_then(|document| document.lines.get(line_number.saturating_sub(1)))
+        }),
         palette,
     );
     draw_cell(
@@ -1003,6 +1097,9 @@ fn draw_line_row(
         line.right_line,
         &line.right_text,
         line.right_kind,
+        line.right_line.and_then(|line_number| {
+            right_highlight.and_then(|document| document.lines.get(line_number.saturating_sub(1)))
+        }),
         palette,
     );
 }
@@ -1022,6 +1119,7 @@ fn draw_cell(
     line_number: Option<usize>,
     text: &str,
     kind: DiffCellKind,
+    highlighted_line: Option<&HighlightedLine>,
     palette: DiffPalette,
 ) {
     ui.painter().rect_filled(rect, 0.0, cell_bg(kind, palette));
@@ -1044,15 +1142,24 @@ fn draw_cell(
         Pos2::new(gutter_rect.right() + 8.0, rect.top()),
         rect.right_bottom(),
     );
-    ui.painter()
-        .with_clip_rect(text_rect.intersect(ui.clip_rect()))
-        .text(
-            text_rect.left_center(),
-            Align2::LEFT_CENTER,
-            text,
-            FontId::monospace(13.0),
-            cell_text(kind, palette),
-        );
+    let base_color = cell_text(kind, palette);
+    let painter = ui
+        .painter()
+        .with_clip_rect(text_rect.intersect(ui.clip_rect()));
+    let galley = painter.layout_job(diff_syntax_layout_job(
+        text,
+        highlighted_line,
+        base_color,
+        palette,
+    ));
+    painter.galley(
+        Pos2::new(
+            text_rect.left(),
+            text_rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        base_color,
+    );
 }
 
 fn draw_header_text(ui: &egui::Ui, rect: Rect, text: &str, color: Color32, align: Align2) {
@@ -1083,6 +1190,57 @@ fn cell_text(kind: DiffCellKind, palette: DiffPalette) -> Color32 {
         DiffCellKind::Empty => palette.muted,
         DiffCellKind::Context => palette.text,
     }
+}
+
+fn diff_syntax_layout_job(
+    text: &str,
+    highlighted_line: Option<&HighlightedLine>,
+    base_color: Color32,
+    palette: DiffPalette,
+) -> LayoutJob {
+    let font_id = FontId::monospace(13.0);
+    let format = |color| TextFormat {
+        font_id: font_id.clone(),
+        color,
+        ..TextFormat::default()
+    };
+    let mut job = LayoutJob::default();
+    let mut cursor = 0usize;
+    if let Some(highlighted_line) = highlighted_line {
+        for span in &highlighted_line.spans {
+            let start = span.start.min(text.len());
+            let end = span.end.min(text.len());
+            if start < cursor
+                || start >= end
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+            {
+                continue;
+            }
+            if cursor < start {
+                job.append(&text[cursor..start], 0.0, format(base_color));
+            }
+            job.append(
+                &text[start..end],
+                0.0,
+                format(diff_syntax_color(span.role, palette)),
+            );
+            cursor = end;
+        }
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, format(base_color));
+    }
+    job
+}
+
+fn diff_syntax_color(role: SyntaxRole, palette: DiffPalette) -> Color32 {
+    let mode = if palette.bg.r() < 128 {
+        crate::theme::ThemeMode::Dark
+    } else {
+        crate::theme::ThemeMode::Light
+    };
+    crate::theme::syntax_color_for_mode(role, mode)
 }
 
 fn diff_line_color(line: &str, palette: DiffPalette) -> Color32 {
@@ -1234,7 +1392,51 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert!(matches!(rows[0], DiffDisplayRow::File(_)));
         assert!(matches!(rows[1], DiffDisplayRow::Hunk(_)));
-        assert!(matches!(rows[2], DiffDisplayRow::Line(_)));
+        assert!(matches!(rows[2], DiffDisplayRow::Line { .. }));
+    }
+
+    #[test]
+    fn syntax_session_attaches_full_document_highlights_to_diff_sides() {
+        let mut files = parse_side_by_side_diff(
+            "diff --git a/src/view.ts b/src/view.ts\n--- a/src/view.ts\n+++ b/src/view.ts\n@@ -1 +1 @@\n-export const left = 1\n+export const right = 2\n",
+        );
+        let highlighted = HighlightedDocument {
+            lines: vec![HighlightedLine {
+                spans: vec![crate::syntax::HighlightSpan {
+                    start: 0,
+                    end: 6,
+                    role: SyntaxRole::Keyword,
+                }],
+            }],
+            ..Default::default()
+        };
+        apply_diff_syntax_session(
+            &mut files,
+            DiffSyntaxSession {
+                files: vec![DiffSyntaxFile {
+                    left_path: "src/view.ts".to_owned(),
+                    right_path: "src/view.ts".to_owned(),
+                    left_highlight: Some(highlighted.clone()),
+                    right_highlight: Some(highlighted),
+                }],
+            },
+        );
+
+        assert!(files[0].left_highlight.is_some());
+        assert!(files[0].right_highlight.is_some());
+        let line = files[0]
+            .left_highlight
+            .as_ref()
+            .and_then(|document| document.lines.first())
+            .unwrap();
+        let job = diff_syntax_layout_job(
+            "export const left = 1",
+            Some(line),
+            Color32::BLACK,
+            diff_palette(DiffTheme::Light),
+        );
+        assert_eq!(&job.text[job.sections[0].byte_range.clone()], "export");
+        assert_ne!(job.sections[0].format.color, Color32::BLACK);
     }
 
     #[test]
