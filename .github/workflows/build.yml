@@ -22,11 +22,11 @@ jobs:
           - name: Linux
             os: ubuntu-latest
             artifact: git-agent-linux-installer
-            asset-path: dist/git-agent-linux-installer.tar.gz
+            asset-path: dist/GitAgent_*.deb
           - name: macOS
             os: macos-latest
             artifact: git-agent-macos-installer
-            asset-path: dist/git-agent-macos-installer.tar.gz
+            asset-path: dist/GitAgent-*-macOS.dmg
           - name: Windows
             os: windows-latest
             artifact: git-agent-windows-installer
@@ -78,9 +78,25 @@ jobs:
         run: cargo test --locked
 
       - name: Build release binaries
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         run: cargo build --release --locked
+
+      - name: Build universal macOS binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          mkdir -p dist/universal-bin
+          for executable in git-agent git-agent-merge git-agent-diff; do
+            lipo -create \
+              "target/x86_64-apple-darwin/release/$executable" \
+              "target/aarch64-apple-darwin/release/$executable" \
+              -output "dist/universal-bin/$executable"
+          done
 
       - name: Build release binaries
         if: runner.os == 'Windows'
@@ -88,36 +104,26 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package installer
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          package_dir="dist/${{ matrix.artifact }}"
-          mkdir -p "$package_dir"
-          cp target/release/git-agent "$package_dir/"
-          cp target/release/git-agent-merge "$package_dir/"
-          cp target/release/git-agent-diff "$package_dir/"
-          cat > "$package_dir/install.sh" <<'INSTALLER'
-          #!/usr/bin/env sh
-          set -eu
+          mkdir -p dist
+          bash installer/linux/package-deb.sh \
+            "${{ github.ref_name }}" \
+            "$(dpkg --print-architecture)" \
+            target/release \
+            dist
 
-          script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-          prefix=${PREFIX:-"$HOME/.local"}
-          install_dir=${INSTALL_DIR:-"$prefix/bin"}
-
-          mkdir -p "$install_dir"
-          cp "$script_dir/git-agent" "$install_dir/git-agent"
-          cp "$script_dir/git-agent-merge" "$install_dir/git-agent-merge"
-          cp "$script_dir/git-agent-diff" "$install_dir/git-agent-diff"
-          chmod 755 "$install_dir/git-agent" "$install_dir/git-agent-merge" "$install_dir/git-agent-diff"
-
-          echo "Installed git-agent, git-agent-merge, and git-agent-diff to $install_dir"
-          echo "Add $install_dir to PATH if it is not already there."
-          INSTALLER
-          sed -i.bak 's/^          //' "$package_dir/install.sh"
-          rm "$package_dir/install.sh.bak"
-          chmod +x "$package_dir/git-agent" "$package_dir/git-agent-merge" "$package_dir/git-agent-diff" "$package_dir/install.sh"
-          tar -czf "dist/${{ matrix.artifact }}.tar.gz" -C dist "${{ matrix.artifact }}"
+      - name: Package installer
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash installer/macos/package.sh \
+            "${{ github.ref_name }}" \
+            dist/universal-bin \
+            dist
 
       - name: Package installer
         if: runner.os == 'Windows'

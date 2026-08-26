@@ -91,6 +91,7 @@ struct SystemFontFace {
     weight: FontWeight,
     path: PathBuf,
     index: u32,
+    supports_cjk: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1365,6 +1366,7 @@ mod tests {
                 weight: FontWeight::Regular,
                 path: PathBuf::from(format!("{name}.ttf")),
                 index: 0,
+                supports_cjk: name.contains("Noto") || name.contains("YaHei"),
             }],
         };
         let catalog = vec![
@@ -1377,7 +1379,7 @@ mod tests {
 
         assert_eq!(
             resolve_font_family(&catalog, None, false).map(|font| font.name.as_str()),
-            Some("Noto Sans SC")
+            Some("Microsoft YaHei UI")
         );
         assert_eq!(
             resolve_font_family(&catalog, None, true).map(|font| font.name.as_str()),
@@ -1394,6 +1396,38 @@ mod tests {
         );
         assert!(font_family_names(&catalog, false).contains(&"Cascadia Mono".to_owned()));
         assert!(!font_family_names(&catalog, true).contains(&"Arial".to_owned()));
+    }
+
+    #[test]
+    fn automatic_font_priorities_follow_each_desktop_platform() {
+        assert_eq!(
+            automatic_font_priorities("macos", false)[0],
+            ".AppleSystemUIFont"
+        );
+        assert_eq!(automatic_font_priorities("macos", true)[0], "SF Mono");
+        assert_eq!(automatic_font_priorities("windows", false)[0], "Segoe UI");
+        assert_eq!(automatic_font_priorities("linux", false)[0], "Ubuntu");
+        assert!(cjk_font_priorities("macos").contains(&"PingFang SC"));
+        assert!(cjk_font_priorities("linux").contains(&"Noto Sans CJK SC"));
+    }
+
+    #[test]
+    fn cjk_fallback_is_selected_by_glyph_coverage_not_catalog_order() {
+        let family = |name: &str, supports_cjk: bool| SystemFontFamily {
+            name: name.to_owned(),
+            monospaced: false,
+            faces: vec![SystemFontFace {
+                weight: FontWeight::Regular,
+                path: PathBuf::from(format!("{name}.ttf")),
+                index: 0,
+                supports_cjk,
+            }],
+        };
+        let catalog = vec![family("Arial", false), family("PingFang SC", true)];
+        assert_eq!(
+            resolve_cjk_font_face(&catalog, "macos").map(|face| face.path.as_path()),
+            Some(Path::new("PingFang SC.ttf"))
+        );
     }
 
     #[test]
@@ -1429,17 +1463,17 @@ fn install_fonts(ctx: &egui::Context) {
 
 fn default_font_definitions() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
-    if let Some(path) = system_cjk_font_path() {
-        if let Ok(bytes) = std::fs::read(path) {
+    if let Some(face) = bundled_system_cjk_font_face() {
+        if let Ok(bytes) = std::fs::read(&face.path) {
             let name = "system_cjk_fallback".to_owned();
-            fonts
-                .font_data
-                .insert(name.clone(), FontData::from_owned(bytes).into());
+            let mut data = FontData::from_owned(bytes);
+            data.index = face.index;
+            fonts.font_data.insert(name.clone(), data.into());
             fonts
                 .families
                 .entry(FontFamily::Proportional)
                 .or_default()
-                .insert(0, name.clone());
+                .push(name.clone());
             fonts
                 .families
                 .entry(FontFamily::Monospace)
@@ -1450,16 +1484,39 @@ fn default_font_definitions() -> FontDefinitions {
     fonts
 }
 
-fn system_cjk_font_path() -> Option<PathBuf> {
-    [
-        r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .find(|path| path.is_file())
+fn bundled_system_cjk_font_face() -> Option<SystemFontFace> {
+    let candidates: &[(&str, u32)] = if cfg!(target_os = "macos") {
+        &[
+            ("/System/Library/Fonts/PingFangUI.ttc", 0),
+            ("/System/Library/Fonts/PingFang.ttc", 0),
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+        ]
+    } else if cfg!(target_os = "windows") {
+        &[
+            (r"C:\Windows\Fonts\NotoSansSC-VF.ttf", 0),
+            (r"C:\Windows\Fonts\msyh.ttc", 0),
+            (r"C:\Windows\Fonts\simhei.ttf", 0),
+            (r"C:\Windows\Fonts\simsun.ttc", 0),
+        ]
+    } else {
+        &[
+            ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+            (
+                "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+                0,
+            ),
+            ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+        ]
+    };
+    candidates.iter().find_map(|(path, index)| {
+        let path = PathBuf::from(path);
+        path.is_file().then_some(SystemFontFace {
+            weight: FontWeight::Regular,
+            path,
+            index: *index,
+            supports_cjk: true,
+        })
+    })
 }
 
 pub fn scan_system_fonts() -> Vec<SystemFontFamily> {
@@ -1475,17 +1532,21 @@ pub fn scan_system_fonts() -> Vec<SystemFontFamily> {
             fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path.clone(),
             fontdb::Source::Binary(_) => continue,
         };
-        let supports_basic_latin = database
+        let coverage = database
             .with_face_data(face.id, |data, index| {
-                ttf_parser::Face::parse(data, index)
-                    .ok()
-                    .is_some_and(|font| {
-                        ['A', 'a', '0']
-                            .into_iter()
-                            .all(|c| font.glyph_index(c).is_some())
-                    })
+                ttf_parser::Face::parse(data, index).ok().map(|font| {
+                    let basic_latin = ['A', 'a', '0']
+                        .into_iter()
+                        .all(|character| font.glyph_index(character).is_some());
+                    let cjk = ['中', '文', '汉', '字']
+                        .into_iter()
+                        .all(|character| font.glyph_index(character).is_some());
+                    (basic_latin, cjk)
+                })
             })
-            .unwrap_or(false);
+            .flatten()
+            .unwrap_or((false, false));
+        let (supports_basic_latin, supports_cjk) = coverage;
         if !supports_basic_latin {
             continue;
         }
@@ -1507,15 +1568,25 @@ pub fn scan_system_fonts() -> Vec<SystemFontFamily> {
             monospaced,
             faces: Vec::new(),
         });
-        if !family
+        if let Some(existing) = family
             .faces
-            .iter()
-            .any(|candidate| candidate.weight == weight)
+            .iter_mut()
+            .find(|candidate| candidate.weight == weight)
         {
+            if supports_cjk && !existing.supports_cjk {
+                *existing = SystemFontFace {
+                    weight,
+                    path,
+                    index: face.index,
+                    supports_cjk,
+                };
+            }
+        } else {
             family.faces.push(SystemFontFace {
                 weight,
                 path,
                 index: face.index,
+                supports_cjk,
             });
         }
     }
@@ -1572,17 +1643,10 @@ pub fn load_font_set(
             .insert(0, name);
     }
 
-    if let Some(path) = system_cjk_font_path() {
-        let fallback = SystemFontFace {
-            weight: FontWeight::Regular,
-            path,
-            index: 0,
-        };
-        if let Ok(name) = register_font_face(&mut fonts, &mut registered, &fallback) {
+    if let Some(fallback) = resolve_cjk_font_face(catalog, std::env::consts::OS) {
+        if let Ok(name) = register_font_face(&mut fonts, &mut registered, fallback) {
             let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
-            if ui_family.is_none() {
-                proportional.insert(0, name.clone());
-            } else if !proportional.contains(&name) {
+            if !proportional.contains(&name) {
                 proportional.push(name.clone());
             }
             let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
@@ -1610,22 +1674,7 @@ fn resolve_font_family<'a>(
         });
     }
 
-    let priorities: &[&str] = if monospaced_only {
-        &[
-            "Cascadia Mono",
-            "Cascadia Code",
-            "JetBrains Mono",
-            "Consolas",
-        ]
-    } else {
-        &[
-            "Noto Sans SC",
-            "Noto Sans CJK SC",
-            "Microsoft YaHei UI",
-            "Microsoft YaHei",
-            "Segoe UI",
-        ]
-    };
+    let priorities = automatic_font_priorities(std::env::consts::OS, monospaced_only);
     priorities
         .iter()
         .find_map(|name| {
@@ -1637,6 +1686,103 @@ fn resolve_font_family<'a>(
             catalog
                 .iter()
                 .find(|family| !monospaced_only || family.monospaced)
+        })
+}
+
+fn automatic_font_priorities(os: &str, monospaced: bool) -> &'static [&'static str] {
+    match (os, monospaced) {
+        ("macos", true) => &["SF Mono", "Menlo", "Monaco", "JetBrains Mono"],
+        ("macos", false) => &[
+            ".AppleSystemUIFont",
+            "SF Pro Text",
+            "SF Pro Display",
+            "PingFang SC",
+            "Hiragino Sans GB",
+        ],
+        ("windows", true) => &[
+            "Cascadia Mono",
+            "Cascadia Code",
+            "JetBrains Mono",
+            "Consolas",
+        ],
+        ("windows", false) => &[
+            "Segoe UI",
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "Noto Sans SC",
+        ],
+        (_, true) => &[
+            "Ubuntu Mono",
+            "Noto Sans Mono",
+            "DejaVu Sans Mono",
+            "Liberation Mono",
+        ],
+        (_, false) => &[
+            "Ubuntu",
+            "Cantarell",
+            "Noto Sans",
+            "DejaVu Sans",
+            "Liberation Sans",
+        ],
+    }
+}
+
+fn cjk_font_priorities(os: &str) -> &'static [&'static str] {
+    match os {
+        "macos" => &[
+            "PingFang SC",
+            "Hiragino Sans GB",
+            "Hiragino Sans",
+            "Heiti SC",
+        ],
+        "windows" => &[
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "Noto Sans SC",
+            "Noto Sans CJK SC",
+            "SimHei",
+        ],
+        _ => &[
+            "Noto Sans CJK SC",
+            "Noto Sans SC",
+            "WenQuanYi Micro Hei",
+            "Source Han Sans SC",
+        ],
+    }
+}
+
+fn resolve_cjk_font_face<'a>(
+    catalog: &'a [SystemFontFamily],
+    os: &str,
+) -> Option<&'a SystemFontFace> {
+    cjk_font_priorities(os)
+        .iter()
+        .find_map(|name| {
+            catalog
+                .iter()
+                .find(|family| family.name.eq_ignore_ascii_case(name))
+                .and_then(|family| {
+                    family
+                        .faces
+                        .iter()
+                        .filter(|face| face.supports_cjk)
+                        .min_by_key(|face| {
+                            face.weight
+                                .numeric()
+                                .abs_diff(FontWeight::Regular.numeric())
+                        })
+                })
+        })
+        .or_else(|| {
+            catalog
+                .iter()
+                .flat_map(|family| &family.faces)
+                .filter(|face| face.supports_cjk)
+                .min_by_key(|face| {
+                    face.weight
+                        .numeric()
+                        .abs_diff(FontWeight::Regular.numeric())
+                })
         })
 }
 

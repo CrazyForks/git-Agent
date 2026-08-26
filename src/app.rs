@@ -412,10 +412,14 @@ fn beginner_tutorial_target_rect(
 }
 
 fn beginner_tutorial_card_rect(screen: Rect, target: Rect) -> Rect {
+    beginner_tutorial_card_rect_with_height(screen, target, 206.0)
+}
+
+fn beginner_tutorial_card_rect_with_height(screen: Rect, target: Rect, height: f32) -> Rect {
     let available = screen.shrink(18.0);
     let card_size = Vec2::new(
         360.0_f32.min(available.width()),
-        206.0_f32.min(available.height()),
+        height.min(available.height()),
     );
     let gap = 22.0;
     let mut position = if target.right() + gap + card_size.x <= available.right() {
@@ -3818,11 +3822,74 @@ fn app_data_dir() -> Option<PathBuf> {
             return Some(data_dir);
         }
     }
-    env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(PathBuf::from))
-        .or_else(|| env::current_dir().ok())
-        .map(|base| base.join("data"))
+    let executable = env::current_exe().ok();
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let xdg_data_home = env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let data_dir = default_app_data_dir(
+        executable.as_deref(),
+        home.as_deref(),
+        xdg_data_home.as_deref(),
+        env::consts::OS,
+    )?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    migrate_legacy_unix_data(&data_dir, home.as_deref(), executable.as_deref());
+    Some(data_dir)
+}
+
+fn default_app_data_dir(
+    executable: Option<&Path>,
+    home: Option<&Path>,
+    xdg_data_home: Option<&Path>,
+    os: &str,
+) -> Option<PathBuf> {
+    match os {
+        "macos" => home.map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join("Git Agent")
+        }),
+        "linux" => xdg_data_home
+            .map(|base| base.join("git-agent"))
+            .or_else(|| home.map(|home| home.join(".local").join("share").join("git-agent"))),
+        _ => executable
+            .and_then(Path::parent)
+            .map(PathBuf::from)
+            .or_else(|| env::current_dir().ok())
+            .map(|base| base.join("data")),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn migrate_legacy_unix_data(target: &Path, home: Option<&Path>, executable: Option<&Path>) {
+    if target.exists() {
+        return;
+    }
+    let mut candidates = Vec::new();
+    if let Some(home) = home {
+        candidates.push(home.join(".local").join("bin").join("data"));
+    }
+    if let Some(executable) = executable.and_then(Path::parent) {
+        candidates.push(executable.join("data"));
+    }
+    if let Some(source) = candidates.into_iter().find(|source| source.is_dir()) {
+        let _ = copy_directory_contents(&source, target);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn copy_directory_contents(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory_contents(&source_path, &target_path)?;
+        } else {
+            fs::copy(source_path, target_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn app_settings_path() -> Option<PathBuf> {
@@ -10378,7 +10445,12 @@ impl GitAgentApp {
             self.layout_prefs.details_pct,
             view_uses_side_details(self.active_view),
         );
-        let card = beginner_tutorial_card_rect(screen, target);
+        let final_step = step_index + 1 == BEGINNER_TUTORIAL_STEPS.len();
+        let card = beginner_tutorial_card_rect_with_height(
+            screen,
+            target,
+            if final_step { 236.0 } else { 206.0 },
+        );
         let origin = screen.min.to_vec2();
         let local_full = Rect::from_min_size(Pos2::ZERO, screen.size());
         let local_target = target.translate(-origin);
@@ -10386,9 +10458,11 @@ impl GitAgentApp {
         let language = self.language;
         let title = i18n::t(language, step.title_key);
         let body = i18n::t(language, step.body_key);
+        let font_recommendation = i18n::t(language, "tutorial.font_recommendation");
+        let font_settings_label = i18n::t(language, "tutorial.font_settings");
         let close_label = i18n::t(language, "tutorial.close");
         let previous_label = i18n::t(language, "tutorial.previous");
-        let next_label = if step_index + 1 == BEGINNER_TUTORIAL_STEPS.len() {
+        let next_label = if final_step {
             i18n::t(language, "tutorial.finish")
         } else {
             i18n::t(language, "tutorial.next")
@@ -10397,6 +10471,7 @@ impl GitAgentApp {
         let mut close_requested = false;
         let mut previous_requested = false;
         let mut next_requested = false;
+        let mut font_settings_requested = false;
 
         egui::Area::new(egui::Id::new("beginner_tutorial_overlay"))
             .order(egui::Order::Foreground)
@@ -10447,6 +10522,14 @@ impl GitAgentApp {
                             );
                             ui.add_space(7.0);
                             ui.label(RichText::new(body).size(13.0).color(theme::muted()));
+                            if final_step {
+                                ui.add_space(7.0);
+                                ui.label(
+                                    RichText::new(font_recommendation)
+                                        .size(12.0)
+                                        .color(theme::text()),
+                                );
+                            }
                             ui.with_layout(Layout::bottom_up(Align::RIGHT), |ui| {
                                 ui.horizontal(|ui| {
                                     if dialog_action_button(
@@ -10459,6 +10542,17 @@ impl GitAgentApp {
                                     {
                                         previous_requested = true;
                                     }
+                                    if final_step
+                                        && dialog_action_button(
+                                            ui,
+                                            font_settings_label,
+                                            true,
+                                            false,
+                                        )
+                                        .clicked()
+                                    {
+                                        font_settings_requested = true;
+                                    }
                                     if dialog_primary_button(ui, next_label, true).clicked() {
                                         next_requested = true;
                                     }
@@ -10468,7 +10562,11 @@ impl GitAgentApp {
                 });
             });
 
-        if close_requested {
+        if font_settings_requested {
+            self.beginner_tutorial_step = None;
+            self.settings_tab = SettingsTab::General;
+            self.settings_open = true;
+        } else if close_requested {
             self.beginner_tutorial_step = None;
         } else if previous_requested {
             self.beginner_tutorial_step = step_index.checked_sub(1);
@@ -38448,13 +38546,43 @@ mod ui_tests {
         let app_data_source = &source[app_data_start..app_data_start + app_data_end];
         assert!(app_data_source.contains("GIT_AGENT_DATA_DIR"));
         assert!(app_data_source.contains("env::current_exe()"));
-        assert!(app_data_source.contains("base.join(\"data\")"));
+        assert!(app_data_source.contains("default_app_data_dir"));
         assert!(!app_data_source.contains("LOCALAPPDATA"));
 
         let frame = dialog_window_frame();
         assert_eq!(frame.fill, Color32::TRANSPARENT);
         assert_eq!(frame.stroke, Stroke::NONE);
         assert_eq!(frame.inner_margin.left, 0);
+    }
+
+    #[test]
+    fn installed_unix_apps_use_platform_user_data_directories() {
+        let home = Path::new("/Users/example");
+        let executable = Path::new("/Applications/Git Agent.app/Contents/MacOS/git-agent");
+        assert_eq!(
+            default_app_data_dir(Some(executable), Some(home), None, "macos"),
+            Some(PathBuf::from(
+                "/Users/example/Library/Application Support/Git Agent"
+            ))
+        );
+        assert_eq!(
+            default_app_data_dir(
+                Some(Path::new("/usr/lib/git-agent/git-agent")),
+                Some(Path::new("/home/example")),
+                None,
+                "linux",
+            ),
+            Some(PathBuf::from("/home/example/.local/share/git-agent"))
+        );
+        assert_eq!(
+            default_app_data_dir(
+                Some(Path::new("/usr/lib/git-agent/git-agent")),
+                Some(Path::new("/home/example")),
+                Some(Path::new("/mnt/user-data")),
+                "linux",
+            ),
+            Some(PathBuf::from("/mnt/user-data/git-agent"))
+        );
     }
 
     #[test]
@@ -50261,6 +50389,10 @@ diff --git a/file.txt b/file.txt
         assert!(overlay.contains("tutorial.finish"));
         assert!(overlay.contains("paint_beginner_tutorial_mask"));
         assert!(overlay.contains("paint_beginner_tutorial_arrow"));
+        assert!(overlay.contains("tutorial.font_recommendation"));
+        assert!(overlay.contains("tutorial.font_settings"));
+        assert!(overlay.contains("self.settings_tab = SettingsTab::General"));
+        assert!(overlay.contains("self.settings_open = true"));
         assert!(!overlay.contains("MergeActionDialog"));
         assert!(!overlay.contains("InteractiveRebaseActionDialog"));
 

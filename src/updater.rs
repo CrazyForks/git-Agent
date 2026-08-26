@@ -109,18 +109,21 @@ fn parse_version(raw: &str) -> Result<Version> {
 }
 
 fn platform_asset<'a>(assets: &'a [GithubAsset], os: &str) -> Option<&'a GithubAsset> {
-    let expected = match os {
-        "windows" => None,
-        "linux" => Some("git-agent-linux-installer.tar.gz"),
-        "macos" => Some("git-agent-macos-installer.tar.gz"),
-        _ => return None,
-    };
-    if let Some(expected) = expected {
-        return assets.iter().find(|asset| asset.name == expected);
+    if !matches!(os, "windows" | "linux" | "macos") {
+        return None;
     }
     assets
         .iter()
-        .find(|asset| asset.name.starts_with("GitAgentSetup-") && asset.name.ends_with(".exe"))
+        .find(|asset| asset_name_matches_os(&asset.name, os))
+}
+
+fn asset_name_matches_os(name: &str, os: &str) -> bool {
+    match os {
+        "windows" => name.starts_with("GitAgentSetup-") && name.ends_with(".exe"),
+        "linux" => name.starts_with("GitAgent_") && name.ends_with("_amd64.deb"),
+        "macos" => name.starts_with("GitAgent-") && name.ends_with("-macOS.dmg"),
+        _ => false,
+    }
 }
 
 fn validate_release_asset(asset: &ReleaseAsset) -> Result<()> {
@@ -133,12 +136,7 @@ fn validate_release_asset(asset: &ReleaseAsset) -> Result<()> {
     if file_name != Some(asset.name.as_str()) || asset.name.is_empty() {
         bail!("Update asset has an invalid file name");
     }
-    let valid_platform_name = match std::env::consts::OS {
-        "windows" => asset.name.starts_with("GitAgentSetup-") && asset.name.ends_with(".exe"),
-        "linux" => asset.name == "git-agent-linux-installer.tar.gz",
-        "macos" => asset.name == "git-agent-macos-installer.tar.gz",
-        _ => false,
-    };
+    let valid_platform_name = asset_name_matches_os(&asset.name, std::env::consts::OS);
     if !valid_platform_name {
         bail!("Update asset does not match the current operating system");
     }
@@ -181,35 +179,28 @@ fn install_downloaded_asset(path: &Path, _directory: &Path) -> Result<InstallOut
     Ok(InstallOutcome::InstallerLaunched)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn install_downloaded_asset(path: &Path, directory: &Path) -> Result<InstallOutcome> {
-    let extract_status = Command::new("tar")
-        .arg("-xzf")
+#[cfg(target_os = "macos")]
+fn install_downloaded_asset(path: &Path, _directory: &Path) -> Result<InstallOutcome> {
+    Command::new("open")
         .arg(path)
-        .arg("-C")
-        .arg(directory)
-        .status()
-        .context("Unable to start tar for update extraction")?;
-    if !extract_status.success() {
-        bail!("Unable to extract update package");
-    }
+        .spawn()
+        .with_context(|| format!("Unable to open disk image: {}", path.display()))?;
+    Ok(InstallOutcome::InstallerLaunched)
+}
 
-    let package_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".tar.gz"))
-        .context("Update package name is invalid")?;
-    let package_directory = directory.join(package_name);
-    let installer = package_directory.join("install.sh");
-    let install_status = Command::new("sh")
-        .arg(&installer)
-        .current_dir(&package_directory)
-        .status()
-        .with_context(|| format!("Unable to start installer: {}", installer.display()))?;
-    if !install_status.success() {
-        bail!("Update installer returned an error");
-    }
-    Ok(InstallOutcome::Installed)
+#[cfg(target_os = "linux")]
+fn install_downloaded_asset(path: &Path, _directory: &Path) -> Result<InstallOutcome> {
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .or_else(|_| Command::new("gio").arg("open").arg(path).spawn())
+        .with_context(|| {
+            format!(
+                "Unable to open system package installer: {}",
+                path.display()
+            )
+        })?;
+    Ok(InstallOutcome::InstallerLaunched)
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -229,8 +220,8 @@ mod tests {
                 "body":"Release notes",
                 "html_url":"https://github.com/adoin/git-Agent/releases/tag/v1.2.0",
                 "assets":[
-                    {"name":"git-agent-linux-installer.tar.gz","browser_download_url":"https://github.com/adoin/git-Agent/releases/download/v1.2.0/git-agent-linux-installer.tar.gz","size":10},
-                    {"name":"git-agent-macos-installer.tar.gz","browser_download_url":"https://github.com/adoin/git-Agent/releases/download/v1.2.0/git-agent-macos-installer.tar.gz","size":20},
+                    {"name":"GitAgent_1.2.0_amd64.deb","browser_download_url":"https://github.com/adoin/git-Agent/releases/download/v1.2.0/GitAgent_1.2.0_amd64.deb","size":10},
+                    {"name":"GitAgent-1.2.0-macOS.dmg","browser_download_url":"https://github.com/adoin/git-Agent/releases/download/v1.2.0/GitAgent-1.2.0-macOS.dmg","size":20},
                     {"name":"GitAgentSetup-v1.2.0.exe","browser_download_url":"https://github.com/adoin/git-Agent/releases/download/v1.2.0/GitAgentSetup-v1.2.0.exe","size":30}
                 ]
             }"#,
@@ -253,17 +244,17 @@ mod tests {
 
         let linux = release_from_response("1.2.0", release_json(), "linux").unwrap();
         assert!(!linux.is_newer);
-        assert_eq!(
-            linux.asset.unwrap().name,
-            "git-agent-linux-installer.tar.gz"
-        );
+        assert_eq!(linux.asset.unwrap().name, "GitAgent_1.2.0_amd64.deb");
 
         let macos = release_from_response("1.3.0", release_json(), "macos").unwrap();
         assert!(!macos.is_newer);
-        assert_eq!(
-            macos.asset.unwrap().name,
-            "git-agent-macos-installer.tar.gz"
-        );
+        assert_eq!(macos.asset.unwrap().name, "GitAgent-1.2.0-macOS.dmg");
+        assert!(asset_name_matches_os("GitAgent-1.2.0-macOS.dmg", "macos"));
+        assert!(asset_name_matches_os("GitAgent_1.2.0_amd64.deb", "linux"));
+        assert!(!asset_name_matches_os(
+            "git-agent-linux-installer.tar.gz",
+            "linux"
+        ));
     }
 
     #[test]

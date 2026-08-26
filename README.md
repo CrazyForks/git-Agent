@@ -26,21 +26,23 @@ Create `theme.local.json` beside the selected `theme.json` to customize the pale
 
 ## GitHub Actions
 
-Pushing a `v*` tag runs the `Build` workflow for Linux, macOS, and Windows. Each job runs tests, builds release binaries, and uploads one installer package for that platform.
+Pushing a `v*` tag runs the `Build` workflow for Linux, macOS, and Windows. Each job runs tests, builds release binaries, and uploads a native desktop installer for that platform.
 
-Linux and macOS releases are published as tarballs with `git-agent`, `git-agent-merge`, and `install.sh`.
+macOS releases are published as a universal Apple Silicon/Intel `.dmg`. Open it and drag `Git Agent.app` to Applications.
+
+Linux releases are published as an amd64 `.deb` with an application-menu entry, icon, command-line launchers, and all three Git Agent executables. Open it with the distribution's software installer. Debian and Ubuntu are supported by this package format.
 
 Windows releases are published as `GitAgentSetup-<version>.exe`. The setup wizard lets you choose the install path and installs both executables.
 
-User data is stored relative to the executable in `data/`, for example:
+Installed applications keep user data in a writable per-user location:
 
 ```text
-<install path>/data/config.json
-<install path>/data/tabs.json
-<install path>/data/layout.json
-<install path>/data/stores/<repository-hash>/snapshot.json
-<install path>/data/stores/<repository-hash>/commit-options.json
+Windows: <install path>/data
+macOS:   ~/Library/Application Support/Git Agent
+Linux:   $XDG_DATA_HOME/git-agent or ~/.local/share/git-agent
 ```
+
+Existing macOS/Linux data from the former `~/.local/bin/data` installer is copied automatically on first launch.
 
 The workflow keeps only the latest 3 build runs and sets uploaded installer artifacts to expire after 3 days, which helps limit GitHub Actions storage usage.
 

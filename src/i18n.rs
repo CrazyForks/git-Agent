@@ -259,6 +259,11 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ("tutorial.previous", "\u{4e0a}\u{4e00}\u{6b65}"),
     ("tutorial.next", "\u{4e0b}\u{4e00}\u{6b65}"),
     ("tutorial.finish", "\u{5b8c}\u{6210}"),
+    ("tutorial.font_settings", "\u{8c03}\u{6574}\u{5b57}\u{4f53}"),
+    (
+        "tutorial.font_recommendation",
+        "\u{63a8}\u{8350}\u{5728}\u{8bbe}\u{7f6e} > \u{5e38}\u{89c4} > \u{5916}\u{89c2}\u{4e2d}\u{9009}\u{62e9}\u{559c}\u{6b22}\u{7684} UI \u{5b57}\u{4f53}\u{3001}\u{5b57}\u{91cd}\u{548c}\u{4ee3}\u{7801}\u{5b57}\u{4f53}\u{ff0c}\u{53ef}\u{83b7}\u{5f97}\u{66f4}\u{8212}\u{9002}\u{7684}\u{9605}\u{8bfb}\u{4f53}\u{9a8c}\u{3002}",
+    ),
     ("tutorial.menus.title", "\u{4e3b}\u{83dc}\u{5355}"),
     (
         "tutorial.menus.body",
@@ -2078,6 +2083,11 @@ const EN: &[(&str, &str)] = &[
     ("tutorial.previous", "Previous"),
     ("tutorial.next", "Next"),
     ("tutorial.finish", "Finish"),
+    ("tutorial.font_settings", "Choose fonts"),
+    (
+        "tutorial.font_recommendation",
+        "For a more comfortable reading experience, choose your preferred UI family, weight, and code font in Settings > General > Appearance.",
+    ),
     ("tutorial.menus.title", "Main menus"),
     (
         "tutorial.menus.body",
