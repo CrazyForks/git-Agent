@@ -33264,6 +33264,8 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
     let mut new_line: Option<usize> = None;
     let mut hunk_index = 0usize;
     let mut has_hunk_in_file = false;
+    let mut in_hunk = false;
+    let mut prefix_width = 1usize;
 
     for line in text.lines().take(1_200) {
         let starts_file = line.starts_with("diff --git")
@@ -33278,6 +33280,8 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
             hunk_lines.clear();
             if starts_file {
                 has_hunk_in_file = false;
+                in_hunk = false;
+                prefix_width = 1;
                 old_line = None;
                 new_line = None;
                 if mode == DiffDisplayMode::Full {
@@ -33308,15 +33312,21 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
             old_line = old_start;
             new_line = new_start;
             has_hunk_in_file = true;
+            in_hunk = true;
+            prefix_width = crate::diff_tool::diff_prefix_width_from_hunk_header(line).unwrap_or(1);
             continue;
         }
 
-        let kind = if line.starts_with('+') {
-            DiffKind::Added
-        } else if line.starts_with('-') {
-            DiffKind::Removed
-        } else {
-            DiffKind::Context
+        if !in_hunk {
+            continue;
+        }
+        let Some(parsed) = crate::diff_tool::patch_content_line(line, prefix_width) else {
+            continue;
+        };
+        let kind = match parsed.kind {
+            crate::diff_tool::PatchLineKind::Added => DiffKind::Added,
+            crate::diff_tool::PatchLineKind::Removed => DiffKind::Removed,
+            crate::diff_tool::PatchLineKind::Context => DiffKind::Context,
         };
 
         let left_no = match kind {
@@ -33327,13 +33337,11 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
             DiffKind::Removed => String::new(),
             _ => new_line.map(|line| line.to_string()).unwrap_or_default(),
         };
-        let body = unified_diff_line_body(line, kind);
-
         hunk_lines.push(DiffLine {
             hunk_index,
             left_no,
             right_no,
-            body: body.to_owned(),
+            body: parsed.body.to_owned(),
             kind,
         });
 
@@ -33364,14 +33372,19 @@ fn selected_diff_hunk_patch(text: &str, selected_rows: &[DiffLineKey]) -> Option
     let mut old_line: Option<usize> = None;
     let mut new_line: Option<usize> = None;
     let mut hunk_index = 0usize;
+    let mut prefix_width = 1usize;
 
     for raw_line in text.lines() {
-        if raw_line.starts_with("diff --git") {
+        if raw_line.starts_with("diff --git")
+            || raw_line.starts_with("diff --cc ")
+            || raw_line.starts_with("diff --combined ")
+        {
             push_selected_diff_hunk(&mut hunks, &preamble, &mut current);
             preamble.clear();
             preamble.push(raw_line.to_owned());
             old_line = None;
             new_line = None;
+            prefix_width = 1;
             continue;
         }
         if raw_line.starts_with("@@") {
@@ -33380,6 +33393,8 @@ fn selected_diff_hunk_patch(text: &str, selected_rows: &[DiffLineKey]) -> Option
             let (old_start, new_start) = parse_hunk_header(raw_line);
             old_line = old_start;
             new_line = new_start;
+            prefix_width =
+                crate::diff_tool::diff_prefix_width_from_hunk_header(raw_line).unwrap_or(1);
             current = Some((raw_line.to_owned(), Vec::new(), Vec::new()));
             continue;
         }
@@ -33393,12 +33408,13 @@ fn selected_diff_hunk_patch(text: &str, selected_rows: &[DiffLineKey]) -> Option
             continue;
         }
 
-        let kind = if raw_line.starts_with('+') {
-            DiffKind::Added
-        } else if raw_line.starts_with('-') {
-            DiffKind::Removed
-        } else {
-            DiffKind::Context
+        let Some(parsed) = crate::diff_tool::patch_content_line(raw_line, prefix_width) else {
+            continue;
+        };
+        let kind = match parsed.kind {
+            crate::diff_tool::PatchLineKind::Added => DiffKind::Added,
+            crate::diff_tool::PatchLineKind::Removed => DiffKind::Removed,
+            crate::diff_tool::PatchLineKind::Context => DiffKind::Context,
         };
         let left_no = match kind {
             DiffKind::Added => String::new(),
@@ -33408,12 +33424,11 @@ fn selected_diff_hunk_patch(text: &str, selected_rows: &[DiffLineKey]) -> Option
             DiffKind::Removed => String::new(),
             _ => new_line.map(|line| line.to_string()).unwrap_or_default(),
         };
-        let body = unified_diff_line_body(raw_line, kind);
         keys.push(DiffLineKey {
             hunk_index,
             left_no,
             right_no,
-            body: body.to_owned(),
+            body: parsed.body.to_owned(),
             kind,
         });
         match kind {
@@ -33514,15 +33529,6 @@ enum DiffKind {
     Added,
     Removed,
     Context,
-}
-
-fn unified_diff_line_body(line: &str, kind: DiffKind) -> &str {
-    let marker = match kind {
-        DiffKind::Added => '+',
-        DiffKind::Removed => '-',
-        DiffKind::Context => ' ',
-    };
-    line.strip_prefix(marker).unwrap_or(line)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45571,9 +45577,9 @@ index 1111111,2222222..3333333
 --- a/src/file.rs
 +++ b/src/file.rs
 @@@ -7,2 -8,2 +109,3 @@@
- context
--removed
-+added";
+  context
+- removed
++ added";
         let items = collect_unified_diff_items(diff, DiffDisplayMode::Full);
 
         assert!(!items.iter().any(|item| match item {
@@ -45625,6 +45631,61 @@ index 1111111,2222222..3333333
         let job = diff_text_layout_job(&lines[0].body, &highlighted, Color32::BLACK);
         assert_eq!(job.sections[1].byte_range, arrow_start..arrow_start + 2);
         assert_eq!(&job.text[job.sections[1].byte_range.clone()], "=>");
+    }
+
+    #[test]
+    fn combined_conflict_diff_keeps_rendered_text_and_syntax_spans_aligned() {
+        let source = "export const EXPECTED_COUNT = 4\n\n<<<<<<< HEAD\nexport const ours = true\n=======\nexport const theirs = true\n>>>>>>> branch\n\nexport type Result = number\n\n";
+        let diff = "diff --cc src/pipeline.ts\nindex 1111111,2222222..0000000\n--- a/src/pipeline.ts\n+++ b/src/pipeline.ts\n@@@ -1,6 -1,6 +1,10 @@@\n  export const EXPECTED_COUNT = 4\n  \n++<<<<<<< HEAD\n +export const ours = true\n++=======\n+ export const theirs = true\n++>>>>>>> branch\n  \n  export type Result = number\n  \n";
+        let lines = collect_unified_diff_items(diff, DiffDisplayMode::Full)
+            .into_iter()
+            .filter_map(|item| match item {
+                DiffRenderItem::Line(line) => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.right_no.as_str(), line.body.as_str(), line.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("1", "export const EXPECTED_COUNT = 4", DiffKind::Context),
+                ("2", "", DiffKind::Context),
+                ("3", "<<<<<<< HEAD", DiffKind::Added),
+                ("4", "export const ours = true", DiffKind::Context),
+                ("5", "=======", DiffKind::Added),
+                ("6", "export const theirs = true", DiffKind::Added),
+                ("7", ">>>>>>> branch", DiffKind::Added),
+                ("8", "", DiffKind::Context),
+                ("9", "export type Result = number", DiffKind::Context),
+                ("10", "", DiffKind::Context),
+            ]
+        );
+
+        let highlighted = crate::syntax::highlight_document(
+            Path::new("C:/nonexistent-repository"),
+            "src/pipeline.ts",
+            source,
+        )
+        .unwrap();
+        let ours = lines
+            .iter()
+            .find(|line| line.body == "export const ours = true")
+            .unwrap();
+        let highlighted_line = highlighted.line(&ours.right_no).unwrap();
+        let job = diff_text_layout_job(&ours.body, highlighted_line, Color32::BLACK);
+        let export = job
+            .sections
+            .iter()
+            .find(|section| section.byte_range == (0..6))
+            .unwrap();
+        assert_eq!(&job.text[export.byte_range.clone()], "export");
+
+        let selected_patch = selected_diff_hunk_patch(diff, &[ours.key()]).unwrap();
+        assert!(selected_patch.contains("++<<<<<<< HEAD"));
+        assert!(selected_patch.contains(" +export const ours = true"));
     }
 
     #[test]

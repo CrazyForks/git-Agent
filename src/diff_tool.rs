@@ -40,6 +40,49 @@ pub enum DiffCellKind {
     Empty,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PatchLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PatchContentLine<'a> {
+    pub kind: PatchLineKind,
+    pub body: &'a str,
+}
+
+pub(crate) fn diff_prefix_width_from_hunk_header(header: &str) -> Option<usize> {
+    if !header.starts_with("@@") {
+        return None;
+    }
+    let parent_count = header
+        .split_whitespace()
+        .filter(|part| part.starts_with('-'))
+        .count();
+    (parent_count > 0).then_some(parent_count)
+}
+
+pub(crate) fn patch_content_line(line: &str, prefix_width: usize) -> Option<PatchContentLine<'_>> {
+    if prefix_width == 0 || line.starts_with("\\ No newline at end of file") {
+        return None;
+    }
+    let prefix = line.as_bytes().get(..prefix_width)?;
+    if !prefix.iter().all(|byte| matches!(byte, b'+' | b'-' | b' ')) {
+        return None;
+    }
+    let kind = match prefix[0] {
+        b'+' => PatchLineKind::Added,
+        b'-' => PatchLineKind::Removed,
+        _ => PatchLineKind::Context,
+    };
+    Some(PatchContentLine {
+        kind,
+        body: &line[prefix_width..],
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffLine {
     pub left_line: Option<usize>,
@@ -281,11 +324,15 @@ pub fn parse_side_by_side_diff(diff_text: &str) -> Vec<DiffFile> {
     let mut left_line = 0usize;
     let mut right_line = 0usize;
     let mut in_hunk = false;
+    let mut prefix_width = 1usize;
     let mut removed = Vec::<String>::new();
     let mut added = Vec::<String>::new();
 
     for raw in diff_text.lines() {
-        if raw.starts_with("diff --git ") {
+        if raw.starts_with("diff --git ")
+            || raw.starts_with("diff --cc ")
+            || raw.starts_with("diff --combined ")
+        {
             if let Some(file) = current.as_mut() {
                 flush_change_block(
                     file,
@@ -296,7 +343,7 @@ pub fn parse_side_by_side_diff(diff_text: &str) -> Vec<DiffFile> {
                 );
             }
             push_current_file(&mut files, &mut current);
-            let (left_path, right_path) = parse_diff_git_paths(raw);
+            let (left_path, right_path) = parse_diff_paths(raw);
             current = Some(DiffFile {
                 left_path,
                 right_path,
@@ -305,6 +352,7 @@ pub fn parse_side_by_side_diff(diff_text: &str) -> Vec<DiffFile> {
                 right_highlight: None,
             });
             in_hunk = false;
+            prefix_width = 1;
             left_line = 0;
             right_line = 0;
             continue;
@@ -331,6 +379,7 @@ pub fn parse_side_by_side_diff(diff_text: &str) -> Vec<DiffFile> {
                 left_line = left_start;
                 right_line = right_start;
             }
+            prefix_width = diff_prefix_width_from_hunk_header(raw).unwrap_or(1);
             file.rows.push(DiffRow::Hunk(raw.to_owned()));
             in_hunk = true;
             continue;
@@ -343,37 +392,47 @@ pub fn parse_side_by_side_diff(diff_text: &str) -> Vec<DiffFile> {
             continue;
         }
 
-        if raw.starts_with('-') && !raw.starts_with("---") {
-            removed.push(raw[1..].to_owned());
-        } else if raw.starts_with('+') && !raw.starts_with("+++") {
-            added.push(raw[1..].to_owned());
-        } else if let Some(text) = raw.strip_prefix(' ') {
-            flush_change_block(
-                file,
-                &mut removed,
-                &mut added,
-                &mut left_line,
-                &mut right_line,
-            );
-            file.rows.push(DiffRow::Line(DiffLine {
-                left_line: Some(left_line),
-                right_line: Some(right_line),
-                left_text: text.to_owned(),
-                right_text: text.to_owned(),
-                left_kind: DiffCellKind::Context,
-                right_kind: DiffCellKind::Context,
-            }));
-            left_line += 1;
-            right_line += 1;
-        } else {
-            flush_change_block(
-                file,
-                &mut removed,
-                &mut added,
-                &mut left_line,
-                &mut right_line,
-            );
-            file.rows.push(DiffRow::Meta(raw.to_owned()));
+        match patch_content_line(raw, prefix_width) {
+            Some(PatchContentLine {
+                kind: PatchLineKind::Removed,
+                body,
+            }) => removed.push(body.to_owned()),
+            Some(PatchContentLine {
+                kind: PatchLineKind::Added,
+                body,
+            }) => added.push(body.to_owned()),
+            Some(PatchContentLine {
+                kind: PatchLineKind::Context,
+                body,
+            }) => {
+                flush_change_block(
+                    file,
+                    &mut removed,
+                    &mut added,
+                    &mut left_line,
+                    &mut right_line,
+                );
+                file.rows.push(DiffRow::Line(DiffLine {
+                    left_line: Some(left_line),
+                    right_line: Some(right_line),
+                    left_text: body.to_owned(),
+                    right_text: body.to_owned(),
+                    left_kind: DiffCellKind::Context,
+                    right_kind: DiffCellKind::Context,
+                }));
+                left_line += 1;
+                right_line += 1;
+            }
+            None => {
+                flush_change_block(
+                    file,
+                    &mut removed,
+                    &mut added,
+                    &mut left_line,
+                    &mut right_line,
+                );
+                file.rows.push(DiffRow::Meta(raw.to_owned()));
+            }
         }
     }
 
@@ -496,13 +555,15 @@ fn flush_change_block(
     added.clear();
 }
 
-fn parse_diff_git_paths(line: &str) -> (String, String) {
-    let mut parts = line
-        .trim_start_matches("diff --git ")
-        .split_whitespace()
-        .map(str::to_owned);
+fn parse_diff_paths(line: &str) -> (String, String) {
+    let raw = line
+        .strip_prefix("diff --git ")
+        .or_else(|| line.strip_prefix("diff --cc "))
+        .or_else(|| line.strip_prefix("diff --combined "))
+        .unwrap_or(line);
+    let mut parts = raw.split_whitespace().map(str::to_owned);
     let left = parts.next().unwrap_or_else(|| "left".to_owned());
-    let right = parts.next().unwrap_or_else(|| "right".to_owned());
+    let right = parts.next().unwrap_or_else(|| left.clone());
     (left, right)
 }
 
@@ -518,10 +579,19 @@ struct DiffHunkRange {
 }
 
 fn parse_hunk_ranges(line: &str) -> Option<(DiffHunkRange, DiffHunkRange)> {
-    let header = line.strip_prefix("@@")?.split("@@").next()?;
-    let mut parts = header.split_whitespace();
-    let left = parse_hunk_range(parts.next()?)?;
-    let right = parse_hunk_range(parts.next()?)?;
+    let ranges = line
+        .split_whitespace()
+        .filter(|part| part.starts_with('-') || part.starts_with('+'))
+        .collect::<Vec<_>>();
+    let left = ranges
+        .iter()
+        .find(|part| part.starts_with('-'))
+        .and_then(|part| parse_hunk_range(part))?;
+    let right = ranges
+        .iter()
+        .rev()
+        .find(|part| part.starts_with('+'))
+        .and_then(|part| parse_hunk_range(part))?;
     Some((left, right))
 }
 
@@ -541,10 +611,11 @@ fn format_hunk_summary(line: &str, language: DiffLanguage) -> String {
     let Some((left, right)) = parse_hunk_ranges(line) else {
         return line.to_owned();
     };
-    let context = line
-        .split_once("@@")
-        .and_then(|(_, rest)| rest.split_once("@@"))
-        .map(|(_, context)| context.trim())
+    let marker_width = line.bytes().take_while(|byte| *byte == b'@').count();
+    let context = (marker_width >= 2)
+        .then(|| &line[marker_width..])
+        .and_then(|rest| rest.find(&line[..marker_width]).map(|end| (rest, end)))
+        .map(|(rest, end)| rest[end + marker_width..].trim())
         .filter(|context| !context.is_empty());
     let left = format_hunk_range(left);
     let right = format_hunk_range(right);
@@ -1393,6 +1464,81 @@ mod tests {
         assert!(matches!(rows[0], DiffDisplayRow::File(_)));
         assert!(matches!(rows[1], DiffDisplayRow::Hunk(_)));
         assert!(matches!(rows[2], DiffDisplayRow::Line { .. }));
+    }
+
+    #[test]
+    fn patch_prefix_parser_distinguishes_git_columns_from_source_text() {
+        assert_eq!(diff_prefix_width_from_hunk_header("@@ -1 +1 @@"), Some(1));
+        assert_eq!(
+            diff_prefix_width_from_hunk_header("@@@ -1 -1 +1 @@@"),
+            Some(2)
+        );
+        assert_eq!(
+            diff_prefix_width_from_hunk_header("@@@@ -1 -1 -1 +1 @@@@"),
+            Some(3)
+        );
+
+        assert_eq!(
+            patch_content_line("++literal-plus", 1),
+            Some(PatchContentLine {
+                kind: PatchLineKind::Added,
+                body: "+literal-plus",
+            })
+        );
+        assert_eq!(
+            patch_content_line("++<<<<<<< HEAD", 2),
+            Some(PatchContentLine {
+                kind: PatchLineKind::Added,
+                body: "<<<<<<< HEAD",
+            })
+        );
+        assert_eq!(
+            patch_content_line(" +export const ours = true", 2),
+            Some(PatchContentLine {
+                kind: PatchLineKind::Context,
+                body: "export const ours = true",
+            })
+        );
+        assert_eq!(
+            patch_content_line("+ export const theirs = true", 2),
+            Some(PatchContentLine {
+                kind: PatchLineKind::Added,
+                body: "export const theirs = true",
+            })
+        );
+        assert_eq!(patch_content_line("\\ No newline at end of file", 1), None);
+    }
+
+    #[test]
+    fn combined_diff_removes_every_parent_prefix_before_rendering() {
+        let files = parse_side_by_side_diff(
+            "diff --cc src/pipeline.ts\nindex 1111111,2222222..0000000\n--- a/src/pipeline.ts\n+++ b/src/pipeline.ts\n@@@ -1,3 -1,3 +1,7 @@@\n  const count = 1\n++<<<<<<< HEAD\n +export const ours = true\n++=======\n+ export const theirs = true\n++>>>>>>> branch\n  const done = true\n",
+        );
+        let rendered = files[0]
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::Line(line) => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let right = rendered
+            .iter()
+            .filter_map(|line| line.right_line.zip(Some(line.right_text.as_str())))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            right,
+            vec![
+                (1, "const count = 1"),
+                (2, "<<<<<<< HEAD"),
+                (3, "export const ours = true"),
+                (4, "======="),
+                (5, "export const theirs = true"),
+                (6, ">>>>>>> branch"),
+                (7, "const done = true"),
+            ]
+        );
     }
 
     #[test]
