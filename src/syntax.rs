@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -259,10 +259,20 @@ fn child_directories(root: &Path) -> Vec<PathBuf> {
 }
 
 fn safe_plugin_relative_path(path: &Path) -> bool {
-    !path.as_os_str().is_empty()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/");
+    let has_windows_drive_prefix = normalized.as_bytes().get(1) == Some(&b':')
+        && normalized
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic);
+
+    !normalized.is_empty()
+        && !normalized.starts_with('/')
+        && !has_windows_drive_prefix
+        && normalized.split('/').all(|component| component != "..")
 }
 
 fn syntax_for_path<'a>(syntax_set: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxReference> {
@@ -669,7 +679,15 @@ mod tests {
     #[test]
     fn plugin_syntax_directory_cannot_escape_plugin_root() {
         assert!(safe_plugin_relative_path(Path::new("syntaxes")));
+        assert!(safe_plugin_relative_path(Path::new("./syntaxes")));
         assert!(!safe_plugin_relative_path(Path::new("../syntaxes")));
+        assert!(!safe_plugin_relative_path(Path::new("..\\syntaxes")));
+        assert!(!safe_plugin_relative_path(Path::new("/syntaxes")));
         assert!(!safe_plugin_relative_path(Path::new("C:/syntaxes")));
+        assert!(!safe_plugin_relative_path(Path::new("C:\\syntaxes")));
+        assert!(!safe_plugin_relative_path(Path::new("C:syntaxes")));
+        assert!(!safe_plugin_relative_path(Path::new(
+            "\\\\server\\syntaxes"
+        )));
     }
 }
