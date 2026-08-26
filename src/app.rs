@@ -33278,10 +33278,7 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
             DiffKind::Removed => String::new(),
             _ => new_line.map(|line| line.to_string()).unwrap_or_default(),
         };
-        let body = line
-            .strip_prefix('+')
-            .or_else(|| line.strip_prefix('-'))
-            .unwrap_or(line);
+        let body = unified_diff_line_body(line, kind);
 
         hunk_lines.push(DiffLine {
             hunk_index,
@@ -33362,10 +33359,7 @@ fn selected_diff_hunk_patch(text: &str, selected_rows: &[DiffLineKey]) -> Option
             DiffKind::Removed => String::new(),
             _ => new_line.map(|line| line.to_string()).unwrap_or_default(),
         };
-        let body = raw_line
-            .strip_prefix('+')
-            .or_else(|| raw_line.strip_prefix('-'))
-            .unwrap_or(raw_line);
+        let body = unified_diff_line_body(raw_line, kind);
         keys.push(DiffLineKey {
             hunk_index,
             left_no,
@@ -33471,6 +33465,15 @@ enum DiffKind {
     Added,
     Removed,
     Context,
+}
+
+fn unified_diff_line_body(line: &str, kind: DiffKind) -> &str {
+    let marker = match kind {
+        DiffKind::Added => '+',
+        DiffKind::Removed => '-',
+        DiffKind::Context => ' ',
+    };
+    line.strip_prefix(marker).unwrap_or(line)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45544,6 +45547,35 @@ index 1111111,2222222..3333333
         assert_eq!(gutter.left_width, 18.0);
         assert_eq!(gutter.right_width, 29.0);
         assert!(gutter.total_width() < 96.0);
+    }
+
+    #[test]
+    fn unified_diff_strips_the_git_marker_from_every_row_kind() {
+        let diff = "@@ -1,2 +1,2 @@\n       default: ({ row }) => (\n-removed\n+added";
+        let lines = collect_unified_diff_items(diff, DiffDisplayMode::Full)
+            .into_iter()
+            .filter_map(|item| match item {
+                DiffRenderItem::Line(line) => Some(line),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines[0].kind, DiffKind::Context);
+        assert_eq!(lines[0].body, "      default: ({ row }) => (");
+        assert_eq!(lines[1].body, "removed");
+        assert_eq!(lines[2].body, "added");
+
+        let arrow_start = lines[0].body.find("=>").unwrap();
+        let highlighted = HighlightedLine {
+            spans: vec![crate::syntax::HighlightSpan {
+                start: arrow_start,
+                end: arrow_start + 2,
+                role: crate::syntax::SyntaxRole::Keyword,
+            }],
+        };
+        let job = diff_text_layout_job(&lines[0].body, &highlighted, Color32::BLACK);
+        assert_eq!(job.sections[1].byte_range, arrow_start..arrow_start + 2);
+        assert_eq!(&job.text[job.sections[1].byte_range.clone()], "=>");
     }
 
     #[test]

@@ -607,6 +607,25 @@ mod tests {
     }
 
     #[test]
+    fn vue_arrow_function_highlights_the_complete_operator() {
+        let vue_source = "<script setup lang=\"tsx\">\nconst column = { default: ({ row }) => (\n  <div class=\"box\">{row.name}</div>\n) }\n</script>\n";
+        let vue = highlight_document(
+            Path::new("C:/nonexistent-repository"),
+            "src/View.vue",
+            vue_source,
+        )
+        .unwrap();
+        let line = vue_source.lines().nth(1).unwrap();
+        let start = line.find("=>").unwrap();
+        assert!(
+            vue.lines[1]
+                .spans
+                .iter()
+                .any(|span| span.start <= start && span.end >= start + 2)
+        );
+    }
+
+    #[test]
     fn oversized_input_falls_back_to_plain_text() {
         let source = "x".repeat(MAX_HIGHLIGHT_BYTES + 1);
         assert!(highlight_document(Path::new("."), "large.rs", &source).is_none());
