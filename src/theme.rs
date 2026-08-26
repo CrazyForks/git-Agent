@@ -1378,11 +1378,13 @@ mod tests {
         ];
 
         assert_eq!(
-            resolve_font_family(&catalog, None, false).map(|font| font.name.as_str()),
+            resolve_font_family_for_os(&catalog, None, false, "windows")
+                .map(|font| font.name.as_str()),
             Some("Microsoft YaHei UI")
         );
         assert_eq!(
-            resolve_font_family(&catalog, None, true).map(|font| font.name.as_str()),
+            resolve_font_family_for_os(&catalog, None, true, "windows")
+                .map(|font| font.name.as_str()),
             Some("Cascadia Mono")
         );
         assert_eq!(
@@ -1668,13 +1670,22 @@ fn resolve_font_family<'a>(
     requested: Option<&str>,
     monospaced_only: bool,
 ) -> Option<&'a SystemFontFamily> {
+    resolve_font_family_for_os(catalog, requested, monospaced_only, std::env::consts::OS)
+}
+
+fn resolve_font_family_for_os<'a>(
+    catalog: &'a [SystemFontFamily],
+    requested: Option<&str>,
+    monospaced_only: bool,
+    os: &str,
+) -> Option<&'a SystemFontFamily> {
     if let Some(requested) = requested {
         return catalog.iter().find(|family| {
             (!monospaced_only || family.monospaced) && family.name.eq_ignore_ascii_case(requested)
         });
     }
 
-    let priorities = automatic_font_priorities(std::env::consts::OS, monospaced_only);
+    let priorities = automatic_font_priorities(os, monospaced_only);
     priorities
         .iter()
         .find_map(|name| {
