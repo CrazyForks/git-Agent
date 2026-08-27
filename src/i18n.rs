@@ -3037,6 +3037,10 @@ const EN: &[(&str, &str)] = &[
     ("worktree.accept_theirs", "Accept Theirs"),
     ("worktree.merge", "Merge Code"),
     ("worktree.merge.in_progress", "Waiting for merge result..."),
+    (
+        "worktree.conflicts.refreshing",
+        "Refreshing conflict status...",
+    ),
     ("stash.title", "Stashes"),
     ("stash.none", "No stashes"),
     ("stash.create", "Stash changes"),
@@ -3264,6 +3268,7 @@ const ZH: &[(&str, &str)] = &[
     ("worktree.accept_theirs", "接受远端"),
     ("worktree.merge", "合并代码"),
     ("worktree.merge.in_progress", "正在等待合并结果…"),
+    ("worktree.conflicts.refreshing", "正在刷新冲突状态…"),
     ("stash.title", "贮藏"),
     ("stash.none", "没有贮藏"),
     ("stash.create", "贮藏更改"),

@@ -6733,9 +6733,13 @@ impl GitAgentApp {
     }
 
     fn active_merge_tool_busy(&self) -> bool {
-        (self.merge_tool_task.is_some()
-            && self.task_root_matches_active_repo(self.merge_tool_root.as_deref()))
+        self.active_merge_tool_process_busy()
             || self.task_root_matches_active_repo(self.conflict_merge_reload_root.as_deref())
+    }
+
+    fn active_merge_tool_process_busy(&self) -> bool {
+        self.merge_tool_task.is_some()
+            && self.task_root_matches_active_repo(self.merge_tool_root.as_deref())
     }
 
     fn active_create_patch_busy(&self) -> bool {
@@ -15183,11 +15187,21 @@ impl GitAgentApp {
     fn poll_merge_tool_task(&mut self, ctx: &egui::Context) {
         if let Some(receiver) = self.merge_tool_task.take() {
             match receiver.try_recv() {
-                Ok((root, Ok(_success))) => {
+                Ok((root, Ok(true))) => {
                     self.merge_tool_root = None;
                     self.last_notice = None;
                     self.conflict_merge_reload_root = Some(root.clone());
                     self.load_repository_uncached(root);
+                    ctx.request_repaint();
+                }
+                Ok((_root, Ok(false))) => {
+                    // The standalone editor writes and stages only after Apply. Cancelling leaves
+                    // the repository untouched, so an uncached reload is both unnecessary and
+                    // actively harmful for large repositories: it keeps this dialog gated long
+                    // after the child process has already exited.
+                    self.merge_tool_root = None;
+                    self.conflict_merge_reload_root = None;
+                    self.last_notice = None;
                     ctx.request_repaint();
                 }
                 Ok((_, Err(error))) => {
@@ -17072,14 +17086,18 @@ impl GitAgentApp {
                     .as_ref()
                     .map(worktree_conflict_files)
                     .unwrap_or_default();
-                let merge_busy = self.merge_tool_busy();
+                let conflict_action_busy = self.branch_actions_busy();
+                let waiting_for_merge_result = self.active_merge_tool_process_busy();
                 let (mut selected_path, mut select_after_refresh) =
                     reconcile_conflict_dialog_selection(
                         &conflict_files,
                         selected_path,
                         select_after_refresh,
-                        merge_busy,
+                        conflict_action_busy,
                     );
+                if conflict_files.is_empty() && !conflict_action_busy {
+                    return;
+                }
                 let mut accept_side = None;
                 let mut merge_path = None;
 
@@ -17136,8 +17154,10 @@ impl GitAgentApp {
                                                         ui,
                                                         action_panel_size,
                                                         self.language,
-                                                        selected_path.is_some() && !merge_busy,
-                                                        merge_busy,
+                                                        selected_path.is_some()
+                                                            && !conflict_action_busy,
+                                                        conflict_action_busy,
+                                                        waiting_for_merge_result,
                                                     )
                                                 {
                                                     match action {
@@ -17147,8 +17167,11 @@ impl GitAgentApp {
                                                             if let Some(path) =
                                                                 selected_path.clone()
                                                             {
+                                                                select_after_refresh =
+                                                                    conflict_files.iter().position(
+                                                                        |file| file.path == path,
+                                                                    );
                                                                 accept_side = Some((path, side));
-                                                                close_after = true;
                                                             }
                                                         }
                                                         ConflictResolutionDialogAction::Merge => {
@@ -30778,9 +30801,9 @@ fn reconcile_conflict_dialog_selection(
     conflict_files: &[WorktreeFile],
     mut selected_path: Option<String>,
     mut select_after_refresh: Option<usize>,
-    merge_busy: bool,
+    action_busy: bool,
 ) -> (Option<String>, Option<usize>) {
-    if merge_busy {
+    if action_busy {
         return (selected_path, select_after_refresh);
     }
 
@@ -30970,7 +30993,8 @@ fn conflict_resolution_actions_panel(
     panel_size: Vec2,
     language: Language,
     actions_enabled: bool,
-    merge_busy: bool,
+    busy: bool,
+    waiting_for_merge_result: bool,
 ) -> Option<ConflictResolutionDialogAction> {
     let mut action = None;
     egui::Frame::new()
@@ -31014,12 +31038,17 @@ fn conflict_resolution_actions_panel(
             {
                 action = Some(ConflictResolutionDialogAction::Merge);
             }
-            if merge_busy {
+            if busy {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
+                    let status_key = if waiting_for_merge_result {
+                        "worktree.merge.in_progress"
+                    } else {
+                        "worktree.conflicts.refreshing"
+                    };
                     ui.label(
-                        RichText::new(i18n::t(language, "worktree.merge.in_progress"))
+                        RichText::new(i18n::t(language, status_key))
                             .small()
                             .color(theme::muted()),
                     );
@@ -49329,7 +49358,8 @@ diff --git a/file.txt b/file.txt
         assert!(!dialog_source.contains(".anchor(Align2::CENTER_CENTER, Vec2::ZERO)"));
         assert!(implementation_source.contains("conflict_resolution_list_panel("));
         assert!(implementation_source.contains("conflict_resolution_actions_panel("));
-        assert!(dialog_source.contains("selected_path.is_some() && !merge_busy"));
+        assert!(dialog_source.contains("!conflict_action_busy"));
+        assert!(dialog_source.contains("self.branch_actions_busy()"));
         assert!(dialog_source.contains("select_after_refresh ="));
         assert!(implementation_source.contains("CONFLICT_ACTION_BUTTON_SIZE"));
         assert!(implementation_source.contains("CONFLICT_MODAL_SIZE"));
@@ -49453,6 +49483,70 @@ diff --git a/file.txt b/file.txt
             (Some("b.ts".to_owned()), None),
             "cancelling the merge tool should keep the original file selected"
         );
+    }
+
+    #[test]
+    fn cancelling_merge_tool_releases_gate_without_repository_reload() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let poll_start = implementation.find("fn poll_merge_tool_task(").unwrap();
+        let poll_end = implementation[poll_start..]
+            .find("fn open_conflict_merge_tool(")
+            .unwrap();
+        let poll = &implementation[poll_start..poll_start + poll_end];
+        let applied_start = poll.find("Ok((root, Ok(true)))").unwrap();
+        let cancelled_start = poll.find("Ok((_root, Ok(false)))").unwrap();
+        let error_start = poll.find("Ok((_, Err(error)))").unwrap();
+        let applied = &poll[applied_start..cancelled_start];
+        let cancelled = &poll[cancelled_start..error_start];
+
+        assert!(applied.contains("self.conflict_merge_reload_root = Some(root.clone())"));
+        assert!(applied.contains("self.load_repository_uncached(root)"));
+        assert!(cancelled.contains("self.merge_tool_root = None"));
+        assert!(cancelled.contains("self.conflict_merge_reload_root = None"));
+        assert!(!cancelled.contains("self.load_repository_uncached"));
+
+        let actions_start = implementation
+            .find("fn conflict_resolution_actions_panel(")
+            .unwrap();
+        let actions_end = implementation[actions_start..]
+            .find("fn conflict_resolution_action_button(")
+            .unwrap();
+        let actions = &implementation[actions_start..actions_start + actions_end];
+        assert!(actions.contains("worktree.merge.in_progress"));
+        assert!(actions.contains("worktree.conflicts.refreshing"));
+    }
+
+    #[test]
+    fn conflict_dialog_accepts_a_side_and_refreshes_in_place() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let dialog_start = implementation_source
+            .find(
+                "WorktreeActionDialog::ResolveConflicts {\n                selected_path,\n                select_after_refresh,\n            } =>",
+            )
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn blame_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        let accept_start = dialog_source
+            .find("ConflictResolutionDialogAction::Accept(")
+            .unwrap();
+        let accept_end = dialog_source[accept_start..]
+            .find("ConflictResolutionDialogAction::Merge")
+            .unwrap();
+        let accept_source = &dialog_source[accept_start..accept_start + accept_end];
+
+        assert!(dialog_source.contains("let conflict_action_busy = self.branch_actions_busy();"));
+        assert!(dialog_source.contains("selected_path.is_some()"));
+        assert!(dialog_source.contains("&& !conflict_action_busy"));
+        assert!(accept_source.contains("select_after_refresh ="));
+        assert!(!accept_source.contains("close_after = true"));
+        assert!(dialog_source.contains("self.execute_git_action(move |root|"));
+        assert!(dialog_source.contains("self.pending_worktree_action = Some("));
+        assert!(dialog_source.contains("conflict_files.is_empty() && !conflict_action_busy"));
+        assert!(implementation_source.contains("self.load_repository_uncached(root)"));
     }
 
     #[test]

@@ -80,6 +80,10 @@ struct MergeSyntaxHighlights {
     local: Option<HighlightedDocument>,
     remote: Option<HighlightedDocument>,
     result: Option<HighlightedDocument>,
+    local_source_lines: Vec<String>,
+    remote_source_lines: Vec<String>,
+    local_unique_source_lines: HashMap<String, Option<usize>>,
+    remote_unique_source_lines: HashMap<String, Option<usize>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,8 +146,10 @@ struct PreparedMergeDocument {
     sources: MergeSourceText,
     result_text: String,
     manual_result_lines: Vec<String>,
+    result_display_rows: Vec<CachedMergeResultDisplayRow>,
     local_display_rows: Vec<CachedMergeSideDisplayRow>,
     remote_display_rows: Vec<CachedMergeSideDisplayRow>,
+    geometry_cache: MergeGeometryCache,
     local_scroll_anchors: Vec<(f32, f32)>,
     remote_scroll_anchors: Vec<(f32, f32)>,
     local_navigation_target: Option<MergeLineActionTarget>,
@@ -307,6 +313,8 @@ const MERGE_AI_MAX_MIDDLE_EDIT_EXPECTED_CHARS: usize = 512;
 const MERGE_AI_MAX_MIDDLE_EDIT_REPLACEMENT_CHARS: usize = 8 * 1024;
 const MERGE_AI_TOOL_NAME: &str = "submit_merge_suggestions";
 const MERGE_AI_OVERLAY_DRAG_MARGIN: f32 = 8.0;
+const MERGE_LOADING_CARD_WIDTH: f32 = 560.0;
+const MERGE_LOADING_CARD_HEIGHT: f32 = 272.0;
 #[cfg(target_os = "windows")]
 const MERGE_WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 static MERGE_CONNECTOR_DEBUG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -449,6 +457,13 @@ struct CachedMergeSideDisplayRow {
     action_target: Option<MergeLineActionTarget>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CachedMergeResultDisplayRow {
+    reference_text: Option<String>,
+    conflict_index: Option<usize>,
+    tone: MergeSideLineTone,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MergeResultDisplayRow<'a> {
     text: &'a str,
@@ -462,6 +477,42 @@ struct BaseOnlyDisplayGroup {
     line_index: usize,
     line_count: usize,
     missing_side: MergeSide,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CachedConflictGeometry {
+    result_span: Option<(usize, usize)>,
+    result_boundary_row: Option<usize>,
+    local_span: Option<(usize, usize)>,
+    remote_span: Option<(usize, usize)>,
+    tone: MergeSideLineTone,
+}
+
+impl Default for CachedConflictGeometry {
+    fn default() -> Self {
+        Self {
+            result_span: None,
+            result_boundary_row: None,
+            local_span: None,
+            remote_span: None,
+            tone: MergeSideLineTone::Unchanged,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CachedBaseOnlyGeometry {
+    group: BaseOnlyDisplayGroup,
+    result_row: usize,
+    side_boundary_row: usize,
+    local_row: Option<usize>,
+    remote_row: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MergeGeometryCache {
+    conflicts: HashMap<usize, CachedConflictGeometry>,
+    base_only_groups: Vec<CachedBaseOnlyGeometry>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1311,8 +1362,10 @@ pub struct MergeToolApp {
     document: MergeDocument,
     result_text: String,
     manual_result_lines: Vec<String>,
+    result_display_rows: Vec<CachedMergeResultDisplayRow>,
     local_display_rows: Vec<CachedMergeSideDisplayRow>,
     remote_display_rows: Vec<CachedMergeSideDisplayRow>,
+    geometry_cache: MergeGeometryCache,
     local_scroll_anchors: Vec<(f32, f32)>,
     remote_scroll_anchors: Vec<(f32, f32)>,
     manual_result_override: bool,
@@ -1331,6 +1384,7 @@ pub struct MergeToolApp {
     write_task: Option<Receiver<anyhow::Result<()>>>,
     ai_task: Option<Receiver<Result<Vec<MergeAiSuggestion>, String>>>,
     ai_suggestions: HashMap<MergeLineActionTarget, MergeAiSuggestion>,
+    ai_middle_edit_rows: HashMap<String, Option<usize>>,
     ai_overlay_offsets: HashMap<(MergeLineActionTarget, MergeAiCardPlacement), Vec2>,
     ai_logged_missing_anchors: HashSet<(MergeLineActionTarget, MergeSide)>,
     ai_notice: Option<MergeAiNotice>,
@@ -1349,6 +1403,11 @@ pub struct MergeToolApp {
     result_highlight_task: Option<Receiver<(u64, Option<HighlightedDocument>)>>,
     result_highlight_revision: u64,
     result_highlight_due: Option<Instant>,
+    frame_window_started: Instant,
+    frame_count: u64,
+    frame_total: Duration,
+    frame_max: Duration,
+    frame_logged_once: bool,
 }
 
 impl MergeToolApp {
@@ -1397,6 +1456,13 @@ impl MergeToolApp {
             &result_display_rows,
             &remote_display_rows,
         );
+        let result_display_rows = cached_merge_result_display_rows(&result_display_rows);
+        let geometry_cache = merge_geometry_cache(
+            &document,
+            &result_display_rows,
+            &local_display_rows,
+            &remote_display_rows,
+        );
         let local_navigation_target = merge_navigation_targets(&document, MergeSide::Local)
             .first()
             .copied();
@@ -1413,8 +1479,10 @@ impl MergeToolApp {
             document,
             result_text,
             manual_result_lines,
+            result_display_rows,
             local_display_rows,
             remote_display_rows,
+            geometry_cache,
             local_scroll_anchors,
             remote_scroll_anchors,
             manual_result_override: false,
@@ -1435,6 +1503,7 @@ impl MergeToolApp {
             write_task: None,
             ai_task: None,
             ai_suggestions: HashMap::new(),
+            ai_middle_edit_rows: HashMap::new(),
             ai_overlay_offsets: HashMap::new(),
             ai_logged_missing_anchors: HashSet::new(),
             ai_notice: None,
@@ -1456,6 +1525,11 @@ impl MergeToolApp {
             result_highlight_task: None,
             result_highlight_revision: 0,
             result_highlight_due: None,
+            frame_window_started: Instant::now(),
+            frame_count: 0,
+            frame_total: Duration::ZERO,
+            frame_max: Duration::ZERO,
+            frame_logged_once: false,
         }
     }
 
@@ -1469,8 +1543,10 @@ impl MergeToolApp {
             document: prepared.document,
             result_text: prepared.result_text,
             manual_result_lines: prepared.manual_result_lines,
+            result_display_rows: prepared.result_display_rows,
             local_display_rows: prepared.local_display_rows,
             remote_display_rows: prepared.remote_display_rows,
+            geometry_cache: prepared.geometry_cache,
             local_scroll_anchors: prepared.local_scroll_anchors,
             remote_scroll_anchors: prepared.remote_scroll_anchors,
             manual_result_override: false,
@@ -1491,6 +1567,7 @@ impl MergeToolApp {
             write_task: None,
             ai_task: None,
             ai_suggestions: HashMap::new(),
+            ai_middle_edit_rows: HashMap::new(),
             ai_overlay_offsets: HashMap::new(),
             ai_logged_missing_anchors: HashSet::new(),
             ai_notice: None,
@@ -1509,6 +1586,11 @@ impl MergeToolApp {
             result_highlight_task: None,
             result_highlight_revision: 0,
             result_highlight_due: None,
+            frame_window_started: Instant::now(),
+            frame_count: 0,
+            frame_total: Duration::ZERO,
+            frame_max: Duration::ZERO,
+            frame_logged_once: false,
         }
     }
 
@@ -1683,6 +1765,7 @@ impl MergeToolApp {
         );
         let (sender, receiver) = mpsc::channel();
         self.ai_suggestions.clear();
+        self.ai_middle_edit_rows.clear();
         self.ai_overlay_offsets.clear();
         self.ai_logged_missing_anchors.clear();
         self.ai_task = Some(receiver);
@@ -1746,6 +1829,7 @@ impl MergeToolApp {
                     .into_iter()
                     .map(|suggestion| (suggestion.target, suggestion))
                     .collect();
+                self.rebuild_ai_middle_edit_rows();
                 self.ai_overlay_offsets.clear();
                 self.ai_logged_missing_anchors.clear();
                 self.ai_notice = Some(if suggestion_count == 0 {
@@ -1861,6 +1945,7 @@ impl MergeToolApp {
 
     fn ignore_ai_suggestion(&mut self, target: MergeLineActionTarget) {
         self.ai_suggestions.remove(&target);
+        self.rebuild_ai_middle_edit_rows();
         self.ai_overlay_offsets
             .retain(|(current, _), _| *current != target);
     }
@@ -1989,25 +2074,43 @@ impl MergeToolApp {
     }
 
     fn rebuild_display_rows(&mut self) {
-        self.local_display_rows = cached_merge_side_display_rows(&self.document, MergeSide::Local);
-        self.remote_display_rows =
-            cached_merge_side_display_rows(&self.document, MergeSide::Remote);
+        let local_display_rows = cached_merge_side_display_rows(&self.document, MergeSide::Local);
+        let remote_display_rows = cached_merge_side_display_rows(&self.document, MergeSide::Remote);
         let result_display_rows = merge_result_display_rows(&self.document);
-        self.local_scroll_anchors = merge_cached_scroll_anchors(
+        let local_scroll_anchors = merge_cached_scroll_anchors(
             &self.document,
             MergeSide::Local,
             &result_display_rows,
-            &self.local_display_rows,
+            &local_display_rows,
         );
-        self.remote_scroll_anchors = merge_cached_scroll_anchors(
+        let remote_scroll_anchors = merge_cached_scroll_anchors(
             &self.document,
             MergeSide::Remote,
             &result_display_rows,
-            &self.remote_display_rows,
+            &remote_display_rows,
         );
+        let result_display_rows = cached_merge_result_display_rows(&result_display_rows);
+        let geometry_cache = merge_geometry_cache(
+            &self.document,
+            &result_display_rows,
+            &local_display_rows,
+            &remote_display_rows,
+        );
+        self.local_display_rows = local_display_rows;
+        self.remote_display_rows = remote_display_rows;
+        self.result_display_rows = result_display_rows;
+        self.geometry_cache = geometry_cache;
+        self.local_scroll_anchors = local_scroll_anchors;
+        self.remote_scroll_anchors = remote_scroll_anchors;
+        self.rebuild_ai_middle_edit_rows();
         // Rows may appear or disappear after accepting a deletion or undoing it. Give all
         // three ScrollAreas a fresh identity so egui cannot retain geometry from another shape.
         self.display_epoch = self.display_epoch.wrapping_add(1);
+    }
+
+    fn rebuild_ai_middle_edit_rows(&mut self) {
+        self.ai_middle_edit_rows =
+            merge_ai_middle_edit_row_cache(&self.ai_suggestions, &self.manual_result_lines);
     }
 
     fn uses_virtual_merge_rows(&self) -> bool {
@@ -2178,6 +2281,46 @@ impl MergeToolApp {
                 }
             }
         }
+    }
+
+    fn record_frame_performance(&mut self, elapsed: Duration) {
+        self.frame_count = self.frame_count.saturating_add(1);
+        self.frame_total += elapsed;
+        self.frame_max = self.frame_max.max(elapsed);
+        let window = self.frame_window_started.elapsed();
+        let report_after = if self.frame_logged_once {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(2)
+        };
+        if window < report_after {
+            return;
+        }
+
+        let average_ms = self.frame_total.as_secs_f64() * 1_000.0 / self.frame_count.max(1) as f64;
+        let max_ms = self.frame_max.as_secs_f64() * 1_000.0;
+        if !self.frame_logged_once || average_ms >= 8.0 || max_ms >= 32.0 {
+            crate::diagnostics::merge_tool_info(
+                "frame.performance",
+                &format!(
+                    "output={} window_ms={} frames={} avg_ms={average_ms:.2} max_ms={max_ms:.2} document_lines={} result_rows={} local_rows={} remote_rows={} conflicts={} deletion_groups={}",
+                    self.args.output.display(),
+                    window.as_millis(),
+                    self.frame_count,
+                    self.document.lines.len(),
+                    self.result_display_rows.len(),
+                    self.local_display_rows.len(),
+                    self.remote_display_rows.len(),
+                    self.document.conflicts().len(),
+                    self.geometry_cache.base_only_groups.len(),
+                ),
+            );
+        }
+        self.frame_window_started = Instant::now();
+        self.frame_count = 0;
+        self.frame_total = Duration::ZERO;
+        self.frame_max = Duration::ZERO;
+        self.frame_logged_once = true;
     }
 }
 
@@ -4141,6 +4284,7 @@ fn normalize_merge_ai_code(value: &str) -> String {
 
 impl App for MergeToolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_started = Instant::now();
         self.poll_load_task(ctx);
         self.poll_result_highlight(ctx);
         self.poll_write_task(ctx);
@@ -4162,6 +4306,7 @@ impl App for MergeToolApp {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(palette.bg))
                 .show(ctx, |ui| merge_loading_panel(ui, self, palette));
+            self.record_frame_performance(frame_started.elapsed());
             return;
         }
 
@@ -4185,6 +4330,7 @@ impl App for MergeToolApp {
             .show(ctx, |ui| merge_editor_columns(ui, self, palette));
 
         merge_cancel_confirm_dialog(ctx, self, palette);
+        self.record_frame_performance(frame_started.elapsed());
     }
 }
 
@@ -4245,6 +4391,23 @@ fn load_merge_document(
         },
     );
     let prepare_elapsed = prepare_started_at.elapsed();
+    let load_fields = format!(
+        "output={} bytes={} lines={} read_ms={} compare_ms={} prepare_ms={} total_ms={} document_lines={} result_rows={} local_rows={} remote_rows={} conflicts={} deletion_groups={}",
+        args.output.display(),
+        total_bytes,
+        total_lines,
+        read_elapsed.as_millis(),
+        compare_elapsed.as_millis(),
+        prepare_elapsed.as_millis(),
+        started_at.elapsed().as_millis(),
+        prepared.document.lines.len(),
+        prepared.result_display_rows.len(),
+        prepared.local_display_rows.len(),
+        prepared.remote_display_rows.len(),
+        prepared.document.conflicts().len(),
+        prepared.geometry_cache.base_only_groups.len(),
+    );
+    crate::diagnostics::merge_tool_info("load.finished", &load_fields);
     eprintln!(
         "[merge-load] file={} bytes={} lines={} read_ms={} compare_ms={} prepare_ms={} total_ms={}",
         args.output.display(),
@@ -4283,6 +4446,13 @@ fn prepare_merge_document(
         &result_display_rows,
         &remote_display_rows,
     );
+    let result_display_rows = cached_merge_result_display_rows(&result_display_rows);
+    let geometry_cache = merge_geometry_cache(
+        &document,
+        &result_display_rows,
+        &local_display_rows,
+        &remote_display_rows,
+    );
     let local_navigation_target = merge_navigation_targets(&document, MergeSide::Local)
         .first()
         .copied();
@@ -4292,9 +4462,31 @@ fn prepare_merge_document(
     let initial_document = document.clone();
     let repository_root = merge_syntax_repository_root(args);
     let path = merge_syntax_path(args);
+    let local_highlight =
+        crate::syntax::highlight_document(&repository_root, &path, &sources.local);
+    let remote_highlight =
+        crate::syntax::highlight_document(&repository_root, &path, &sources.remote);
+    let local_source_lines = local_highlight
+        .is_some()
+        .then(|| sources.local.lines().map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let remote_source_lines = remote_highlight
+        .is_some()
+        .then(|| {
+            sources
+                .remote
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let syntax_highlights = MergeSyntaxHighlights {
-        local: crate::syntax::highlight_document(&repository_root, &path, &sources.local),
-        remote: crate::syntax::highlight_document(&repository_root, &path, &sources.remote),
+        local_unique_source_lines: merge_unique_source_line_indices(&local_source_lines),
+        remote_unique_source_lines: merge_unique_source_line_indices(&remote_source_lines),
+        local_source_lines,
+        remote_source_lines,
+        local: local_highlight,
+        remote: remote_highlight,
         result: crate::syntax::highlight_document(
             &repository_root,
             &path,
@@ -4307,8 +4499,10 @@ fn prepare_merge_document(
         sources,
         result_text,
         manual_result_lines,
+        result_display_rows,
         local_display_rows,
         remote_display_rows,
+        geometry_cache,
         local_scroll_anchors,
         remote_scroll_anchors,
         local_navigation_target,
@@ -4438,8 +4632,6 @@ fn merge_custom_title_bar(
 }
 
 fn merge_loading_panel(ui: &mut Ui, app: &MergeToolApp, palette: MergePalette) {
-    let card_width = (ui.available_width() - 32.0).clamp(320.0, 520.0);
-    let content_width = card_width - 36.0;
     let elapsed = app
         .load_started_at
         .map(|started_at| started_at.elapsed().as_secs_f32())
@@ -4450,129 +4642,208 @@ fn merge_loading_panel(ui: &mut Ui, app: &MergeToolApp, palette: MergePalette) {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_else(|| app.args.output.to_str().unwrap_or("merge result"));
+    let available = ui.available_rect_before_wrap();
+    let card_rect = merge_loading_card_rect(available);
 
-    ui.add_space(44.0);
-    ui.horizontal(|ui| {
-        ui.add_space(((ui.available_width() - card_width) * 0.5).max(0.0));
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(card_rect), |ui| {
         egui::Frame::new()
             .fill(palette.panel)
             .shadow(palette.shadow)
-            .corner_radius(egui::CornerRadius::same(MERGE_PANEL_RADIUS))
-            .inner_margin(egui::Margin::same(18))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(24))
             .show(ui, |ui| {
-                ui.set_min_width(content_width);
-                ui.set_max_width(content_width);
+                let content_size = card_rect.size() - Vec2::splat(48.0);
+                ui.set_min_size(content_size);
+                ui.set_max_size(content_size);
 
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(mt(app.language, "loading_title"))
-                            .size(16.0)
-                            .strong()
-                            .color(palette.text),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (header_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::hover());
+                let spinner_rect = Rect::from_min_size(header_rect.min, Vec2::splat(40.0));
+                let elapsed_rect = Rect::from_center_size(
+                    Pos2::new(header_rect.right() - 34.0, header_rect.center().y),
+                    Vec2::new(68.0, 28.0),
+                );
+                let title_rect = Rect::from_min_max(
+                    Pos2::new(spinner_rect.right() + 14.0, header_rect.top()),
+                    Pos2::new(elapsed_rect.left() - 12.0, header_rect.bottom()),
+                );
+                ui.painter().circle_filled(
+                    spinner_rect.center(),
+                    20.0,
+                    color_with_opacity(palette.accent, 0.10),
+                );
+                ui.put(
+                    spinner_rect.shrink(9.0),
+                    egui::Spinner::new().size(22.0).color(palette.accent),
+                );
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_rect), |ui| {
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.label(
-                            RichText::new(format!("{elapsed:.1} s"))
-                                .size(12.0)
-                                .color(palette.muted),
+                            RichText::new(mt(app.language, "loading_title"))
+                                .size(18.0)
+                                .strong()
+                                .color(palette.text),
+                        );
+                        ui.label(
+                            RichText::new(merge_loading_active_stage_label(
+                                app.language,
+                                app.load_progress.stage,
+                            ))
+                            .size(11.0)
+                            .color(palette.accent),
                         );
                     });
                 });
+                ui.painter().rect_filled(
+                    elapsed_rect,
+                    egui::CornerRadius::same(14),
+                    palette.panel_soft,
+                );
+                ui.painter().text(
+                    elapsed_rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!("{elapsed:.1} s"),
+                    FontId::proportional(11.0),
+                    palette.muted,
+                );
 
-                ui.add_space(8.0);
-                ui.label(RichText::new(file_name).size(13.0).color(palette.text));
-                let scale = merge_loading_scale_label(app.language, app.load_progress);
-                if !scale.is_empty() {
-                    ui.label(RichText::new(scale).size(11.0).color(palette.muted));
-                }
-
-                ui.add_space(12.0);
-                for (index, (stage, label_key)) in [
-                    (MergeLoadStage::ReadingFiles, "loading_reading"),
-                    (MergeLoadStage::ComparingChanges, "loading_comparing"),
-                    (MergeLoadStage::PreparingEditor, "loading_preparing"),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    merge_loading_stage_row(
-                        ui,
-                        index,
-                        stage,
-                        label_key,
-                        app.load_progress.stage,
-                        app.language,
-                        palette,
-                    );
-                    if index < 2 {
-                        ui.add_space(5.0);
-                    }
-                }
+                ui.add_space(14.0);
+                egui::Frame::new()
+                    .fill(palette.panel_soft)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(file_name)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(palette.text),
+                            )
+                            .truncate(),
+                        );
+                        let scale = merge_loading_scale_label(app.language, app.load_progress);
+                        if !scale.is_empty() {
+                            ui.label(RichText::new(scale).size(11.0).color(palette.muted));
+                        }
+                    });
+                ui.add_space(18.0);
+                merge_loading_progress_track(ui, app.load_progress.stage, app.language, palette);
             });
     });
 }
 
-fn merge_loading_stage_row(
+fn merge_loading_card_rect(available: Rect) -> Rect {
+    let margin = Vec2::splat(24.0);
+    let maximum = (available.size() - margin * 2.0).max(Vec2::ZERO);
+    let size = Vec2::new(
+        MERGE_LOADING_CARD_WIDTH.min(maximum.x),
+        MERGE_LOADING_CARD_HEIGHT.min(maximum.y),
+    );
+    Rect::from_center_size(available.center(), size)
+}
+
+fn merge_loading_active_stage_label(
+    language: MergeLanguage,
+    current_stage: MergeLoadStage,
+) -> String {
+    let label_key = match current_stage {
+        MergeLoadStage::ReadingFiles => "loading_reading",
+        MergeLoadStage::ComparingChanges => "loading_comparing",
+        MergeLoadStage::PreparingEditor => "loading_preparing",
+    };
+    format!(
+        "{} · {}",
+        mt(language, label_key),
+        mt(language, "loading_active")
+    )
+}
+
+fn merge_loading_progress_track(
     ui: &mut Ui,
-    index: usize,
-    stage: MergeLoadStage,
-    label_key: &str,
     current_stage: MergeLoadStage,
     language: MergeLanguage,
     palette: MergePalette,
 ) {
     let current_index = merge_load_stage_index(current_stage);
-    let completed = index < current_index;
-    let active = stage == current_stage;
-    let marker_color = if completed || active {
-        palette.accent
-    } else {
-        color_with_opacity(palette.muted, 0.42)
-    };
-    let state_key = if completed {
-        "loading_done"
-    } else if active {
-        "loading_active"
-    } else {
-        "loading_waiting"
-    };
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 62.0), Sense::hover());
+    let slot_width = rect.width() / 3.0;
+    let centers = (0..3)
+        .map(|index| {
+            Pos2::new(
+                rect.left() + slot_width * (index as f32 + 0.5),
+                rect.top() + 9.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let painter = ui.painter();
+    painter.line_segment(
+        [centers[0], centers[2]],
+        egui::Stroke::new(2.0, color_with_opacity(palette.muted, 0.22)),
+    );
+    painter.line_segment(
+        [centers[0], centers[current_index]],
+        egui::Stroke::new(2.0, palette.accent),
+    );
 
-    ui.horizontal(|ui| {
-        let (marker_rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
-        ui.painter()
-            .circle_filled(marker_rect.center(), 5.0, marker_color);
+    for (index, (label_key, center)) in
+        ["loading_reading", "loading_comparing", "loading_preparing"]
+            .into_iter()
+            .zip(centers)
+            .enumerate()
+    {
+        let completed = index < current_index;
+        let active = index == current_index;
+        if completed || active {
+            painter.circle_filled(center, 7.0, palette.accent);
+        } else {
+            painter.circle_filled(center, 7.0, palette.panel);
+            painter.circle_stroke(
+                center,
+                7.0,
+                egui::Stroke::new(1.5, color_with_opacity(palette.muted, 0.46)),
+            );
+        }
         if completed {
-            let center = marker_rect.center();
             let stroke = egui::Stroke::new(1.4, Color32::WHITE);
-            ui.painter().line_segment(
+            painter.line_segment(
                 [center + Vec2::new(-2.4, 0.0), center + Vec2::new(-0.5, 2.0)],
                 stroke,
             );
-            ui.painter().line_segment(
+            painter.line_segment(
                 [center + Vec2::new(-0.5, 2.0), center + Vec2::new(3.0, -2.2)],
                 stroke,
             );
+        } else if active {
+            painter.circle_filled(center, 2.5, palette.panel);
         }
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(mt(language, label_key))
-                .size(13.0)
-                .color(if active { palette.text } else { palette.muted }),
+        painter.text(
+            Pos2::new(center.x, rect.top() + 24.0),
+            Align2::CENTER_TOP,
+            mt(language, label_key),
+            FontId::proportional(12.0),
+            if active { palette.text } else { palette.muted },
         );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(mt(language, state_key))
-                    .size(11.0)
-                    .color(if active {
-                        palette.accent
-                    } else {
-                        palette.muted
-                    }),
-            );
-        });
-    });
+        let state_key = if completed {
+            "loading_done"
+        } else if active {
+            "loading_active"
+        } else {
+            "loading_waiting"
+        };
+        painter.text(
+            Pos2::new(center.x, rect.top() + 43.0),
+            Align2::CENTER_TOP,
+            mt(language, state_key),
+            FontId::proportional(10.0),
+            if active {
+                palette.accent
+            } else {
+                palette.muted
+            },
+        );
+    }
 }
 
 fn merge_load_stage_index(stage: MergeLoadStage) -> usize {
@@ -5027,6 +5298,17 @@ fn merge_cancel_confirm_dialog(ctx: &egui::Context, app: &mut MergeToolApp, pale
     app.show_cancel_confirm = open && !continue_merge;
 }
 
+fn merge_pane_ui<R>(ui: &mut Ui, pane: Rect, body: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(pane), |ui| {
+        // `UiBuilder::max_rect` is a layout hint, not a hard boundary: an oversized child can
+        // expand the child Ui beyond it. Each merge pane must keep an explicit paint clip so a
+        // wide editable line cannot cover its neighboring pane or the overview strip.
+        ui.shrink_clip_rect(pane);
+        body(ui)
+    })
+    .inner
+}
+
 fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
     let available = ui
         .available_rect_before_wrap()
@@ -5105,11 +5387,10 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
         search_result_y: None,
         geometry: MergePanelGeometry::default(),
     };
-    let use_virtual_rows = app.uses_virtual_merge_rows();
     // Collapsed tails replace many rows with one marker. Their display coordinates are no longer
     // the source-document coordinates used by the normal three-way anchor mapper.
     let use_direct_shared_scroll = app.collapse_unchanged;
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(result), |ui| {
+    merge_pane_ui(ui, result, |ui| {
         result_output = merge_result_panel(
             ui,
             app,
@@ -5124,48 +5405,40 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
     let mut next_shared_scroll_y = frame_scroll_y;
     let local_scroll_y = if use_direct_shared_scroll {
         frame_scroll_y
-    } else if use_virtual_rows {
-        app.cached_side_scroll_y_for_result_scroll(MergeSide::Local, frame_scroll_y)
     } else {
-        merge_side_scroll_y_for_result_scroll(&app.document, MergeSide::Local, frame_scroll_y)
+        app.cached_side_scroll_y_for_result_scroll(MergeSide::Local, frame_scroll_y)
     };
-    let local_output = ui
-        .allocate_new_ui(egui::UiBuilder::new().max_rect(left), |ui| {
-            merge_side_panel(
-                ui,
-                app,
-                MergeSide::Local,
-                "merge_local_scroll",
-                requested_scroll_x,
-                code_content_width,
-                local_scroll_y,
-                side_scroll_input.is_some_and(|(side, _)| side == MergeSide::Local),
-                palette,
-            )
-        })
-        .inner;
+    let local_output = merge_pane_ui(ui, left, |ui| {
+        merge_side_panel(
+            ui,
+            app,
+            MergeSide::Local,
+            "merge_local_scroll",
+            requested_scroll_x,
+            code_content_width,
+            local_scroll_y,
+            side_scroll_input.is_some_and(|(side, _)| side == MergeSide::Local),
+            palette,
+        )
+    });
     let remote_scroll_y = if use_direct_shared_scroll {
         frame_scroll_y
-    } else if use_virtual_rows {
-        app.cached_side_scroll_y_for_result_scroll(MergeSide::Remote, frame_scroll_y)
     } else {
-        merge_side_scroll_y_for_result_scroll(&app.document, MergeSide::Remote, frame_scroll_y)
+        app.cached_side_scroll_y_for_result_scroll(MergeSide::Remote, frame_scroll_y)
     };
-    let remote_output = ui
-        .allocate_new_ui(egui::UiBuilder::new().max_rect(right), |ui| {
-            merge_side_panel(
-                ui,
-                app,
-                MergeSide::Remote,
-                "merge_remote_scroll",
-                requested_scroll_x,
-                code_content_width,
-                remote_scroll_y,
-                side_scroll_input.is_some_and(|(side, _)| side == MergeSide::Remote),
-                palette,
-            )
-        })
-        .inner;
+    let remote_output = merge_pane_ui(ui, right, |ui| {
+        merge_side_panel(
+            ui,
+            app,
+            MergeSide::Remote,
+            "merge_remote_scroll",
+            requested_scroll_x,
+            code_content_width,
+            remote_scroll_y,
+            side_scroll_input.is_some_and(|(side, _)| side == MergeSide::Remote),
+            palette,
+        )
+    });
 
     // Navigation is a single result-coordinate action. Resolve it after both side panes render so
     // the other pane's ordinary scroll synchronization cannot overwrite the requested conflict.
@@ -5216,6 +5489,7 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
     paint_merge_block_connectors(
         ui,
         &app.document,
+        &app.geometry_cache,
         &local_output.geometry,
         &result_output.geometry,
         &remote_output.geometry,
@@ -5458,18 +5732,23 @@ fn merge_ai_suggestion_overlays(
     if app.ai_task.is_some() || app.manual_result_override {
         return None;
     }
-    let suggestions = app.ai_suggestions.values().cloned().collect::<Vec<_>>();
+    // Copy only small stable keys. Cloning complete AI suggestions here used to duplicate long
+    // reasons and replacement text on every frame, which made card dragging stall on large files.
+    let suggestion_targets = app.ai_suggestions.keys().copied().collect::<Vec<_>>();
     let mut action = None;
-    for suggestion in suggestions {
+    for suggestion_target in suggestion_targets {
+        let Some(suggestion) = app.ai_suggestions.get(&suggestion_target) else {
+            continue;
+        };
         let local_action_anchor = merge_ai_action_anchor(
-            &app.document,
+            &app.geometry_cache,
             local_geometry,
             &app.local_display_rows,
             suggestion.target,
             MergeSide::Local,
         );
         let remote_action_anchor = merge_ai_action_anchor(
-            &app.document,
+            &app.geometry_cache,
             remote_geometry,
             &app.remote_display_rows,
             suggestion.target,
@@ -5479,7 +5758,7 @@ fn merge_ai_suggestion_overlays(
             match (local_action_anchor, remote_action_anchor) {
                 (Some(local), Some(remote)) => {
                     let Some(anchor) = merge_ai_middle_anchor(
-                        &app.document,
+                        &app.geometry_cache,
                         result_geometry,
                         suggestion.target,
                         local,
@@ -5491,7 +5770,7 @@ fn merge_ai_suggestion_overlays(
                 }
                 (Some(local), None) => {
                     let Some(anchor) = merge_ai_suggestion_anchor(
-                        &app.document,
+                        &app.geometry_cache,
                         local_geometry,
                         &app.local_display_rows,
                         suggestion.target,
@@ -5507,7 +5786,7 @@ fn merge_ai_suggestion_overlays(
                 }
                 (None, Some(remote)) => {
                     let Some(anchor) = merge_ai_suggestion_anchor(
-                        &app.document,
+                        &app.geometry_cache,
                         remote_geometry,
                         &app.remote_display_rows,
                         suggestion.target,
@@ -5540,7 +5819,7 @@ fn merge_ai_suggestion_overlays(
         for edit in &suggestion.middle_edits {
             if let Some(edit_anchor) = merge_ai_middle_edit_anchor(
                 result_geometry,
-                &app.manual_result_lines,
+                &app.ai_middle_edit_rows,
                 &edit.expected_text,
             ) {
                 connector_anchors.push(edit_anchor);
@@ -5695,27 +5974,29 @@ fn merge_ai_suggestion_overlays(
 }
 
 fn merge_ai_middle_anchor(
-    document: &MergeDocument,
+    cache: &MergeGeometryCache,
     result_geometry: &MergePanelGeometry,
     target: MergeLineActionTarget,
     local_anchor: Pos2,
     remote_anchor: Pos2,
 ) -> Option<Rect> {
     let rect = match target {
-        MergeLineActionTarget::Conflict(index) => document
-            .conflicts()
+        MergeLineActionTarget::Conflict(index) => cache.conflicts.get(&index).and_then(|cached| {
+            cached
+                .result_span
+                .and_then(|(first, count)| result_geometry.span_rect(first, count))
+                .or_else(|| {
+                    cached.result_boundary_row.and_then(|row| {
+                        result_geometry.boundary_marker_rect(row, MERGE_BASE_ONLY_MARKER_HEIGHT)
+                    })
+                })
+        }),
+        MergeLineActionTarget::BaseOnlyGroup(line_index) => cache
+            .base_only_groups
             .iter()
-            .find(|conflict| conflict.index == index)
-            .and_then(|conflict| {
-                merge_block_result_rect_from_geometry(document, conflict, result_geometry).or_else(
-                    || merge_conflict_insertion_marker_rect(document, conflict, result_geometry),
-                )
-            }),
-        MergeLineActionTarget::BaseOnlyGroup(line_index) => base_only_display_groups(document)
-            .into_iter()
-            .find(|group| group.line_index == line_index)
-            .and_then(|group| {
-                merge_base_only_result_rect_from_geometry(document, group, result_geometry)
+            .find(|cached| cached.group.line_index == line_index)
+            .and_then(|cached| {
+                result_geometry.span_rect(cached.result_row, cached.group.line_count)
             }),
     };
     rect.or_else(|| {
@@ -5730,10 +6011,10 @@ fn merge_ai_middle_anchor(
 
 fn merge_ai_middle_edit_anchor(
     geometry: &MergePanelGeometry,
-    lines: &[String],
+    middle_edit_rows: &HashMap<String, Option<usize>>,
     expected_text: &str,
 ) -> Option<Pos2> {
-    let row_index = merge_ai_middle_edit_row(lines, expected_text)?;
+    let row_index = middle_edit_rows.get(expected_text).copied().flatten()?;
     geometry
         .rows
         .iter()
@@ -5741,29 +6022,41 @@ fn merge_ai_middle_edit_anchor(
         .map(|(_, rect)| rect.left_center())
 }
 
-fn merge_ai_middle_edit_row(lines: &[String], expected_text: &str) -> Option<usize> {
-    if expected_text.is_empty() || expected_text.contains(['\r', '\n']) {
-        return None;
-    }
-    let matches = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| line.contains(expected_text).then_some(index))
-        .collect::<Vec<_>>();
-    let [row_index] = matches.as_slice() else {
-        return None;
-    };
-    Some(*row_index)
-}
-
 fn merge_ai_pending_middle_edit_rows(
     suggestions: &HashMap<MergeLineActionTarget, MergeAiSuggestion>,
-    lines: &[String],
+    middle_edit_rows: &HashMap<String, Option<usize>>,
 ) -> HashSet<usize> {
     suggestions
         .values()
         .flat_map(|suggestion| suggestion.middle_edits.iter())
-        .filter_map(|edit| merge_ai_middle_edit_row(lines, &edit.expected_text))
+        .filter_map(|edit| middle_edit_rows.get(&edit.expected_text).copied().flatten())
+        .collect()
+}
+
+fn merge_ai_middle_edit_row_cache(
+    suggestions: &HashMap<MergeLineActionTarget, MergeAiSuggestion>,
+    lines: &[String],
+) -> HashMap<String, Option<usize>> {
+    let mut matches = suggestions
+        .values()
+        .flat_map(|suggestion| suggestion.middle_edits.iter())
+        .map(|edit| edit.expected_text.as_str())
+        .filter(|expected| !expected.is_empty() && !expected.contains(['\r', '\n']))
+        .map(|expected| (expected.to_owned(), (0_usize, None)))
+        .collect::<HashMap<_, _>>();
+
+    for (row_index, line) in lines.iter().enumerate() {
+        for (expected, (count, unique_row)) in &mut matches {
+            if line.contains(expected.as_str()) {
+                *count += 1;
+                *unique_row = (*count == 1).then_some(row_index);
+            }
+        }
+    }
+
+    matches
+        .into_iter()
+        .map(|(expected, (count, row))| (expected, (count == 1).then_some(row).flatten()))
         .collect()
 }
 
@@ -5789,7 +6082,7 @@ fn merge_ai_overlay_allowed_offset(viewport: Rect, anchor_pos: Pos2, card_size: 
 }
 
 fn merge_ai_action_anchor(
-    document: &MergeDocument,
+    cache: &MergeGeometryCache,
     geometry: &MergePanelGeometry,
     rows: &[CachedMergeSideDisplayRow],
     target: MergeLineActionTarget,
@@ -5802,11 +6095,17 @@ fn merge_ai_action_anchor(
                 .map(|_| *rect)
         }),
         MergeLineActionTarget::BaseOnlyGroup(line_index) => {
-            let group = base_only_display_groups(document)
-                .into_iter()
-                .find(|group| group.line_index == line_index)?;
-            (group.missing_side == side)
-                .then(|| merge_base_only_side_rect_from_geometry(document, group, geometry))
+            let cached = cache
+                .base_only_groups
+                .iter()
+                .find(|cached| cached.group.line_index == line_index)?;
+            (cached.group.missing_side == side)
+                .then(|| {
+                    geometry.boundary_marker_rect(
+                        cached.side_boundary_row,
+                        MERGE_BASE_ONLY_MARKER_HEIGHT,
+                    )
+                })
                 .flatten()
                 .map(|marker| {
                     Rect::from_center_size(
@@ -5870,7 +6169,7 @@ fn closest_rect_edge_point(rect: Rect, point: Pos2) -> Pos2 {
 }
 
 fn merge_ai_suggestion_anchor(
-    document: &MergeDocument,
+    cache: &MergeGeometryCache,
     geometry: &MergePanelGeometry,
     rows: &[CachedMergeSideDisplayRow],
     target: MergeLineActionTarget,
@@ -5887,14 +6186,19 @@ fn merge_ai_suggestion_anchor(
             })
             .reduce(|merged, rect| merged.union(rect)),
         MergeLineActionTarget::BaseOnlyGroup(line_index) => {
-            let group = base_only_display_groups(document)
-                .into_iter()
-                .find(|group| group.line_index == line_index)?;
-            if side == group.missing_side {
-                merge_base_only_side_rect_from_geometry(document, group, geometry)
+            let cached = cache
+                .base_only_groups
+                .iter()
+                .find(|cached| cached.group.line_index == line_index)?;
+            if side == cached.group.missing_side {
+                geometry
+                    .boundary_marker_rect(cached.side_boundary_row, MERGE_BASE_ONLY_MARKER_HEIGHT)
             } else {
-                let first = merge_side_display_row_for_line(document, side, group.line_index)?;
-                geometry.span_rect(first, group.line_count)
+                let first = match side {
+                    MergeSide::Local => cached.local_row,
+                    MergeSide::Remote => cached.remote_row,
+                }?;
+                geometry.span_rect(first, cached.group.line_count)
             }
         }
     }
@@ -6043,6 +6347,56 @@ fn paint_merge_search_match(ui: &Ui, rect: Rect, current: bool, palette: MergePa
     );
 }
 
+fn merge_side_highlighted_line<'a>(
+    highlights: &'a MergeSyntaxHighlights,
+    side: MergeSide,
+    row: &CachedMergeSideDisplayRow,
+) -> Option<&'a HighlightedLine> {
+    let line_index = row.line_number?.checked_sub(1)?;
+    let (document, source_lines, unique_source_lines) = match side {
+        MergeSide::Local => (
+            highlights.local.as_ref()?,
+            &highlights.local_source_lines,
+            &highlights.local_unique_source_lines,
+        ),
+        MergeSide::Remote => (
+            highlights.remote.as_ref()?,
+            &highlights.remote_source_lines,
+            &highlights.remote_unique_source_lines,
+        ),
+    };
+    // Merge alignment rows can intentionally display text from a different side or from the
+    // auto-merged result. Applying source byte ranges to that text colors arbitrary fragments of
+    // identifiers, so fall back to the pane's base color unless the exact source line matches.
+    if source_lines
+        .get(line_index)
+        .is_some_and(|source_line| source_line == &row.text)
+    {
+        return document.lines.get(line_index);
+    }
+
+    // A one-sided insertion can add alignment rows without adding source lines to the opposite
+    // pane. In that case all following display line numbers are shifted. Recover only lines whose
+    // exact text occurs once in that source; repeated lines remain plain instead of risking spans
+    // from the wrong syntactic context.
+    let source_index = unique_source_lines.get(&row.text).copied().flatten()?;
+    source_lines
+        .get(source_index)
+        .filter(|source_line| *source_line == &row.text)?;
+    document.lines.get(source_index)
+}
+
+fn merge_unique_source_line_indices(lines: &[String]) -> HashMap<String, Option<usize>> {
+    let mut indices = HashMap::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        indices
+            .entry(line.clone())
+            .and_modify(|stored| *stored = None)
+            .or_insert(Some(index));
+    }
+    indices
+}
+
 fn merge_side_panel(
     ui: &mut Ui,
     app: &mut MergeToolApp,
@@ -6095,7 +6449,6 @@ fn merge_side_panel(
             });
         }
         ui.add_space(8.0);
-        let use_virtual_rows = app.uses_virtual_merge_rows();
         let visible_rows = merge_visible_tail_len(rows, app.collapse_unchanged);
         let hidden_rows = rows.len().saturating_sub(visible_rows);
         let display_rows = visible_rows + usize::from(hidden_rows > 0);
@@ -6120,13 +6473,8 @@ fn merge_side_panel(
                         continue;
                     }
                     let row = &rows[display_index];
-                    let highlighted_line = row.line_number.and_then(|line_number| {
-                        let document = match side {
-                            MergeSide::Local => app.syntax_highlights.local.as_ref(),
-                            MergeSide::Remote => app.syntax_highlights.remote.as_ref(),
-                        }?;
-                        document.lines.get(line_number.saturating_sub(1))
-                    });
+                    let highlighted_line =
+                        merge_side_highlighted_line(&app.syntax_highlights, side, row);
                     let background = merge_side_background_run(
                         rows,
                         display_index,
@@ -6174,7 +6522,7 @@ fn merge_side_panel(
         if !app.manual_result_override {
             paint_base_only_side_overlays(
                 ui,
-                &app.document,
+                &app.geometry_cache,
                 side,
                 &geometry,
                 palette,
@@ -6193,10 +6541,8 @@ fn merge_side_panel(
             if merge_side_offset_changed_by_user(accepts_scroll_input, scroll_y, clamped_scroll_y) {
                 requested_result_scroll_y = Some(if app.collapse_unchanged {
                     clamped_scroll_y
-                } else if use_virtual_rows {
-                    app.cached_result_scroll_y_for_side_scroll(side, clamped_scroll_y)
                 } else {
-                    merge_result_scroll_y_for_side_scroll(&app.document, side, clamped_scroll_y)
+                    app.cached_result_scroll_y_for_side_scroll(side, clamped_scroll_y)
                 });
                 ui.ctx().request_repaint();
             }
@@ -6245,15 +6591,11 @@ fn merge_result_panel(
         }
         let mut changed_lines = Vec::new();
         let line_count = app.manual_result_lines.len();
-        let result_display_rows =
-            (!app.manual_result_override).then(|| merge_result_display_rows(&app.document));
         let result_row_styles = if app.manual_result_override {
             vec![(MergeSideLineTone::Unchanged, false); line_count]
         } else {
-            result_display_rows
-                .as_ref()
-                .expect("result rows exist outside manual edit mode")
-                .into_iter()
+            app.result_display_rows
+                .iter()
                 .map(|row| {
                     let active = row.conflict_index.is_some_and(|conflict_index| {
                         (conflict_index == app.local_conflict_cursor
@@ -6265,7 +6607,7 @@ fn merge_result_panel(
                 .collect::<Vec<_>>()
         };
         let ai_middle_edit_rows =
-            merge_ai_pending_middle_edit_rows(&app.ai_suggestions, &app.manual_result_lines);
+            merge_ai_pending_middle_edit_rows(&app.ai_suggestions, &app.ai_middle_edit_rows);
         let visible_rows = merge_visible_result_len(&result_row_styles, app.collapse_unchanged);
         let hidden_rows = line_count.saturating_sub(visible_rows);
         let display_rows = visible_rows + usize::from(hidden_rows > 0);
@@ -6295,10 +6637,10 @@ fn merge_result_panel(
                         app.highlight_mode,
                         palette,
                     );
-                    let reference_text = result_display_rows
-                        .as_ref()
-                        .and_then(|rows| rows.get(result_index))
-                        .and_then(|row| row.reference_text);
+                    let reference_text = (!app.manual_result_override)
+                        .then(|| app.result_display_rows.get(result_index))
+                        .flatten()
+                        .and_then(|row| row.reference_text.as_deref());
                     let highlighted_line = app
                         .syntax_highlights
                         .result
@@ -6398,8 +6740,9 @@ fn merge_result_content_height(app: &MergeToolApp) -> f32 {
     let display_rows = if app.manual_result_override {
         app.manual_result_lines.len().max(1)
     } else {
-        let styles = merge_result_display_rows(&app.document)
-            .into_iter()
+        let styles = app
+            .result_display_rows
+            .iter()
             .map(|row| {
                 let active = row.conflict_index.is_some_and(|conflict_index| {
                     (conflict_index == app.local_conflict_cursor
@@ -6634,10 +6977,7 @@ fn merge_result_overview_tones(app: &MergeToolApp) -> Vec<MergeSideLineTone> {
     if app.manual_result_override {
         return vec![MergeSideLineTone::Unchanged; app.manual_result_lines.len()];
     }
-    merge_result_display_rows(&app.document)
-        .into_iter()
-        .map(|row| row.tone)
-        .collect()
+    app.result_display_rows.iter().map(|row| row.tone).collect()
 }
 
 fn merge_visible_side_overview_tones(
@@ -7044,6 +7384,7 @@ fn merge_syntax_layout_job(
                 || start >= end
                 || !text.is_char_boundary(start)
                 || !text.is_char_boundary(end)
+                || merge_syntax_span_splits_identifier(text, start, end)
             {
                 continue;
             }
@@ -7062,6 +7403,23 @@ fn merge_syntax_layout_job(
         job.append(&text[cursor..], 0.0, format(base_color));
     }
     job
+}
+
+fn merge_syntax_span_splits_identifier(text: &str, start: usize, end: usize) -> bool {
+    let boundary_splits_identifier = |boundary: usize| {
+        if boundary == 0 || boundary >= text.len() {
+            return false;
+        }
+        let previous = text[..boundary].chars().next_back();
+        let next = text[boundary..].chars().next();
+        previous.is_some_and(merge_identifier_character)
+            && next.is_some_and(merge_identifier_character)
+    };
+    boundary_splits_identifier(start) || boundary_splits_identifier(end)
+}
+
+fn merge_identifier_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '$')
 }
 
 fn merge_syntax_color(role: SyntaxRole, palette: MergePalette) -> Color32 {
@@ -7324,17 +7682,19 @@ fn base_only_gap_marker_rect(row_rect: Rect) -> Rect {
 
 fn paint_base_only_side_overlays(
     ui: &mut Ui,
-    document: &MergeDocument,
+    cache: &MergeGeometryCache,
     side: MergeSide,
     geometry: &MergePanelGeometry,
     palette: MergePalette,
     pending_action: &mut Option<(MergeLineActionTarget, MergeLineAction)>,
 ) {
-    for group in base_only_display_groups(document)
-        .into_iter()
-        .filter(|group| group.missing_side == side)
+    for cached in cache
+        .base_only_groups
+        .iter()
+        .filter(|cached| cached.group.missing_side == side)
     {
-        let Some(marker_rect) = merge_base_only_side_rect_from_geometry(document, group, geometry)
+        let Some(marker_rect) =
+            geometry.boundary_marker_rect(cached.side_boundary_row, MERGE_BASE_ONLY_MARKER_HEIGHT)
         else {
             continue;
         };
@@ -7345,7 +7705,7 @@ fn paint_base_only_side_overlays(
             Vec2::new(marker_rect.width(), MERGE_CODE_ROW_HEIGHT),
         );
         let action_rects = conflict_action_rects(action_rect, side);
-        let action_target = MergeLineActionTarget::BaseOnlyGroup(group.line_index);
+        let action_target = MergeLineActionTarget::BaseOnlyGroup(cached.group.line_index);
         let drop_response = ui.put(action_rects.drop, egui::Button::new("X"));
         if drop_response.clicked() {
             *pending_action = Some((action_target, MergeLineAction::Drop));
@@ -7452,6 +7812,228 @@ fn cached_merge_side_display_rows(
             action_target: row.action_target,
         })
         .collect()
+}
+
+fn cached_merge_result_display_rows(
+    rows: &[MergeResultDisplayRow<'_>],
+) -> Vec<CachedMergeResultDisplayRow> {
+    rows.iter()
+        .map(|row| CachedMergeResultDisplayRow {
+            reference_text: row.reference_text.map(str::to_owned),
+            conflict_index: row.conflict_index,
+            tone: row.tone,
+        })
+        .collect()
+}
+
+fn merge_cached_conflict_spans(
+    conflict_indices: impl IntoIterator<Item = Option<usize>>,
+) -> HashMap<usize, (usize, usize)> {
+    let mut spans = HashMap::<usize, (usize, usize)>::new();
+    for (row_index, conflict_index) in conflict_indices.into_iter().enumerate() {
+        let Some(conflict_index) = conflict_index else {
+            continue;
+        };
+        spans
+            .entry(conflict_index)
+            .and_modify(|(_, count)| *count += 1)
+            .or_insert((row_index, 1));
+    }
+    spans
+}
+
+fn merge_cached_result_rows_for_document_lines(
+    document: &MergeDocument,
+    conflict_spans: &HashMap<usize, (usize, usize)>,
+) -> Vec<Option<usize>> {
+    let conflict_starts = document
+        .conflicts()
+        .iter()
+        .filter_map(|conflict| {
+            conflict
+                .line_indices
+                .first()
+                .copied()
+                .map(|line_index| (line_index, conflict))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut rows = vec![None; document.lines.len()];
+    let mut display_row = 0;
+    let mut line_index = 0;
+    while line_index < document.lines.len() {
+        if let Some(conflict) = conflict_starts.get(&line_index) {
+            display_row += conflict_spans
+                .get(&conflict.index)
+                .map_or(0, |(_, count)| *count);
+            line_index = conflict
+                .line_indices
+                .last()
+                .map_or(line_index + 1, |last| last + 1);
+            continue;
+        }
+
+        rows[line_index] = Some(display_row);
+        let line = &document.lines[line_index];
+        display_row += if line.is_base_only_display() {
+            1
+        } else {
+            line.result_lines().len()
+        };
+        line_index += 1;
+    }
+    rows
+}
+
+fn merge_cached_side_rows_for_document_lines(
+    document: &MergeDocument,
+    side: MergeSide,
+    conflict_spans: &HashMap<usize, (usize, usize)>,
+) -> Vec<Option<usize>> {
+    let conflict_starts = document
+        .conflicts()
+        .iter()
+        .filter_map(|conflict| {
+            conflict
+                .line_indices
+                .first()
+                .copied()
+                .map(|line_index| (line_index, conflict))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut rows = vec![None; document.lines.len()];
+    let mut display_row = 0;
+    let mut line_index = 0;
+    while line_index < document.lines.len() {
+        if let Some(conflict) = conflict_starts.get(&line_index) {
+            let (first, count) = conflict_spans
+                .get(&conflict.index)
+                .copied()
+                .unwrap_or((display_row, 0));
+            for conflict_line in &conflict.line_indices {
+                if let Some(row) = rows.get_mut(*conflict_line) {
+                    *row = Some(first);
+                }
+            }
+            display_row += count;
+            line_index = conflict
+                .line_indices
+                .last()
+                .map_or(line_index + 1, |last| last + 1);
+            continue;
+        }
+
+        let line = &document.lines[line_index];
+        let raw_missing_side = line.base_only_missing_side_raw();
+        if line.base_only_resolved && raw_missing_side == Some(side) {
+            line_index += 1;
+            continue;
+        }
+        if line.base_only_missing_side() == Some(side) {
+            let group_len = base_only_gap_group_len(document, line_index, side).max(1);
+            for group_line in line_index..(line_index + group_len).min(rows.len()) {
+                rows[group_line] = Some(display_row);
+            }
+            line_index += group_len;
+            continue;
+        }
+
+        rows[line_index] = Some(display_row);
+        display_row += 1;
+        line_index += 1;
+    }
+    rows
+}
+
+fn merge_cached_conflict_tone(
+    result_rows: &[CachedMergeResultDisplayRow],
+    conflict_index: usize,
+) -> MergeSideLineTone {
+    let mut has_base_only = false;
+    let mut has_added = false;
+    for row in result_rows
+        .iter()
+        .filter(|row| row.conflict_index == Some(conflict_index))
+    {
+        match row.tone {
+            MergeSideLineTone::Replaced
+            | MergeSideLineTone::Deleted
+            | MergeSideLineTone::LocalDeletedRemoteEdited
+            | MergeSideLineTone::LocalEditedRemoteDeleted => {
+                return MergeSideLineTone::Replaced;
+            }
+            MergeSideLineTone::BaseOnly => has_base_only = true,
+            MergeSideLineTone::Added => has_added = true,
+            MergeSideLineTone::Unchanged => {}
+        }
+    }
+    if has_base_only {
+        MergeSideLineTone::BaseOnly
+    } else if has_added {
+        MergeSideLineTone::Added
+    } else {
+        MergeSideLineTone::Unchanged
+    }
+}
+
+fn merge_geometry_cache(
+    document: &MergeDocument,
+    result_rows: &[CachedMergeResultDisplayRow],
+    local_rows: &[CachedMergeSideDisplayRow],
+    remote_rows: &[CachedMergeSideDisplayRow],
+) -> MergeGeometryCache {
+    let result_spans =
+        merge_cached_conflict_spans(result_rows.iter().map(|row| row.conflict_index));
+    let local_spans = merge_cached_conflict_spans(local_rows.iter().map(|row| row.conflict_index));
+    let remote_spans =
+        merge_cached_conflict_spans(remote_rows.iter().map(|row| row.conflict_index));
+    let result_line_rows = merge_cached_result_rows_for_document_lines(document, &result_spans);
+    let local_line_rows =
+        merge_cached_side_rows_for_document_lines(document, MergeSide::Local, &local_spans);
+    let remote_line_rows =
+        merge_cached_side_rows_for_document_lines(document, MergeSide::Remote, &remote_spans);
+
+    let conflicts = document
+        .conflicts()
+        .iter()
+        .map(|conflict| {
+            (
+                conflict.index,
+                CachedConflictGeometry {
+                    result_span: result_spans.get(&conflict.index).copied(),
+                    result_boundary_row: conflict.line_indices.first().copied().map(|line_index| {
+                        merge_result_display_boundary_before_line(document, line_index)
+                    }),
+                    local_span: local_spans.get(&conflict.index).copied(),
+                    remote_span: remote_spans.get(&conflict.index).copied(),
+                    tone: merge_cached_conflict_tone(result_rows, conflict.index),
+                },
+            )
+        })
+        .collect();
+    let base_only_groups = base_only_display_groups(document)
+        .into_iter()
+        .filter_map(|group| {
+            let result_row = result_line_rows.get(group.line_index).copied().flatten()?;
+            let local_row = local_line_rows.get(group.line_index).copied().flatten();
+            let remote_row = remote_line_rows.get(group.line_index).copied().flatten();
+            let side_boundary_row = match group.missing_side {
+                MergeSide::Local => local_row,
+                MergeSide::Remote => remote_row,
+            }?;
+            Some(CachedBaseOnlyGeometry {
+                group,
+                result_row,
+                side_boundary_row,
+                local_row,
+                remote_row,
+            })
+        })
+        .collect();
+
+    MergeGeometryCache {
+        conflicts,
+        base_only_groups,
+    }
 }
 
 fn merge_cached_scroll_anchors(
@@ -7859,8 +8441,6 @@ fn merge_editable_result_row(
         );
     }
     let before = text.clone();
-    let previous_clip_rect = ui.clip_rect();
-    ui.set_clip_rect(previous_clip_rect.intersect(text_clip_rect));
     let mut layouter = |ui: &Ui, value: &str, wrap_width: f32| {
         let mut job = merge_syntax_layout_job(
             value,
@@ -7872,7 +8452,12 @@ fn merge_editable_result_row(
         job.wrap.max_width = wrap_width;
         ui.fonts(|fonts| fonts.layout_job(job))
     };
-    let changed = ui
+    // The editor is intentionally as wide as the longest line so all panes share one horizontal
+    // offset. Put it in a non-allocating child Ui: adding the wide TextEdit directly to the row Ui
+    // expands that Ui, causing every following row and the panel frame to cross pane boundaries.
+    let mut editor_ui = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
+    editor_ui.shrink_clip_rect(text_clip_rect);
+    let changed = editor_ui
         .put(
             text_rect,
             egui::TextEdit::singleline(text)
@@ -7887,7 +8472,6 @@ fn merge_editable_result_row(
         )
         .changed()
         .then_some(before);
-    ui.set_clip_rect(previous_clip_rect);
     (rect, changed)
 }
 
@@ -8300,6 +8884,7 @@ fn merge_line_similarity(left: &str, right: &str) -> f32 {
 fn paint_merge_block_connectors(
     ui: &Ui,
     document: &MergeDocument,
+    cache: &MergeGeometryCache,
     local_geometry: &MergePanelGeometry,
     result_geometry: &MergePanelGeometry,
     remote_geometry: &MergePanelGeometry,
@@ -8310,15 +8895,24 @@ fn paint_merge_block_connectors(
     palette: MergePalette,
 ) {
     for conflict in document.conflicts() {
+        let cached = cache
+            .conflicts
+            .get(&conflict.index)
+            .copied()
+            .unwrap_or_default();
         let tone = if conflict.base.is_empty() {
             MergeSideLineTone::Replaced
         } else {
-            merge_block_connector_tone(document, conflict)
+            cached.tone
         };
         let result_rect = if conflict.base.is_empty() {
-            merge_conflict_insertion_marker_rect(document, conflict, result_geometry)
+            cached.result_boundary_row.and_then(|row| {
+                result_geometry.boundary_marker_rect(row, MERGE_BASE_ONLY_MARKER_HEIGHT)
+            })
         } else {
-            merge_block_result_rect_from_geometry(document, conflict, result_geometry)
+            cached
+                .result_span
+                .and_then(|(first, count)| result_geometry.span_rect(first, count))
         };
         let Some(result_rect) = result_rect else {
             continue;
@@ -8342,12 +8936,10 @@ fn paint_merge_block_connectors(
         }
         paint_result_block_outline(ui, result_rect, tone, palette);
 
-        if let Some(local_rect) = merge_block_side_rect_from_geometry(
-            document,
-            conflict,
-            MergeSide::Local,
-            local_geometry,
-        ) {
+        if let Some(local_rect) = cached
+            .local_span
+            .and_then(|(first, count)| local_geometry.span_rect(first, count))
+        {
             paint_side_block_bridge(
                 ui,
                 result_rect,
@@ -8377,12 +8969,10 @@ fn paint_merge_block_connectors(
                 tone,
             );
         }
-        if let Some(remote_rect) = merge_block_side_rect_from_geometry(
-            document,
-            conflict,
-            MergeSide::Remote,
-            remote_geometry,
-        ) {
+        if let Some(remote_rect) = cached
+            .remote_span
+            .and_then(|(first, count)| remote_geometry.span_rect(first, count))
+        {
             paint_side_block_bridge(
                 ui,
                 result_rect,
@@ -8414,9 +9004,9 @@ fn paint_merge_block_connectors(
         }
     }
 
-    for group in base_only_display_groups(document) {
-        let Some(result_rect) =
-            merge_base_only_result_rect_from_geometry(document, group, result_geometry)
+    for cached in &cache.base_only_groups {
+        let group = cached.group;
+        let Some(result_rect) = result_geometry.span_rect(cached.result_row, group.line_count)
         else {
             continue;
         };
@@ -8426,8 +9016,8 @@ fn paint_merge_block_connectors(
             MergeSide::Local => local_geometry,
             MergeSide::Remote => remote_geometry,
         };
-        if let Some(side_rect) =
-            merge_base_only_side_rect_from_geometry(document, group, side_geometry)
+        if let Some(side_rect) = side_geometry
+            .boundary_marker_rect(cached.side_boundary_row, MERGE_BASE_ONLY_MARKER_HEIGHT)
         {
             let side_column = match group.missing_side {
                 MergeSide::Local => columns.local,
@@ -8549,16 +9139,6 @@ fn merge_block_side_rect_from_geometry(
 ) -> Option<Rect> {
     let (first, count) = merge_side_row_span_for_conflict(document, side, conflict)?;
     geometry.span_rect(first, count)
-}
-
-fn merge_conflict_insertion_marker_rect(
-    document: &MergeDocument,
-    conflict: &ConflictBlock,
-    geometry: &MergePanelGeometry,
-) -> Option<Rect> {
-    let first_line = *conflict.line_indices.first()?;
-    let row_index = merge_result_display_boundary_before_line(document, first_line);
-    geometry.boundary_marker_rect(row_index, MERGE_BASE_ONLY_MARKER_HEIGHT)
 }
 
 #[cfg(test)]
@@ -10285,22 +10865,6 @@ export function quote(total: number): number {
             "export const EXPECTED_COUNT = 4".to_owned(),
             "export const pipeline = []".to_owned(),
         ];
-
-        assert_eq!(
-            merge_ai_middle_edit_anchor(&geometry, &lines, "EXPECTED_COUNT = 4"),
-            Some(Pos2::new(100.0, 20.0))
-        );
-        assert_eq!(
-            merge_ai_middle_edit_anchor(
-                &geometry,
-                &["same anchor".to_owned(), "same anchor".to_owned()],
-                "same"
-            ),
-            None
-        );
-        assert_eq!(merge_ai_code_preview("first\nsecond", 40), "first ↵ second");
-        assert_eq!(merge_ai_code_preview("abcdef", 3), "abc…");
-
         let target = MergeLineActionTarget::Conflict(0);
         let suggestions = HashMap::from([(
             target,
@@ -10316,8 +10880,37 @@ export function quote(total: number): number {
                 }],
             },
         )]);
+        let middle_edit_rows = merge_ai_middle_edit_row_cache(&suggestions, &lines);
+
         assert_eq!(
-            merge_ai_pending_middle_edit_rows(&suggestions, &lines),
+            merge_ai_middle_edit_anchor(&geometry, &middle_edit_rows, "EXPECTED_COUNT = 4"),
+            Some(Pos2::new(100.0, 20.0))
+        );
+        let duplicate_lines = vec!["same anchor".to_owned(), "same anchor".to_owned()];
+        let duplicate_suggestion = MergeAiSuggestion {
+            target,
+            choice: MergeAiChoice::Manual,
+            reason_zh: String::new(),
+            reason_en: String::new(),
+            manual_result: Some("pipeline".to_owned()),
+            middle_edits: vec![MergeAiMiddleEdit {
+                expected_text: "same".to_owned(),
+                replacement_text: "replacement".to_owned(),
+            }],
+        };
+        let duplicate_rows = merge_ai_middle_edit_row_cache(
+            &HashMap::from([(target, duplicate_suggestion)]),
+            &duplicate_lines,
+        );
+        assert_eq!(
+            merge_ai_middle_edit_anchor(&geometry, &duplicate_rows, "same"),
+            None
+        );
+        assert_eq!(merge_ai_code_preview("first\nsecond", 40), "first ↵ second");
+        assert_eq!(merge_ai_code_preview("abcdef", 3), "abc…");
+
+        assert_eq!(
+            merge_ai_pending_middle_edit_rows(&suggestions, &middle_edit_rows),
             HashSet::from([0])
         );
     }
@@ -11062,6 +11655,43 @@ export function quote(total: number): number {
     }
 
     #[test]
+    fn loading_card_is_centered_bounded_and_stage_aware() {
+        let available = Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 730.0));
+        let card = merge_loading_card_rect(available);
+        assert_eq!(card.center(), available.center());
+        assert_eq!(card.size(), Vec2::new(560.0, 272.0));
+
+        let compact_available = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 240.0));
+        let compact_card = merge_loading_card_rect(compact_available);
+        assert_eq!(compact_card.size(), Vec2::new(352.0, 192.0));
+        assert!(compact_available.contains(compact_card.min));
+        assert!(compact_available.contains(compact_card.max));
+
+        assert_eq!(
+            merge_loading_active_stage_label(
+                MergeLanguage::Chinese,
+                MergeLoadStage::PreparingEditor,
+            ),
+            "准备编辑器 · 处理中"
+        );
+    }
+
+    #[test]
+    fn loading_panel_uses_a_fixed_centered_card_and_segmented_progress() {
+        let source = include_str!("merge_tool.rs");
+        let panel = source
+            .split("fn merge_loading_panel")
+            .nth(1)
+            .and_then(|tail| tail.split("fn merge_loading_card_rect").next())
+            .unwrap();
+
+        assert!(panel.contains("merge_loading_card_rect(available)"));
+        assert!(panel.contains("UiBuilder::new().max_rect(card_rect)"));
+        assert!(panel.contains("merge_loading_progress_track("));
+        assert!(!panel.contains("ui.add_space(((ui.available_width() - card_width)"));
+    }
+
+    #[test]
     fn large_sparse_merge_prepares_without_quadratic_diff_matrix() {
         let base = (0..8_000)
             .map(|index| format!("package-{index:05}: 1.0.{index}"))
@@ -11120,6 +11750,96 @@ export function quote(total: number): number {
                     .any(|span| span.role == SyntaxRole::Keyword)
             }));
         }
+    }
+
+    #[test]
+    fn side_syntax_highlight_never_applies_spans_to_different_text() {
+        let source = "const expected = true\n";
+        let document = three_way_merge(source, source, source);
+        let mut row = cached_merge_side_display_rows(&document, MergeSide::Local)
+            .into_iter()
+            .next()
+            .unwrap();
+        let highlights = MergeSyntaxHighlights {
+            local: crate::syntax::highlight_document(Path::new("."), "src/view.ts", source),
+            local_source_lines: vec!["const expected = true".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(merge_side_highlighted_line(&highlights, MergeSide::Local, &row).is_some());
+        row.text = "const visible = true".to_owned();
+        assert!(merge_side_highlighted_line(&highlights, MergeSide::Local, &row).is_none());
+    }
+
+    #[test]
+    fn side_syntax_highlight_recovers_a_unique_line_after_alignment_shift() {
+        let source = "<script setup lang=\"ts\">\nconst props = withDefaults(defineProps<{}>(), {})\n</script>\n";
+        let document = three_way_merge(source, source, source);
+        let mut row = cached_merge_side_display_rows(&document, MergeSide::Local)
+            .into_iter()
+            .find(|row| row.text.starts_with("const props"))
+            .unwrap();
+        row.line_number = Some(25);
+        let source_lines = source.lines().map(str::to_owned).collect::<Vec<_>>();
+        let highlights = MergeSyntaxHighlights {
+            local: crate::syntax::highlight_document(Path::new("."), "src/View.vue", source),
+            local_unique_source_lines: merge_unique_source_line_indices(&source_lines),
+            local_source_lines: source_lines,
+            ..Default::default()
+        };
+
+        let highlighted = merge_side_highlighted_line(&highlights, MergeSide::Local, &row).unwrap();
+        assert!(
+            highlighted
+                .spans
+                .iter()
+                .any(|span| span.role == SyntaxRole::Keyword)
+        );
+
+        let repeated = vec![row.text.clone(), row.text.clone()];
+        let ambiguous = MergeSyntaxHighlights {
+            local: highlights.local.clone(),
+            local_unique_source_lines: merge_unique_source_line_indices(&repeated),
+            local_source_lines: repeated,
+            ..Default::default()
+        };
+        assert!(merge_side_highlighted_line(&ambiguous, MergeSide::Local, &row).is_none());
+    }
+
+    #[test]
+    fn syntax_layout_drops_spans_that_split_identifiers() {
+        let text = "const ratioOptions";
+        let highlighted = HighlightedLine {
+            spans: vec![crate::syntax::HighlightSpan {
+                start: 4,
+                end: 9,
+                role: SyntaxRole::Keyword,
+            }],
+        };
+        let job = merge_syntax_layout_job(
+            text,
+            Some(&highlighted),
+            Color32::BLACK,
+            merge_palette(MergeTheme::Light),
+            MERGE_CODE_FONT_SIZE,
+        );
+
+        assert_eq!(job.sections.len(), 1);
+        assert_eq!(job.sections[0].byte_range, 0..text.len());
+    }
+
+    #[test]
+    fn ai_overlay_uses_cached_middle_rows_and_does_not_clone_suggestions_per_frame() {
+        let source = include_str!("merge_tool.rs");
+        let overlay = source
+            .split("fn merge_ai_suggestion_overlays")
+            .nth(1)
+            .and_then(|tail| tail.split("fn merge_ai_middle_anchor").next())
+            .unwrap();
+
+        assert!(overlay.contains("app.ai_middle_edit_rows"));
+        assert!(!overlay.contains("values().cloned()"));
+        assert!(!overlay.contains("manual_result_lines"));
     }
 
     #[test]
@@ -11783,6 +12503,55 @@ export function quote(total: number): number {
         assert_eq!(result_content.left(), result_clip.left() - scroll_x);
         assert_eq!(side_content.width(), content_width);
         assert_eq!(result_content.width(), content_width);
+    }
+
+    #[test]
+    fn wide_result_editor_stays_inside_its_own_pane() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 500.0));
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        });
+        let pane = Rect::from_min_size(Pos2::new(260.0, 40.0), Vec2::new(300.0, 360.0));
+        let mut observed = None;
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            observed = Some(merge_pane_ui(ui, pane, |ui| {
+                let initial_right = ui.max_rect().right();
+                let mut line = "a-very-long-lockfile-value".repeat(80);
+                for index in 0..3 {
+                    let _ = merge_editable_result_row(
+                        ui,
+                        index,
+                        &mut line,
+                        None,
+                        MergeSideLineTone::Unchanged,
+                        None,
+                        MergeHighlightMode::Lines,
+                        None,
+                        false,
+                        0.0,
+                        4_000.0,
+                        merge_palette(MergeTheme::Light),
+                    );
+                }
+                (initial_right, ui.max_rect().right(), ui.clip_rect())
+            }));
+        });
+        let _ = ctx.end_pass();
+
+        let (initial_right, final_right, clip) = observed.expect("pane rendered");
+        assert_eq!(initial_right, pane.right());
+        assert_eq!(final_right, pane.right());
+        assert_eq!(clip, pane.intersect(screen));
+
+        let source = include_str!("merge_tool.rs");
+        let columns = source
+            .split("fn merge_editor_columns")
+            .nth(1)
+            .and_then(|tail| tail.split("fn merge_side_scroll_input").next())
+            .expect("merge editor columns implementation");
+        assert_eq!(columns.matches("merge_pane_ui(ui,").count(), 3);
     }
 
     #[test]
@@ -12520,7 +13289,8 @@ export function quote(total: number): number {
             .and_then(|tail| tail.split("#[cfg(test)]").next())
             .expect("result row source");
 
-        assert!(result_panel.contains("merge_result_display_rows(&app.document)"));
+        assert!(result_panel.contains("app.result_display_rows"));
+        assert!(!result_panel.contains("merge_result_display_rows(&app.document)"));
         assert!(row_painter.contains("MergeSideLineTone::BaseOnly"));
         assert!(row_painter.contains("paint_result_side_status_badges"));
         assert!(row_painter.contains("MergeSideLineTone::LocalDeletedRemoteEdited"));
@@ -13374,14 +14144,82 @@ export function quote(total: number): number {
             .split("fn paint_merge_block_connectors")
             .nth(1)
             .and_then(|tail| tail.split("fn merge_connector_debug_mode").next())
-            .and_then(|tail| {
-                tail.split("for group in base_only_display_groups(document)")
-                    .nth(1)
-            })
+            .and_then(|tail| tail.split("for cached in &cache.base_only_groups").nth(1))
             .expect("base-only connector loop");
 
         assert!(base_only_section.contains("paint_base_only_marker_bridge"));
         assert!(!base_only_section.contains("paint_side_block_bridge"));
+    }
+
+    #[test]
+    fn cached_merge_geometry_matches_dynamic_document_mapping() {
+        let document = three_way_merge(
+            "start\nremove locally\nstable\nbase conflict\nend\n",
+            "start\nstable\nlocal conflict\nend\n",
+            "start\nremove locally\nstable\nremote conflict\nend\n",
+        );
+        let result_rows = merge_result_display_rows(&document);
+        let local_rows = cached_merge_side_display_rows(&document, MergeSide::Local);
+        let remote_rows = cached_merge_side_display_rows(&document, MergeSide::Remote);
+        let cached_result_rows = cached_merge_result_display_rows(&result_rows);
+        let cache = merge_geometry_cache(&document, &cached_result_rows, &local_rows, &remote_rows);
+
+        assert!(!cache.base_only_groups.is_empty());
+        for cached in &cache.base_only_groups {
+            assert_eq!(
+                Some(cached.result_row),
+                merge_result_display_row_for_line(&document, cached.group.line_index)
+            );
+            assert_eq!(
+                Some(cached.side_boundary_row),
+                merge_side_display_row_for_line(
+                    &document,
+                    cached.group.missing_side,
+                    cached.group.line_index,
+                )
+            );
+        }
+
+        for conflict in document.conflicts() {
+            let cached = cache.conflicts.get(&conflict.index).unwrap();
+            assert_eq!(
+                cached.result_span,
+                merge_result_row_span_for_conflict(&document, conflict)
+            );
+            assert_eq!(
+                cached.local_span,
+                merge_side_row_span_for_conflict(&document, MergeSide::Local, conflict)
+            );
+            assert_eq!(
+                cached.remote_span,
+                merge_side_row_span_for_conflict(&document, MergeSide::Remote, conflict)
+            );
+            assert_eq!(cached.tone, merge_block_connector_tone(&document, conflict));
+        }
+    }
+
+    #[test]
+    fn frame_hot_paths_use_precomputed_merge_geometry() {
+        let source = include_str!("merge_tool.rs");
+        for function in [
+            "fn paint_base_only_side_overlays",
+            "fn paint_merge_block_connectors",
+            "fn merge_ai_suggestion_overlays",
+            "fn merge_editor_columns",
+            "fn merge_side_panel",
+        ] {
+            let implementation = source
+                .split(function)
+                .nth(1)
+                .and_then(|tail| tail.split("\nfn ").next())
+                .unwrap();
+            assert!(!implementation.contains("base_only_display_groups("));
+            assert!(!implementation.contains("merge_side_display_row_for_line("));
+            assert!(!implementation.contains("merge_side_display_rows("));
+            assert!(!implementation.contains("merge_diff_base_to_side("));
+            assert!(!implementation.contains("merge_side_scroll_y_for_result_scroll("));
+            assert!(!implementation.contains("merge_result_scroll_y_for_side_scroll("));
+        }
     }
 
     #[test]

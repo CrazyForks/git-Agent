@@ -143,6 +143,7 @@ pub fn highlight_document(
     let mut parser = ParseState::new(syntax);
     let mut scope_stack = ScopeStack::new();
     let mut highlighted_lines = Vec::with_capacity(lines.len().max(1));
+    let mut vue_semantic_state = (syntax.name == "Vue Component").then(VueSemanticState::default);
 
     for raw_line in lines {
         let visible_line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
@@ -175,6 +176,9 @@ pub fn highlight_document(
             }
             spans.push(HighlightSpan { start, end, role });
         }
+        if let Some(state) = vue_semantic_state.as_mut() {
+            enrich_vue_semantic_roles(&visible_line[..visible_len], &mut spans, state);
+        }
         highlighted_lines.push(HighlightedLine { spans });
     }
 
@@ -186,6 +190,215 @@ pub fn highlight_document(
         detection,
         lines: highlighted_lines,
     })
+}
+
+const VUE_COMPILER_MACROS: &[&str] = &[
+    "defineEmits",
+    "defineExpose",
+    "defineModel",
+    "defineOptions",
+    "defineProps",
+    "defineSlots",
+    "withDefaults",
+];
+
+#[derive(Debug, Default)]
+struct VueSemanticState {
+    in_script: bool,
+    reading_script_open_tag: bool,
+    script_setup: bool,
+}
+
+fn enrich_vue_semantic_roles(
+    line: &str,
+    spans: &mut Vec<HighlightSpan>,
+    state: &mut VueSemanticState,
+) {
+    let lowercase = line.to_ascii_lowercase();
+    let code_start = if state.in_script {
+        0
+    } else {
+        let fragment_start = if state.reading_script_open_tag {
+            0
+        } else {
+            let Some(start) = vue_script_open_tag_start(&lowercase) else {
+                return;
+            };
+            state.reading_script_open_tag = true;
+            state.script_setup = false;
+            start
+        };
+        let fragment = &line[fragment_start..];
+        if vue_tag_fragment_has_setup_attribute(fragment) {
+            state.script_setup = true;
+        }
+        let Some(tag_end) = vue_tag_end(fragment) else {
+            return;
+        };
+        state.reading_script_open_tag = false;
+        state.in_script = true;
+        fragment_start + tag_end + 1
+    };
+
+    let remaining = &lowercase[code_start..];
+    let code_end = code_start + remaining.find("</script").unwrap_or(remaining.len());
+    enrich_vue_script_code(
+        &line[code_start..code_end],
+        code_start,
+        spans,
+        state.script_setup,
+    );
+
+    if code_end < line.len() {
+        state.in_script = false;
+        state.reading_script_open_tag = false;
+        state.script_setup = false;
+    }
+}
+
+fn vue_script_open_tag_start(lowercase: &str) -> Option<usize> {
+    lowercase.match_indices("<script").find_map(|(start, tag)| {
+        let after = lowercase.as_bytes().get(start + tag.len()).copied();
+        after
+            .is_none_or(|byte| byte.is_ascii_whitespace() || matches!(byte, b'>' | b'/'))
+            .then_some(start)
+    })
+}
+
+fn vue_tag_end(fragment: &str) -> Option<usize> {
+    let mut quote = None;
+    for (index, byte) in fragment.bytes().enumerate() {
+        match (quote, byte) {
+            (Some(expected), current) if current == expected => quote = None,
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, b'>') => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn vue_tag_fragment_has_setup_attribute(fragment: &str) -> bool {
+    let lowercase = fragment.to_ascii_lowercase();
+    let bytes = lowercase.as_bytes();
+    let mut quote = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        match (quote, bytes[index]) {
+            (Some(expected), current) if current == expected => quote = None,
+            (Some(_), _) => {}
+            (None, b'\'' | b'"') => quote = Some(bytes[index]),
+            (None, _) if bytes[index..].starts_with(b"setup") => {
+                let before_is_boundary = index == 0 || bytes[index - 1].is_ascii_whitespace();
+                let after = bytes.get(index + b"setup".len()).copied();
+                let after_is_boundary = after.is_none_or(|byte| {
+                    byte.is_ascii_whitespace() || matches!(byte, b'=' | b'>' | b'/')
+                });
+                if before_is_boundary && after_is_boundary {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn enrich_vue_script_code(
+    code: &str,
+    line_offset: usize,
+    spans: &mut Vec<HighlightSpan>,
+    script_setup: bool,
+) {
+    for (start, end) in javascript_identifier_ranges(code) {
+        let identifier = &code[start..end];
+        let compiler_macro = script_setup && VUE_COMPILER_MACROS.contains(&identifier);
+        let call_site = code[end..].trim_start().starts_with('(')
+            && !matches!(
+                identifier,
+                "catch" | "for" | "if" | "switch" | "while" | "with"
+            );
+        if compiler_macro || call_site {
+            overlay_syntax_role(
+                spans,
+                line_offset + start,
+                line_offset + end,
+                SyntaxRole::Function,
+            );
+        }
+    }
+}
+
+fn javascript_identifier_ranges(line: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (index, character) in line.char_indices() {
+        let continues = character.is_ascii_alphanumeric() || matches!(character, '_' | '$');
+        if start.is_some() && continues {
+            continue;
+        }
+        if let Some(identifier_start) = start.take() {
+            ranges.push((identifier_start, index));
+        }
+        if character.is_ascii_alphabetic() || matches!(character, '_' | '$') {
+            start = Some(index);
+        }
+    }
+    if let Some(identifier_start) = start {
+        ranges.push((identifier_start, line.len()));
+    }
+    ranges
+}
+
+fn overlay_syntax_role(spans: &mut Vec<HighlightSpan>, start: usize, end: usize, role: SyntaxRole) {
+    if spans.iter().any(|span| {
+        span.start < end
+            && span.end > start
+            && matches!(
+                span.role,
+                SyntaxRole::Comment | SyntaxRole::String | SyntaxRole::Invalid
+            )
+    }) {
+        return;
+    }
+
+    let mut updated = Vec::with_capacity(spans.len() + 1);
+    for span in spans.drain(..) {
+        if span.end <= start || span.start >= end {
+            updated.push(span);
+            continue;
+        }
+        if span.start < start {
+            updated.push(HighlightSpan {
+                start: span.start,
+                end: start,
+                role: span.role,
+            });
+        }
+        if span.end > end {
+            updated.push(HighlightSpan {
+                start: end,
+                end: span.end,
+                role: span.role,
+            });
+        }
+    }
+    updated.push(HighlightSpan { start, end, role });
+    updated.sort_by_key(|span| span.start);
+
+    let mut merged = Vec::<HighlightSpan>::with_capacity(updated.len());
+    for span in updated {
+        if let Some(previous) = merged.last_mut()
+            && previous.end == span.start
+            && previous.role == span.role
+        {
+            previous.end = span.end;
+        } else {
+            merged.push(span);
+        }
+    }
+    *spans = merged;
 }
 
 fn syntax_set() -> &'static SyntaxSet {
@@ -633,6 +846,89 @@ mod tests {
                 .iter()
                 .any(|span| span.start <= start && span.end >= start + 2)
         );
+    }
+
+    #[test]
+    fn vue_compiler_macros_and_call_sites_have_function_roles() {
+        let source = "<script setup lang=\"ts\">\nconst props = withDefaults(\n  defineProps<{ value?: string }>(),\n  {},\n)\nconst doubled = computed(() => props.value)\nconst literal = 'withDefaults('\n// defineProps<{ ignored: true }>()\n</script>\n";
+        let document = highlight_document(
+            Path::new("C:/nonexistent-repository"),
+            "src/View.vue",
+            source,
+        )
+        .unwrap();
+        let has_role = |line_index: usize, token: &str, role: SyntaxRole| {
+            let line = source.lines().nth(line_index).unwrap();
+            let start = line.find(token).unwrap();
+            document.lines[line_index].spans.iter().any(|span| {
+                span.start <= start && span.end >= start + token.len() && span.role == role
+            })
+        };
+
+        assert!(has_role(1, "const", SyntaxRole::Keyword));
+        assert!(has_role(1, "withDefaults", SyntaxRole::Function));
+        assert!(has_role(2, "defineProps", SyntaxRole::Function));
+        assert!(has_role(5, "computed", SyntaxRole::Function));
+        assert!(!has_role(6, "withDefaults", SyntaxRole::Function));
+        assert!(!has_role(7, "defineProps", SyntaxRole::Function));
+    }
+
+    #[test]
+    fn ordinary_vue_script_does_not_assume_vue_three_compiler_macros() {
+        let mut state = VueSemanticState::default();
+        enrich_vue_semantic_roles("<script lang=\"ts\">", &mut Vec::new(), &mut state);
+
+        let macro_line = "const props = defineProps<Props>";
+        let mut macro_spans = Vec::new();
+        enrich_vue_semantic_roles(macro_line, &mut macro_spans, &mut state);
+        let macro_start = macro_line.find("defineProps").unwrap();
+        assert!(!macro_spans.iter().any(|span| {
+            span.start <= macro_start
+                && span.end >= macro_start + "defineProps".len()
+                && span.role == SyntaxRole::Function
+        }));
+
+        let call_line = "const result = transform(props)";
+        let mut call_spans = Vec::new();
+        enrich_vue_semantic_roles(call_line, &mut call_spans, &mut state);
+        let call_start = call_line.find("transform").unwrap();
+        assert!(call_spans.iter().any(|span| {
+            span.start <= call_start
+                && span.end >= call_start + "transform".len()
+                && span.role == SyntaxRole::Function
+        }));
+    }
+
+    #[test]
+    fn multiline_script_setup_enables_vue_three_compiler_macros() {
+        let mut state = VueSemanticState::default();
+        for line in ["<script", "  lang=\"ts\"", "  setup", ">"] {
+            enrich_vue_semantic_roles(line, &mut Vec::new(), &mut state);
+        }
+
+        let macro_line = "const props = defineProps<Props>";
+        let mut spans = Vec::new();
+        enrich_vue_semantic_roles(macro_line, &mut spans, &mut state);
+        let start = macro_line.find("defineProps").unwrap();
+        assert!(spans.iter().any(|span| {
+            span.start <= start
+                && span.end >= start + "defineProps".len()
+                && span.role == SyntaxRole::Function
+        }));
+
+        let mut ordinary_state = VueSemanticState::default();
+        enrich_vue_semantic_roles(
+            "<script data-mode=\"setup\">",
+            &mut Vec::new(),
+            &mut ordinary_state,
+        );
+        let mut ordinary_spans = Vec::new();
+        enrich_vue_semantic_roles(macro_line, &mut ordinary_spans, &mut ordinary_state);
+        assert!(!ordinary_spans.iter().any(|span| {
+            span.start <= start
+                && span.end >= start + "defineProps".len()
+                && span.role == SyntaxRole::Function
+        }));
     }
 
     #[test]
