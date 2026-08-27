@@ -37,6 +37,7 @@ use crate::{
         self, Commit, CommitDetails, FileDiff, RepositoryHistory, RepositorySnapshot, ResetMode,
         StashEntry, Tag, WorktreeFile,
     },
+    gitignore::{self, GitignoreDocument},
     graph::{self, EdgeKind, GraphLayout},
     i18n::{self, Language},
     patch::{
@@ -978,6 +979,10 @@ pub struct GitAgentApp {
     requested_top_menu: Option<TopMenu>,
     repo_settings_open: bool,
     repo_settings_tab: SettingsTab,
+    repo_gitignore_editor: Option<RepoGitignoreEditorState>,
+    repo_gitignore_save_task: Option<Receiver<(PathBuf, anyhow::Result<()>)>>,
+    repo_gitignore_save_root: Option<PathBuf>,
+    repo_gitignore_close_after_save: bool,
     pending_repo_remote_action: Option<RepoRemoteActionDialog>,
     pending_commit_text_link: Option<CommitTextLinkDialog>,
     compiled_commit_text_links: Vec<CompiledCommitTextLink>,
@@ -1726,7 +1731,22 @@ enum SettingsTab {
     HostingAccounts,
     CommitAuthors,
     RepoRemotes,
+    RepoIgnoreRules,
     RepoAdvanced,
+}
+
+#[derive(Clone, Debug)]
+struct RepoGitignoreEditorState {
+    root: PathBuf,
+    document: GitignoreDocument,
+    original_text: String,
+    error: Option<String>,
+}
+
+impl RepoGitignoreEditorState {
+    fn dirty(&self) -> bool {
+        self.document.to_text() != self.original_text
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4670,6 +4690,10 @@ impl GitAgentApp {
                 .as_deref()
                 == Some("1"),
             repo_settings_tab: SettingsTab::RepoRemotes,
+            repo_gitignore_editor: None,
+            repo_gitignore_save_task: None,
+            repo_gitignore_save_root: None,
+            repo_gitignore_close_after_save: false,
             pending_repo_remote_action: None,
             pending_commit_text_link: None,
             compiled_commit_text_links: Vec::new(),
@@ -5824,6 +5848,7 @@ impl GitAgentApp {
 
     fn open_repo_settings_from_menu(&mut self) {
         self.repo_settings_tab = SettingsTab::RepoRemotes;
+        self.repo_gitignore_editor = None;
         self.repo_settings_open = true;
     }
 
@@ -6695,6 +6720,84 @@ impl GitAgentApp {
         self.start_remote_git_action_with_status("status.applying_changes", action);
     }
 
+    fn ensure_repo_gitignore_editor(&mut self) {
+        let Some(root) = self.active_repo_root() else {
+            self.repo_gitignore_editor = None;
+            return;
+        };
+        if self
+            .repo_gitignore_editor
+            .as_ref()
+            .is_some_and(|editor| paths_equal(&editor.root, &root))
+        {
+            return;
+        }
+        self.repo_gitignore_editor = Some(match gitignore::load_repository_gitignore(&root) {
+            Ok((document, original_text)) => RepoGitignoreEditorState {
+                root,
+                document,
+                original_text,
+                error: None,
+            },
+            Err(error) => RepoGitignoreEditorState {
+                root,
+                document: GitignoreDocument::from_text(""),
+                original_text: String::new(),
+                error: Some(error.to_string()),
+            },
+        });
+    }
+
+    fn start_repo_gitignore_save(&mut self, close_after_save: bool) {
+        if self.branch_actions_busy() || self.repo_gitignore_save_task.is_some() {
+            return;
+        }
+        self.ensure_repo_gitignore_editor();
+        let Some(editor) = self.repo_gitignore_editor.as_ref() else {
+            return;
+        };
+        if editor.error.is_some() || !editor.dirty() {
+            return;
+        }
+
+        let root = editor.root.clone();
+        let expected_original = editor.original_text.clone();
+        let document = editor.document.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.repo_gitignore_save_task = Some(receiver);
+        self.repo_gitignore_save_root = Some(root.clone());
+        self.repo_gitignore_close_after_save = close_after_save;
+        self.loading_repo = true;
+        self.error = None;
+        self.last_notice = None;
+        if let Some(editor) = self.repo_gitignore_editor.as_mut() {
+            editor.error = None;
+        }
+
+        let scheduler = self.repository_refresh_scheduler.clone();
+        let scheduler_key = repo_state_key(&root);
+        let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
+        thread::spawn(move || {
+            let result = exclusive_access
+                .recv()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Repository refresh scheduler stopped before .gitignore save began"
+                    )
+                })
+                .and_then(|()| {
+                    gitignore::save_repository_gitignore(&root, &expected_original, &document)
+                });
+            scheduler.release_exclusive(scheduler_key);
+            let _ = sender.send((root, result));
+        });
+    }
+
+    fn active_repo_gitignore_save_busy(&self) -> bool {
+        self.repo_gitignore_save_task.is_some()
+            && self.task_root_matches_active_repo(self.repo_gitignore_save_root.as_deref())
+    }
+
     fn branch_checkout_busy(&self) -> bool {
         self.branch_checkout_task.is_some() || self.pending_branch_checkout.is_some()
     }
@@ -6841,6 +6944,7 @@ impl GitAgentApp {
 
     fn branch_actions_busy(&self) -> bool {
         self.active_repo_has_pending_load()
+            || self.active_repo_gitignore_save_busy()
             || self.active_branch_checkout_busy()
             || self.active_remote_git_busy()
             || self.active_background_remote_git_busy()
@@ -6854,6 +6958,7 @@ impl GitAgentApp {
 
     fn repo_toolbar_loading_busy(&self) -> bool {
         self.active_branch_checkout_busy()
+            || self.active_repo_gitignore_save_busy()
             || self.active_merge_tool_busy()
             || self.active_external_diff_tool_busy()
             || self.repo_source_task.is_some()
@@ -6861,6 +6966,9 @@ impl GitAgentApp {
     }
 
     fn repo_toolbar_loading_label(&self) -> &str {
+        if self.active_repo_gitignore_save_busy() {
+            return self.tr("status.saving_ignore_rules");
+        }
         if self.active_branch_checkout_busy() {
             return self.tr("status.switching_branch");
         }
@@ -9371,6 +9479,59 @@ impl GitAgentApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.loading_diff_key = None;
                     self.error = Some("Diff loader stopped unexpectedly".to_owned());
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.repo_gitignore_save_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(()))) => {
+                    self.repo_gitignore_save_root = None;
+                    self.loading_repo = false;
+                    if let Some(editor) = self
+                        .repo_gitignore_editor
+                        .as_mut()
+                        .filter(|editor| paths_equal(&editor.root, &root))
+                    {
+                        editor.original_text = editor.document.to_text();
+                        editor.error = None;
+                    }
+                    let close_after_save = self.repo_gitignore_close_after_save;
+                    self.repo_gitignore_close_after_save = false;
+                    self.show_toast(self.tr("repo.settings.ignore_saved"));
+                    if close_after_save {
+                        self.repo_settings_open = false;
+                        self.repo_gitignore_editor = None;
+                    }
+                    self.load_repository_uncached(root);
+                    ctx.request_repaint();
+                }
+                Ok((root, Err(error))) => {
+                    self.repo_gitignore_save_root = None;
+                    self.repo_gitignore_close_after_save = false;
+                    self.loading_repo = false;
+                    if let Some(editor) = self
+                        .repo_gitignore_editor
+                        .as_mut()
+                        .filter(|editor| paths_equal(&editor.root, &root))
+                    {
+                        editor.error = Some(error.to_string());
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.repo_gitignore_save_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.repo_gitignore_save_root = None;
+                    self.repo_gitignore_close_after_save = false;
+                    self.loading_repo = false;
+                    let message = self.tr("repo.settings.ignore_save_disconnected").to_owned();
+                    if let Some(editor) = self.repo_gitignore_editor.as_mut() {
+                        editor.error = Some(message);
+                    }
                     ctx.request_repaint();
                 }
             }
@@ -12818,8 +12979,7 @@ impl GitAgentApp {
                 )
                 .clicked()
                 {
-                    self.repo_settings_tab = SettingsTab::RepoRemotes;
-                    self.repo_settings_open = true;
+                    self.open_repo_settings_from_menu();
                 }
                 if responsive_global_action_button(
                     ui,
@@ -20848,9 +21008,14 @@ impl GitAgentApp {
             return;
         }
 
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        let saving_ignore_rules = self.repo_gitignore_save_task.is_some();
+        if !saving_ignore_rules && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.repo_settings_open = false;
+            self.repo_gitignore_editor = None;
             return;
+        }
+        if self.repo_settings_tab == SettingsTab::RepoIgnoreRules {
+            self.ensure_repo_gitignore_editor();
         }
 
         let mut close_requested = false;
@@ -20872,7 +21037,9 @@ impl GitAgentApp {
                 settings_dialog_panel_frame().show(ui, |ui| {
                     ui.set_width(size.x);
                     settings_dialog_title_row(ui, self.tr("repo.settings.title"), size.x, |ui| {
-                        if window_control_button(ui, "\u{00d7}", true).clicked() {
+                        if !saving_ignore_rules
+                            && window_control_button(ui, "\u{00d7}", true).clicked()
+                        {
                             close_requested = true;
                         }
                     });
@@ -20880,6 +21047,9 @@ impl GitAgentApp {
                         ui.set_width(size.x - 28.0);
                         ui.add_space(6.0);
                         repo_settings_tab_strip(ui, &mut self.repo_settings_tab, self.language);
+                        if self.repo_settings_tab == SettingsTab::RepoIgnoreRules {
+                            self.ensure_repo_gitignore_editor();
+                        }
                         ui.add_space(12.0);
                         let content_width = repo_settings_content_width(size.x);
                         ScrollArea::vertical()
@@ -20890,6 +21060,9 @@ impl GitAgentApp {
                                 ui.set_min_width(content_width);
                                 ui.vertical(|ui| match self.repo_settings_tab {
                                     SettingsTab::RepoRemotes => self.repo_remotes_settings_page(ui),
+                                    SettingsTab::RepoIgnoreRules => {
+                                        self.repo_ignore_rules_settings_page(ui)
+                                    }
                                     SettingsTab::RepoAdvanced => {
                                         self.repo_advanced_settings_page(ui)
                                     }
@@ -20898,25 +21071,46 @@ impl GitAgentApp {
                             });
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            if ui
-                                .button(self.tr("repo.settings.edit_config_file"))
-                                .clicked()
-                            {
-                                self.open_repo_config_file();
-                            }
+                            ui.add_enabled_ui(!saving_ignore_rules, |ui| {
+                                if ui
+                                    .button(self.tr("repo.settings.edit_config_file"))
+                                    .clicked()
+                                {
+                                    self.open_repo_config_file();
+                                }
+                            });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if dialog_primary_button(ui, self.tr("dialog.ok"), true).clicked() {
-                                    close_requested = true;
+                                let can_submit = !saving_ignore_rules;
+                                if dialog_primary_button(ui, self.tr("dialog.ok"), can_submit)
+                                    .clicked()
+                                {
+                                    let dirty_ignore_rules = self.repo_settings_tab
+                                        == SettingsTab::RepoIgnoreRules
+                                        && self
+                                            .repo_gitignore_editor
+                                            .as_ref()
+                                            .is_some_and(|editor| editor.dirty());
+                                    if dirty_ignore_rules {
+                                        self.start_repo_gitignore_save(true);
+                                    } else {
+                                        close_requested = true;
+                                    }
                                 }
-                                if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
-                                    close_requested = true;
-                                }
+                                ui.add_enabled_ui(!saving_ignore_rules, |ui| {
+                                    if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked()
+                                    {
+                                        close_requested = true;
+                                    }
+                                });
                             });
                         });
                     });
                 });
             });
 
+        if close_requested {
+            self.repo_gitignore_editor = None;
+        }
         self.repo_settings_open = self.repo_settings_open && !close_requested;
     }
 
@@ -22362,6 +22556,200 @@ impl GitAgentApp {
                 );
             });
         });
+    }
+
+    fn repo_ignore_rules_settings_page(&mut self, ui: &mut Ui) {
+        self.ensure_repo_gitignore_editor();
+        let language = self.language;
+        let saving = self.repo_gitignore_save_task.is_some();
+        let mut remove_index = None;
+        let mut save_requested = false;
+        let Some(editor) = self.repo_gitignore_editor.as_mut() else {
+            ui.label(
+                RichText::new(i18n::t(language, "repo.settings.ignore_load_failed"))
+                    .color(theme::warning()),
+            );
+            return;
+        };
+
+        repo_settings_card(ui, i18n::t(language, "repo.settings.ignore_rules"), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(editor.root.join(".gitignore").display().to_string())
+                        .monospace()
+                        .color(theme::text()),
+                );
+                if editor.dirty() {
+                    ui.label(
+                        RichText::new(i18n::t(language, "repo.settings.ignore_modified"))
+                            .small()
+                            .color(theme::warning()),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(i18n::t(language, "repo.settings.ignore_hint"))
+                    .small()
+                    .color(theme::muted()),
+            );
+            ui.label(
+                RichText::new(i18n::t(language, "repo.settings.ignore_precedence_hint"))
+                    .small()
+                    .color(theme::muted()),
+            );
+            ui.add_space(8.0);
+
+            let available_width = ui.available_width();
+            let explanation_width = ((available_width - 36.0 - 32.0) * 0.5 - 20.0).max(160.0);
+            let explanation_font = FontId::proportional(11.0);
+            let row_heights = editor
+                .document
+                .lines
+                .iter()
+                .map(|line| {
+                    let explanation = gitignore::explain_gitignore_line(line);
+                    let text = match language {
+                        Language::Chinese => explanation.zh,
+                        Language::English => explanation.en,
+                    };
+                    (ui.painter()
+                        .layout(
+                            text,
+                            explanation_font.clone(),
+                            theme::text(),
+                            explanation_width,
+                        )
+                        .size()
+                        .y
+                        + 16.0)
+                        .max(42.0)
+                })
+                .collect::<Vec<_>>();
+            let table = TableBuilder::new(ui)
+                .striped(true)
+                .cell_layout(Layout::left_to_right(Align::Center))
+                .column(Column::exact(36.0))
+                .column(Column::remainder().at_least(190.0))
+                .column(Column::remainder().at_least(250.0))
+                .column(Column::exact(32.0))
+                .min_scrolled_height(0.0)
+                .max_scroll_height(420.0)
+                .sense(Sense::hover());
+            table
+                .header(26.0, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("#");
+                    });
+                    header.col(|ui| {
+                        ui.strong(i18n::t(language, "repo.settings.ignore_pattern"));
+                    });
+                    header.col(|ui| {
+                        ui.strong(i18n::t(language, "repo.settings.ignore_explanation"));
+                    });
+                    header.col(|_| {});
+                })
+                .body(|body| {
+                    body.heterogeneous_rows(row_heights.into_iter(), |mut row| {
+                        let index = row.index();
+                        row.col(|ui| {
+                            ui.label(RichText::new((index + 1).to_string()).color(theme::muted()));
+                        });
+                        row.col(|ui| {
+                            ui.add_enabled_ui(!saving, |ui| {
+                                themed_text_edit_selection(ui);
+                                ui.add_sized(
+                                    [ui.available_width().max(80.0), 26.0],
+                                    TextEdit::singleline(&mut editor.document.lines[index])
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                        });
+                        row.col(|ui| {
+                            let explanation =
+                                gitignore::explain_gitignore_line(&editor.document.lines[index]);
+                            let explanation = match language {
+                                Language::Chinese => explanation.zh,
+                                Language::English => explanation.en,
+                            };
+                            ui.set_max_width(explanation_width);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(explanation).small().color(theme::text()),
+                                )
+                                .wrap(),
+                            );
+                        });
+                        row.col(|ui| {
+                            if icon_button(
+                                ui,
+                                UiIcon::Trash,
+                                i18n::t(language, "repo.settings.ignore_remove"),
+                                !saving,
+                            )
+                            .clicked()
+                            {
+                                remove_index = Some(index);
+                            }
+                        });
+                    });
+                });
+
+            if editor.document.lines.is_empty() {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(i18n::t(language, "repo.settings.ignore_empty"))
+                        .color(theme::muted()),
+                );
+            }
+            if let Some(error) = &editor.error {
+                ui.add_space(8.0);
+                ui.label(RichText::new(error).small().color(theme::warning()));
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if inline_text_action_button(
+                    ui,
+                    Some(UiIcon::Plus),
+                    i18n::t(language, "repo.settings.ignore_add"),
+                    !saving,
+                    false,
+                )
+                .clicked()
+                {
+                    editor.document.add_rule();
+                }
+                if inline_text_action_button(
+                    ui,
+                    Some(UiIcon::Edit),
+                    i18n::t(language, "repo.settings.ignore_save"),
+                    !saving && editor.error.is_none() && editor.dirty(),
+                    false,
+                )
+                .clicked()
+                {
+                    save_requested = true;
+                }
+                if saving {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(i18n::t(language, "repo.settings.ignore_saving"))
+                            .small()
+                            .color(theme::muted()),
+                    );
+                }
+            });
+        });
+
+        if let Some(index) = remove_index {
+            if index < editor.document.lines.len() {
+                editor.document.lines.remove(index);
+            }
+        }
+        if save_requested {
+            self.start_repo_gitignore_save(false);
+        }
     }
 
     fn repo_advanced_settings_page(&mut self, ui: &mut Ui) {
@@ -30133,6 +30521,7 @@ fn settings_tab_label(language: Language, tab: SettingsTab) -> &'static str {
         (Language::Chinese, SettingsTab::HostingAccounts) => "\u{6258}\u{7ba1}\u{8d26}\u{6237}",
         (Language::Chinese, SettingsTab::CommitAuthors) => "\u{63d0}\u{4ea4}\u{8005}",
         (Language::Chinese, SettingsTab::RepoRemotes) => "\u{8fdc}\u{7aef}\u{4ed3}\u{5e93}",
+        (Language::Chinese, SettingsTab::RepoIgnoreRules) => "\u{5ffd}\u{7565}\u{89c4}\u{5219}",
         (Language::Chinese, SettingsTab::RepoAdvanced) => "\u{9ad8}\u{7ea7}",
         (_, SettingsTab::General) => "General",
         (_, SettingsTab::Git) => "Git",
@@ -30142,6 +30531,7 @@ fn settings_tab_label(language: Language, tab: SettingsTab) -> &'static str {
         (_, SettingsTab::HostingAccounts) => "Hosting Accounts",
         (_, SettingsTab::CommitAuthors) => "Authors",
         (_, SettingsTab::RepoRemotes) => "Remote Repositories",
+        (_, SettingsTab::RepoIgnoreRules) => "Ignore Rules",
         (_, SettingsTab::RepoAdvanced) => "Advanced",
     }
 }
@@ -30204,6 +30594,7 @@ fn repo_settings_content_width(dialog_width: f32) -> f32 {
 fn repo_settings_dialog_height(tab: SettingsTab) -> f32 {
     match tab {
         SettingsTab::RepoRemotes => 330.0,
+        SettingsTab::RepoIgnoreRules => REPO_SETTINGS_DIALOG_HEIGHT,
         SettingsTab::RepoAdvanced => REPO_SETTINGS_DIALOG_HEIGHT,
         _ => 330.0,
     }
@@ -30212,6 +30603,7 @@ fn repo_settings_dialog_height(tab: SettingsTab) -> f32 {
 fn repo_settings_content_max_height(tab: SettingsTab) -> f32 {
     match tab {
         SettingsTab::RepoRemotes => 190.0,
+        SettingsTab::RepoIgnoreRules => 500.0,
         SettingsTab::RepoAdvanced => 500.0,
         _ => 190.0,
     }
@@ -30223,6 +30615,11 @@ fn repo_settings_tab_strip(ui: &mut Ui, current: &mut SettingsTab, language: Lan
             SettingsTab::RepoRemotes,
             UiIcon::Globe,
             settings_tab_label(language, SettingsTab::RepoRemotes),
+        ),
+        (
+            SettingsTab::RepoIgnoreRules,
+            UiIcon::File,
+            settings_tab_label(language, SettingsTab::RepoIgnoreRules),
         ),
         (
             SettingsTab::RepoAdvanced,
@@ -50921,5 +51318,46 @@ diff --git a/file.txt b/file.txt
         assert!(implementation.contains("CommitIdentityExecution::UseOnce"));
         assert!(implementation.contains("CommitIdentityExecution::Persist"));
         assert!(implementation.contains("CommitIdentityExecution::Suppress"));
+    }
+
+    #[test]
+    fn repo_ignore_rules_use_localized_deterministic_explanations_and_safe_async_save() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let page_start = implementation
+            .find("fn repo_ignore_rules_settings_page(")
+            .unwrap();
+        let page_end = implementation[page_start..]
+            .find("fn repo_advanced_settings_page(")
+            .unwrap();
+        let page = &implementation[page_start..page_start + page_end];
+        let save_start = implementation
+            .find("fn start_repo_gitignore_save(")
+            .unwrap();
+        let save_end = implementation[save_start..]
+            .find("fn active_repo_gitignore_save_busy(")
+            .unwrap();
+        let save = &implementation[save_start..save_start + save_end];
+        let poll_start = implementation.find("fn poll_tasks(").unwrap();
+        let poll_end = implementation[poll_start..]
+            .find("fn request_selected_details(")
+            .unwrap();
+        let poll = &implementation[poll_start..poll_start + poll_end];
+
+        assert!(implementation.contains("SettingsTab::RepoIgnoreRules"));
+        assert!(page.contains("gitignore::explain_gitignore_line"));
+        assert!(page.contains("Language::Chinese => explanation.zh"));
+        assert!(page.contains("Language::English => explanation.en"));
+        assert!(page.contains("editor.document.add_rule()"));
+        assert!(page.contains("body.heterogeneous_rows(row_heights.into_iter()"));
+        assert!(page.contains(".wrap()"));
+        assert!(save.contains("self.repo_gitignore_save_task = Some(receiver)"));
+        assert!(save.contains("self.repo_gitignore_save_root = Some(root.clone())"));
+        assert!(save.contains("self.loading_repo = true"));
+        assert!(save.contains("scheduler.acquire_exclusive"));
+        assert!(implementation.contains("|| self.active_repo_gitignore_save_busy()"));
+        assert!(poll.contains("self.repo_gitignore_save_task.take()"));
+        assert!(poll.contains("self.repo_gitignore_save_root = None"));
+        assert!(poll.contains("self.load_repository_uncached(root)"));
     }
 }

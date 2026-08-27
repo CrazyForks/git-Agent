@@ -39,6 +39,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify tag matches application version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $packageVersion = ($metadata.packages | Where-Object { $_.name -eq "git-agent" }).version
+          $tagVersion = "${{ github.ref_name }}".TrimStart("v")
+
+          if ($packageVersion -ne $tagVersion) {
+            throw "Release tag ${{ github.ref_name }} does not match Cargo package version $packageVersion"
+          }
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
