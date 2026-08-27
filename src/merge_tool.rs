@@ -311,6 +311,7 @@ const MERGE_AI_MAX_MANUAL_RESULT_CHARS: usize = 32 * 1024;
 const MERGE_AI_MAX_MIDDLE_EDITS: usize = 12;
 const MERGE_AI_MAX_MIDDLE_EDIT_EXPECTED_CHARS: usize = 512;
 const MERGE_AI_MAX_MIDDLE_EDIT_REPLACEMENT_CHARS: usize = 8 * 1024;
+const MERGE_AI_TARGET_CONTEXT_RADIUS: usize = 20;
 const MERGE_AI_TOOL_NAME: &str = "submit_merge_suggestions";
 const MERGE_AI_OVERLAY_DRAG_MARGIN: f32 = 8.0;
 const MERGE_LOADING_CARD_WIDTH: f32 = 560.0;
@@ -3120,20 +3121,49 @@ fn request_merge_ai_suggestions(
             .into_iter()
             .map(|group| MergeLineActionTarget::BaseOnlyGroup(group.line_index)),
     );
+    let payload_has_exact_coverage =
+        merge_ai_response_has_exact_target_coverage(&content, &valid_targets);
     let suggestions = parse_merge_ai_suggestions(&content, &valid_targets, args.language)?;
     let suggestions = guard_merge_ai_suggestions(document, suggestions);
-    if merge_ai_needs_completeness_repair(&suggestions) {
+    let accepted_targets = suggestions
+        .iter()
+        .map(|suggestion| suggestion.target)
+        .collect::<HashSet<_>>();
+    let exact_coverage = payload_has_exact_coverage && accepted_targets == valid_targets;
+    let needs_completeness_repair = merge_ai_needs_completeness_repair(&suggestions);
+    if !exact_coverage || needs_completeness_repair {
         crate::diagnostics::merge_ai_trace(
             "validation.repair_requested",
-            "reason=manual_result_without_confirmed_middle_edits",
+            &format!(
+                "reason={}{}",
+                (!exact_coverage).then_some("target_coverage").unwrap_or(""),
+                if !exact_coverage && needs_completeness_repair {
+                    "+manual_result_without_confirmed_middle_edits"
+                } else if needs_completeness_repair {
+                    "manual_result_without_confirmed_middle_edits"
+                } else {
+                    ""
+                }
+            ),
         );
-        let repair_prompt = merge_ai_completeness_repair_prompt(&prompt, &content);
+        let repair_prompt = merge_ai_validation_repair_prompt(
+            &prompt,
+            &content,
+            !exact_coverage,
+            needs_completeness_repair,
+        );
         let repaired_content = send_merge_ai_tool_request(
             config,
             &repair_prompt,
             "completeness_repair",
             valid_targets.len(),
         )?;
+        if !merge_ai_response_has_exact_target_coverage(&repaired_content, &valid_targets) {
+            return Err(format!(
+                "AI validation repair did not return exactly {} current merge targets",
+                valid_targets.len()
+            ));
+        }
         let repaired =
             parse_merge_ai_suggestions(&repaired_content, &valid_targets, args.language)?;
         let repaired = guard_merge_ai_suggestions(document, repaired);
@@ -3172,9 +3202,24 @@ fn merge_ai_needs_completeness_repair(suggestions: &[MergeAiSuggestion]) -> bool
     })
 }
 
-fn merge_ai_completeness_repair_prompt(prompt: &str, previous_payload: &str) -> String {
+fn merge_ai_validation_repair_prompt(
+    prompt: &str,
+    previous_payload: &str,
+    repair_coverage: bool,
+    repair_completeness: bool,
+) -> String {
+    let coverage_instruction = if repair_coverage {
+        "The previous payload had missing, duplicate, or extra targets. Return exactly one suggestion for each target explicitly listed under CONFLICTS and DELETION DECISIONS, and no suggestion for any other target."
+    } else {
+        "Preserve the exact target coverage from the supplied request."
+    };
+    let completeness_instruction = if repair_completeness {
+        "At least one manual result lacked confirmed dependent Middle edits, so audit every manual replacement and encode every mechanically required non-target edit."
+    } else {
+        "Keep manual results and Middle edits internally consistent."
+    };
     format!(
-        "{prompt}\n\nSTRUCTURED COMPLETENESS AND CONSISTENCY AUDIT:\nThe previous tool result is reproduced below. Re-derive it from the supplied code instead of trusting any number or claim in that result. Audit it against the full Middle draft, assertions, references, and related files above. Recount every explicit array element, object property, argument, parameter, enum member, and ordered operation in manual_result, then compare those counts and orders with every numeric or derived middle_edit and assertion. For example, six listed elements require a count of 6, never 5. A reason must never describe a concrete required code change that is absent from the structured payload. If applying manual_result changes a collection, signature, enum, or order and a supplied derived value, assertion, caller, or reference must also change, encode every exact non-target change in middle_edits. Do not label a mechanically provable mismatch as pre-existing when the exact correction is available. Keep middle_edits empty only after verifying no additional Middle line must change. Keep reason_zh and reason_en to one or two short sentences and merge order to one short sentence. Return the complete corrected tool payload once, with exactly the same target coverage.\n\nPREVIOUS TOOL RESULT:\n{previous_payload}",
+        "{prompt}\n\nSTRUCTURED COVERAGE, COMPLETENESS, AND CONSISTENCY AUDIT:\nThe previous tool result is reproduced below. Re-derive it from the supplied code instead of trusting any target, number, or claim in that result. {coverage_instruction} {completeness_instruction} Audit every decision against the target-local neighborhoods, resolved Middle result, assertions, references, and related files above. Never use an unresolved target's provisional presence or omission as evidence. Recount every explicit array element, object property, argument, parameter, enum member, and ordered operation in manual_result, then compare those counts and orders with every numeric or derived middle_edit and assertion. For example, six listed elements require a count of 6, never 5. A reason must never describe a concrete required code change that is absent from the structured payload. If applying manual_result changes a collection, signature, enum, or order and a supplied derived value, assertion, caller, or reference must also change, encode every exact non-target change in middle_edits. Do not label a mechanically provable mismatch as pre-existing when the exact correction is available. Keep middle_edits empty only after verifying no additional Middle line must change. Keep reason_zh and reason_en to one or two short sentences and merge order to one short sentence. Return the complete corrected tool payload once.\n\nPREVIOUS TOOL RESULT:\n{previous_payload}",
     )
 }
 
@@ -3498,6 +3543,58 @@ fn merge_ai_response_structure(
             )
         }
     }
+}
+
+fn merge_ai_response_has_exact_target_coverage(
+    response: &str,
+    valid_targets: &HashSet<MergeLineActionTarget>,
+) -> bool {
+    let response = response
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```");
+    let response = response.trim_end_matches("```").trim();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(response) else {
+        return false;
+    };
+    let Some(items) = value
+        .get("suggestions")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+    else {
+        return false;
+    };
+    if items.len() != valid_targets.len() {
+        return false;
+    }
+
+    let mut targets = HashSet::new();
+    for item in items {
+        let Some(index) = item
+            .get("target_index")
+            .or_else(|| item.get("conflict_index"))
+            .and_then(serde_json::Value::as_u64)
+        else {
+            return false;
+        };
+        let target_type = item
+            .get("target_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("conflict")
+            .trim()
+            .to_ascii_lowercase();
+        let target = match target_type.as_str() {
+            "conflict" => MergeLineActionTarget::Conflict(index as usize),
+            "deletion" | "base_only" | "base-only" => {
+                MergeLineActionTarget::BaseOnlyGroup(index as usize)
+            }
+            _ => return false,
+        };
+        if !valid_targets.contains(&target) || !targets.insert(target) {
+            return false;
+        }
+    }
+    targets == *valid_targets
 }
 
 fn parse_merge_ai_suggestions(
@@ -4159,19 +4256,215 @@ fn is_identifier_character(character: char) -> bool {
 }
 
 fn merge_ai_system_prompt() -> &'static str {
-    "You are a conservative Git merge assistant. Never claim to edit files and never execute changes. Analyze each conflict and deletion decision using the complete Left/Base/Right texts, the current editable Middle draft, branch-specific Git history, the current repository merge diff, symbol references, and related files. The panes are named Left, Middle, and Right; they do not imply local or remote repository ownership. Treat the Middle draft as the authoritative context for changes already merged outside the target conflict. Never preserve an import, declaration, dependency, or call merely because it exists on one side: first verify that the merged Middle draft or current related code still uses it. When either side adds, removes, renames, or reorders array elements, object properties, method or function parameters and arguments, enum members, or ordered operations, inspect the complete Middle draft plus related definitions and callers for resulting effects before choosing. Recommend left only when evidence shows the Left pane should win, right only when evidence shows the Right pane should win, or manual when the correct Middle result requires editing or evidence is insufficient. For an exact manual resolution, set manual_result_provided to true and return the complete replacement for that target in manual_result. Use middle_edits only for additional exact changes to already-resolved Middle code, including non-diff lines; every expected_text must be a unique substring within one logical Middle line, and replacement_text may contain multiple lines. Leave manual_result_provided false and middle_edits empty when evidence is insufficient. These payloads are proposals applied only after user confirmation. For every manual recommendation that retains meaningful content from both sides, merge_order_zh and merge_order_en must state the exact execution or precedence order. For control-flow branches, analyze condition overlap and state which branch wins when both conditions match; never claim mutual exclusivity without concrete supplied proof. If the retained edits are structurally parallel, explicitly state that no runtime order exists and specify their placement. If evidence cannot determine the order, list the candidate orders and their behavioral difference instead of saying only to keep both. Keep each localized reason to one or two short sentences: conclusion first, then only decisive evidence. Keep merge order to one short sentence and do not duplicate it in the reason. Do not expose the full reasoning chain. Submit recommendations exactly once through the submit_merge_suggestions tool."
+    "You are a conservative Git merge assistant. Never claim to edit files and never execute changes. Analyze each conflict and deletion decision using the complete Left/Base/Right texts, the resolved Middle result, target-local neighborhoods, branch-specific Git history, the current repository merge diff, symbol references, and related files. The panes are named Left, Middle, and Right; they do not imply local or remote repository ownership. Treat Middle as authoritative only for changes already resolved outside the current target. Every unresolved target is omitted from the resolved Middle result, so its presence or absence there is never evidence to keep or delete that target. Never argue that a deletion should be kept merely because a provisional editor row or the other pane still contains it. Compare the target-local neighborhoods and verify whether the changed side moved, consolidated, or replaced the target behavior elsewhere. When the same operation is relocated to a broader or shared execution point that already covers the old location, retaining both copies duplicates behavior; keep both only when supplied evidence proves that each copy still has a distinct responsibility. Never preserve an import, declaration, dependency, or call merely because it exists on one side: first verify that the merged Middle result or current related code still uses it. When either side adds, removes, renames, or reorders array elements, object properties, method or function parameters and arguments, enum members, or ordered operations, inspect the complete Middle result plus related definitions and callers for resulting effects before choosing. Recommend left only when evidence shows the Left pane should win, right only when evidence shows the Right pane should win, or manual when the correct Middle result requires editing or evidence is insufficient. For an exact manual resolution, set manual_result_provided to true and return the complete replacement for that target in manual_result. Use middle_edits only for additional exact changes to already-resolved Middle code, including non-diff lines; every expected_text must be a unique substring within one logical Middle line, and replacement_text may contain multiple lines. Leave manual_result_provided false and middle_edits empty when evidence is insufficient. These payloads are proposals applied only after user confirmation. For every manual recommendation that retains meaningful content from both sides, merge_order_zh and merge_order_en must state the exact execution or precedence order. For control-flow branches, analyze condition overlap and state which branch wins when both conditions match; never claim mutual exclusivity without concrete supplied proof. If the retained edits are structurally parallel, explicitly state that no runtime order exists and specify their placement. If evidence cannot determine the order, list the candidate orders and their behavioral difference instead of saying only to keep both. Keep each localized reason to one or two short sentences: conclusion first, then only decisive evidence. Keep merge order to one short sentence and do not duplicate it in the reason. Do not expose the full reasoning chain. Submit recommendations exactly once through the submit_merge_suggestions tool."
 }
 
 fn merge_ai_editable_middle_text(document: &MergeDocument) -> String {
-    let mut text = merge_result_display_rows(document)
-        .into_iter()
-        .map(|row| row.text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !text.is_empty() {
-        text.push('\n');
+    document.result_text()
+}
+
+fn merge_ai_target_neighborhoods(sources: &MergeSourceText, document: &MergeDocument) -> String {
+    let base_lines = split_lines(&sources.base);
+    let local_lines = split_lines(&sources.local);
+    let remote_lines = split_lines(&sources.remote);
+    let local_changes = diff_changes(&base_lines, &local_lines, MergeIgnoreMode::None);
+    let remote_changes = diff_changes(&base_lines, &remote_lines, MergeIgnoreMode::None);
+    let mut targets = document
+        .conflicts()
+        .iter()
+        .map(|conflict| {
+            let start = conflict.line_indices.first().copied().unwrap_or(0);
+            let end = conflict
+                .line_indices
+                .last()
+                .map_or(start, |index| index + 1);
+            (
+                start,
+                end,
+                format!("Conflict {}", conflict.index),
+                conflict.base.clone(),
+                conflict.local.len(),
+                conflict.remote.len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for group in base_only_display_groups(document) {
+        let end = group.line_index + group.line_count;
+        let base = document.lines[group.line_index..end]
+            .iter()
+            .filter_map(|line| line.base.clone())
+            .collect::<Vec<_>>();
+        let local_len = document.lines[group.line_index..end]
+            .iter()
+            .filter(|line| line.local.is_some())
+            .count();
+        let remote_len = document.lines[group.line_index..end]
+            .iter()
+            .filter(|line| line.remote.is_some())
+            .count();
+        targets.push((
+            group.line_index,
+            end,
+            format!("Deletion {}", group.line_index),
+            base,
+            local_len,
+            remote_len,
+        ));
     }
-    text
+    targets.sort_by_key(|target| target.0);
+
+    let mut output = String::new();
+    let mut base_cursor = 0usize;
+    for (document_start, document_end, label, base_target, local_len, remote_len) in targets {
+        let base_start = if base_target.is_empty() {
+            base_cursor
+        } else {
+            find_merge_ai_line_block(&base_lines, &base_target, base_cursor)
+                .or_else(|| find_merge_ai_line_block(&base_lines, &base_target, 0))
+                .unwrap_or(base_cursor.min(base_lines.len()))
+        };
+        base_cursor = base_start.saturating_add(base_target.len());
+        let local_start =
+            side_position_for_base_position(&local_changes, base_start, MergeBoundaryBias::Before);
+        let remote_start =
+            side_position_for_base_position(&remote_changes, base_start, MergeBoundaryBias::Before);
+
+        output.push_str("\n### ");
+        output.push_str(&label);
+        output.push_str(" target-local neighborhoods\n");
+        append_merge_ai_line_window(
+            &mut output,
+            "BASE",
+            &base_lines,
+            base_start,
+            base_target.len(),
+        );
+        append_merge_ai_line_window(&mut output, "LEFT", &local_lines, local_start, local_len);
+        append_merge_ai_line_window(
+            &mut output,
+            "RIGHT",
+            &remote_lines,
+            remote_start,
+            remote_len,
+        );
+        append_merge_ai_relocation_evidence(&mut output, document, &base_target);
+        append_merge_ai_middle_window(&mut output, document, document_start, document_end);
+    }
+    output
+}
+
+fn append_merge_ai_relocation_evidence(
+    output: &mut String,
+    document: &MergeDocument,
+    target_lines: &[String],
+) {
+    let resolved_middle = document.result_text();
+    let resolved_lines = resolved_middle
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<HashSet<_>>();
+    let mut repeated = target_lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| {
+            line.chars().count() >= 4
+                && line.chars().any(|character| character.is_alphanumeric())
+                && resolved_lines.contains(*line)
+        })
+        .collect::<Vec<_>>();
+    repeated.sort_unstable();
+    repeated.dedup();
+    if repeated.is_empty() {
+        return;
+    }
+
+    output.push_str(
+        "CROSS-TARGET RELATIONSHIP EVIDENCE: the resolved Middle already contains these exact target lines elsewhere:\n",
+    );
+    for line in repeated {
+        output.push_str("  = ");
+        output.push_str(line);
+        output.push('\n');
+    }
+    output.push_str(
+        "Treat this as possible relocation or consolidation, not proof that both copies are required. Compare responsibilities before keeping the old target.\n",
+    );
+}
+
+fn find_merge_ai_line_block(lines: &[String], target: &[String], start: usize) -> Option<usize> {
+    if target.is_empty() {
+        return Some(start.min(lines.len()));
+    }
+    lines
+        .windows(target.len())
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, window)| {
+            window
+                .iter()
+                .map(String::as_str)
+                .eq(target.iter().map(String::as_str))
+                .then_some(index)
+        })
+}
+
+fn append_merge_ai_line_window(
+    output: &mut String,
+    pane: &str,
+    lines: &[String],
+    target_start: usize,
+    target_len: usize,
+) {
+    let target_start = target_start.min(lines.len());
+    let target_end = target_start.saturating_add(target_len).min(lines.len());
+    let start = target_start.saturating_sub(MERGE_AI_TARGET_CONTEXT_RADIUS);
+    let end = target_end
+        .saturating_add(MERGE_AI_TARGET_CONTEXT_RADIUS)
+        .min(lines.len());
+    output.push_str(pane);
+    output.push_str(" neighborhood (>> marks target lines):\n");
+    for index in start..end {
+        if target_len == 0 && index == target_start {
+            output.push_str(">> [TARGET ABSENT IN THIS PANE; DELETION/INSERTION POINT]\n");
+        }
+        let marker = if (target_start..target_end).contains(&index) {
+            ">>"
+        } else {
+            "  "
+        };
+        output.push_str(&format!("{marker} {:>6}: {}\n", index + 1, lines[index]));
+    }
+    if target_len == 0 && target_start == end {
+        output.push_str(">> [TARGET ABSENT IN THIS PANE; DELETION/INSERTION POINT]\n");
+    }
+}
+
+fn append_merge_ai_middle_window(
+    output: &mut String,
+    document: &MergeDocument,
+    target_start: usize,
+    target_end: usize,
+) {
+    let start = target_start.saturating_sub(MERGE_AI_TARGET_CONTEXT_RADIUS);
+    let end = target_end
+        .saturating_add(MERGE_AI_TARGET_CONTEXT_RADIUS)
+        .min(document.lines.len());
+    output.push_str(
+        "MIDDLE resolved surroundings (the unresolved target is deliberately omitted):\n",
+    );
+    for index in start..end {
+        if index == target_start {
+            output.push_str(">> [UNRESOLVED TARGET OMITTED; DO NOT INFER KEEP OR DELETE]\n");
+        }
+        if (target_start..target_end).contains(&index) {
+            continue;
+        }
+        let line = &document.lines[index];
+        if line.include_in_result {
+            output.push_str(&format!("   {:>6}: {}\n", index + 1, line.result));
+        }
+    }
 }
 
 fn merge_ai_prompt(
@@ -4224,15 +4517,16 @@ fn merge_ai_prompt(
             )
         })
         .collect::<String>();
+    let target_neighborhoods = merge_ai_target_neighborhoods(sources, document);
     let source_excerpts = format!(
-        "BASE FILE EXCERPT:\n{}\nLEFT FILE EXCERPT:\n{}\nRIGHT FILE EXCERPT:\n{}\nMIDDLE AUTO-MERGED DRAFT:\n{}",
+        "FILE PREFIX EXCERPTS (may be truncated; never infer target absence from these prefixes):\nBASE FILE PREFIX:\n{}\nLEFT FILE PREFIX:\n{}\nRIGHT FILE PREFIX:\n{}\nRESOLVED MIDDLE RESULT (all unresolved targets are omitted; target absence is not a deletion decision):\n{}",
         truncate_merge_ai_text(&sources.base, 20 * 1024),
         truncate_merge_ai_text(&sources.local, 20 * 1024),
         truncate_merge_ai_text(&sources.remote, 20 * 1024),
         truncate_merge_ai_text(&merge_ai_editable_middle_text(document), 32 * 1024),
     );
     format!(
-        "Analyze a merge for `{}`. Before choosing a side, reconcile each target with the entire MIDDLE AUTO-MERGED DRAFT and CURRENT REPOSITORY MERGE STATE, because non-conflicting edits may make a line from either side obsolete. For imports and declarations, explicitly verify current usage in the Middle draft and SYMBOL REFERENCES; absence of usage is evidence for removal, not preservation. When either side adds, removes, renames, or reorders array elements, object properties, method or function parameters and arguments, enum members, or ordered operations, inspect the complete Middle draft plus related definitions and callers for resulting effects before choosing. Use branch-specific history to infer intent, but choose manual if the evidence conflicts or the correct result is neither side verbatim. When the correct target is neither side verbatim and evidence is sufficient, set manual_result_provided=true and put the exact complete target replacement in manual_result. Put any additional required edits to already-resolved Middle code in middle_edits. This includes non-diff lines. Each expected_text must occur exactly once inside one logical Middle line; replacement_text may contain multiple lines, and insertions must retain the chosen anchor text in replacement_text. Do not use line numbers or Markdown fences. For left/right choices, or when evidence is insufficient, use manual_result_provided=false, manual_result=\"\", and middle_edits=[] unless the selected side mechanically requires a proven additional Middle edit. For every suggestion, write both `reason_zh` in Simplified Chinese and `reason_en` in English. Each reason must be exactly one or two short sentences: the first states the recommendation, and the optional second cites only the decisive Middle/history/reference evidence. Do not repeat code, merge order, or the full analysis. Also always return `merge_order_zh` and `merge_order_en` as one short sentence: for a manual result that retains both sides, state the exact before/after or precedence order; for control-flow branches analyze whether conditions overlap and state which branch wins when both match, never asserting mutual exclusivity without concrete evidence; for parallel declarations/fields state that no runtime order exists and give their structural placement; when evidence is insufficient state the candidate orders and how behavior differs. Never respond only that both sides should be kept. For left/right choices use 不适用 and Not applicable. In those reasons call the panes 左边/中间/右边 and Left/Middle/Right respectively; never infer or say local branch or remote branch. Call `{MERGE_AI_TOOL_NAME}` exactly once and include one suggestion for every conflict and every deletion decision. The call is advisory only: do not claim that any file or merge result was changed.\n\nCONFLICTS:{conflicts}\n\nDELETION DECISIONS:{deletions}\n\nGIT HISTORY:\n{}\n\nCURRENT REPOSITORY MERGE STATE:\n{}\n\nSYMBOL REFERENCES IN CURRENT WORKTREE:\n{}\n\nRELATED FILE CONTEXT:{}\n\n{}",
+        "Analyze a merge for `{}`. Before choosing a side, reconcile each target with TARGET-LOCAL NEIGHBORHOODS, the RESOLVED MIDDLE RESULT, and CURRENT REPOSITORY MERGE STATE, because non-conflicting edits may make a line from either side obsolete. Middle contains only already-resolved code outside unresolved targets. Never use an unresolved target's provisional editor row, or its deliberate omission from Middle, as evidence to keep or delete it. For deletions, compare Base→Left and Base→Right intent in the supplied neighborhoods and check whether the changed side moved, consolidated, or replaced the same operation elsewhere. If a broader or shared execution point in the resolved Middle already covers the deleted location, retaining the old copy duplicates behavior; keep both only with concrete evidence that they still serve distinct responsibilities. For imports and declarations, explicitly verify current usage in the resolved Middle result and SYMBOL REFERENCES; absence of usage is evidence for removal, not preservation. When either side adds, removes, renames, or reorders array elements, object properties, method or function parameters and arguments, enum members, or ordered operations, inspect the complete Middle result plus related definitions and callers for resulting effects before choosing. Use branch-specific history to infer intent, but choose manual if the evidence conflicts or the correct result is neither side verbatim. When the correct target is neither side verbatim and evidence is sufficient, set manual_result_provided=true and put the exact complete target replacement in manual_result. Put any additional required edits to already-resolved Middle code in middle_edits. This includes non-diff lines. Each expected_text must occur exactly once inside one logical Middle line; replacement_text may contain multiple lines, and insertions must retain the chosen anchor text in replacement_text. Do not use line numbers or Markdown fences. For left/right choices, or when evidence is insufficient, use manual_result_provided=false, manual_result=\"\", and middle_edits=[] unless the selected side mechanically requires a proven additional Middle edit. For every suggestion, write both `reason_zh` in Simplified Chinese and `reason_en` in English. Each reason must be exactly one or two short sentences: the first states the recommendation, and the optional second cites only the decisive Middle/history/reference evidence. Do not repeat code, merge order, or the full analysis. Also always return `merge_order_zh` and `merge_order_en` as one short sentence: for a manual result that retains both sides, state the exact before/after or precedence order; for control-flow branches analyze whether conditions overlap and state which branch wins when both match, never asserting mutual exclusivity without concrete evidence; for parallel declarations/fields state that no runtime order exists and give their structural placement; when evidence is insufficient state the candidate orders and how behavior differs. Never respond only that both sides should be kept. For left/right choices use 不适用 and Not applicable. In those reasons call the panes 左边/中间/右边 and Left/Middle/Right respectively; never infer or say local branch or remote branch. Call `{MERGE_AI_TOOL_NAME}` exactly once and include exactly one suggestion for every listed conflict and deletion decision, with no extra targets. The call is advisory only: do not claim that any file or merge result was changed.\n\nCONFLICTS:{conflicts}\n\nDELETION DECISIONS:{deletions}\n\nTARGET-LOCAL NEIGHBORHOODS (these are authoritative for code around each target):\n{target_neighborhoods}\n\nGIT HISTORY:\n{}\n\nCURRENT REPOSITORY MERGE STATE:\n{}\n\nSYMBOL REFERENCES IN CURRENT WORKTREE:\n{}\n\nRELATED FILE CONTEXT:{}\n\n{}",
         args.output.display(),
         if context.history.is_empty() {
             "(unavailable)"
@@ -10545,6 +10839,80 @@ export function quote(total: number): number {
         let _ = fs::remove_dir_all(temp_root);
     }
 
+    /// Live regression for a stale child event binding after the changed pane moved the same
+    /// handler to the enclosing trigger. The target repository is context-only and remains
+    /// untouched; all three merge inputs live in a temporary directory.
+    #[test]
+    #[ignore = "requires a configured AI model and explicit GIT_AGENT_LIVE_AI_REPO"]
+    fn live_merge_ai_moved_event_binding_prefers_deletion() {
+        let repo = PathBuf::from(
+            env::var("GIT_AGENT_LIVE_AI_REPO")
+                .expect("set GIT_AGENT_LIVE_AI_REPO to the merge test repository"),
+        );
+        let requested_model = env::var("GIT_AGENT_LIVE_AI_MODEL").ok();
+        let config = crate::app::load_merge_ai_model_config(requested_model.as_deref())
+            .expect("unable to load the configured AI model");
+        let (sources, document) = moved_vue_event_binding_fixture();
+        let deletions = base_only_display_groups(&document);
+        assert_eq!(deletions.len(), 2);
+        assert!(
+            deletions
+                .iter()
+                .all(|deletion| deletion.missing_side == MergeSide::Local)
+        );
+
+        let temp_root = env::temp_dir().join(format!(
+            "git-agent-live-ai-moved-event-{}-{}",
+            std::process::id(),
+            MERGE_AI_CONTEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&temp_root).expect("unable to create live AI temporary directory");
+        let base_path = temp_root.join("base.vue");
+        let local_path = temp_root.join("left.vue");
+        let remote_path = temp_root.join("right.vue");
+        fs::write(&base_path, &sources.base).expect("unable to write base fixture");
+        fs::write(&local_path, &sources.local).expect("unable to write left fixture");
+        fs::write(&remote_path, &sources.remote).expect("unable to write right fixture");
+        let args = MergeArgs {
+            base: base_path,
+            local: local_path,
+            remote: remote_path,
+            output: repo.join("src/components/dropdown/PSelect.vue"),
+            repo_root: Some(repo),
+            stage: false,
+            theme: MergeTheme::Light,
+            language: MergeLanguage::Chinese,
+            ai_model_name: requested_model,
+        };
+        let context = collect_merge_ai_context(&args, &sources, &document)
+            .expect("unable to collect live AI context");
+        let suggestions =
+            request_merge_ai_suggestions(&config, &args, &sources, &document, &context)
+                .expect("live AI request failed");
+        for suggestion in &suggestions {
+            println!(
+                "LIVE_AI_MOVED_EVENT\ttarget={:?}\tchoice={:?}\treason_zh={}\treason_en={}",
+                suggestion.target,
+                suggestion.choice,
+                suggestion.reason_zh.replace(['\r', '\n'], " "),
+                suggestion.reason_en.replace(['\r', '\n'], " "),
+            );
+        }
+        for deletion in deletions {
+            let target = MergeLineActionTarget::BaseOnlyGroup(deletion.line_index);
+            let suggestion = suggestions
+                .iter()
+                .find(|suggestion| suggestion.target == target)
+                .unwrap_or_else(|| panic!("model must return suggestion for {target:?}"));
+            assert_eq!(
+                suggestion.choice,
+                MergeAiChoice::Local,
+                "the changed Left pane moved the click handler to the enclosing trigger"
+            );
+        }
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
     fn navigation_matrix_document() -> MergeDocument {
         three_way_merge(
             "header\nconflict-a = base\nstable-a\ndelete-from-local\nstable-b\nconflict-b = base\nstable-c\ndelete-from-remote\nstable-d\nconflict-c = base\nfooter\n",
@@ -10583,6 +10951,58 @@ export function quote(total: number): number {
                 .reason_en
                 .contains("Merge order: Run Left validation")
         );
+        assert!(
+            !merge_ai_response_has_exact_target_coverage(
+                r#"{"suggestions":[
+                    {"conflict_index":0,"choice":"left"},
+                    {"conflict_index":2,"choice":"manual"},
+                    {"conflict_index":3,"choice":"right"}
+                ]}"#,
+                &valid_targets,
+            ),
+            "an otherwise parseable extra target must trigger a coverage repair"
+        );
+    }
+
+    #[test]
+    fn ai_response_coverage_requires_each_current_target_exactly_once() {
+        let valid_targets = HashSet::from([
+            MergeLineActionTarget::Conflict(0),
+            MergeLineActionTarget::BaseOnlyGroup(17),
+        ]);
+        let exact = r#"{"suggestions":[
+            {"target_type":"conflict","target_index":0},
+            {"target_type":"deletion","target_index":17}
+        ]}"#;
+        let missing = r#"{"suggestions":[
+            {"target_type":"conflict","target_index":0}
+        ]}"#;
+        let duplicate = r#"{"suggestions":[
+            {"target_type":"conflict","target_index":0},
+            {"target_type":"conflict","target_index":0}
+        ]}"#;
+        let extra = r#"{"suggestions":[
+            {"target_type":"conflict","target_index":0},
+            {"target_type":"deletion","target_index":17},
+            {"target_type":"conflict","target_index":1}
+        ]}"#;
+
+        assert!(merge_ai_response_has_exact_target_coverage(
+            exact,
+            &valid_targets
+        ));
+        assert!(!merge_ai_response_has_exact_target_coverage(
+            missing,
+            &valid_targets
+        ));
+        assert!(!merge_ai_response_has_exact_target_coverage(
+            duplicate,
+            &valid_targets
+        ));
+        assert!(!merge_ai_response_has_exact_target_coverage(
+            extra,
+            &valid_targets
+        ));
     }
 
     #[test]
@@ -10839,7 +11259,8 @@ export function quote(total: number): number {
 
     #[test]
     fn completeness_repair_requires_reasons_and_payload_to_agree() {
-        let prompt = merge_ai_completeness_repair_prompt("original context", "previous payload");
+        let prompt =
+            merge_ai_validation_repair_prompt("original context", "previous payload", true, true);
 
         assert!(prompt.contains("original context"));
         assert!(prompt.contains("previous payload"));
@@ -10847,7 +11268,8 @@ export function quote(total: number): number {
         assert!(prompt.contains("encode every exact non-target change in middle_edits"));
         assert!(prompt.contains("Recount every explicit array element"));
         assert!(prompt.contains("six listed elements require a count of 6, never 5"));
-        assert!(prompt.contains("exactly the same target coverage"));
+        assert!(prompt.contains("exactly one suggestion for each target"));
+        assert!(prompt.contains("no suggestion for any other target"));
     }
 
     #[test]
@@ -11180,7 +11602,9 @@ export function quote(total: number): number {
         assert!(!prompt.contains("LOCAL FILE EXCERPT"));
         assert!(!prompt.contains("REMOTE FILE EXCERPT"));
         assert!(prompt.contains("value = local"));
-        assert!(prompt.contains("MIDDLE AUTO-MERGED DRAFT"));
+        assert!(prompt.contains("RESOLVED MIDDLE RESULT"));
+        assert!(prompt.contains("TARGET-LOCAL NEIGHBORHOODS"));
+        assert!(prompt.contains("unresolved target's provisional editor row"));
         assert!(prompt.contains("abc123 change validation"));
         assert!(prompt.contains("CURRENT REPOSITORY MERGE STATE"));
         assert!(prompt.contains("M src/plugin.ts"));
@@ -11189,6 +11613,55 @@ export function quote(total: number): number {
         assert!(prompt.contains("related file: settings.toml"));
         assert!(prompt.contains("submit_merge_suggestions"));
         assert!(prompt.contains("advisory only"));
+    }
+
+    fn moved_vue_event_binding_fixture() -> (MergeSourceText, MergeDocument) {
+        let filler = (0..1_400)
+            .map(|index| format!("// stable filler {index:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let base = format!(
+            "<script setup>\nfunction openDropdown() {{}}\n</script>\n{filler}\n<template>\n  <div class=\"p-select-trigger\">\n    <a-input\n      readonly\n      @click=\"openDropdown\"\n    />\n    <div\n      class=\"p-select-tags-wrapper\"\n      @click=\"openDropdown\"\n    />\n  </div>\n</template>\n"
+        );
+        let left = format!(
+            "<script setup>\nfunction openDropdown() {{}}\n</script>\n{filler}\n<template>\n  <div\n    class=\"p-select-trigger\"\n    @click=\"openDropdown\"\n  >\n    <a-input\n      readonly\n    />\n    <div\n      class=\"p-select-tags-wrapper\"\n    />\n  </div>\n</template>\n"
+        );
+        let remote = base.clone();
+        let sources = MergeSourceText {
+            base: base.clone(),
+            local: left.clone(),
+            remote: remote.clone(),
+        };
+        (sources, three_way_merge(&base, &left, &remote))
+    }
+
+    #[test]
+    fn ai_prompt_uses_target_local_context_for_large_file_event_relocation() {
+        let (sources, document) = moved_vue_event_binding_fixture();
+        let deletions = base_only_display_groups(&document);
+        assert_eq!(deletions.len(), 2);
+        assert!(
+            sources.base.chars().count() > 20 * 1024,
+            "fixture must place the template beyond the old prefix-only context"
+        );
+
+        let middle = merge_ai_editable_middle_text(&document);
+        assert_eq!(middle.matches("@click=\"openDropdown\"").count(), 1);
+        let prompt = merge_ai_prompt(
+            &test_merge_args(),
+            &sources,
+            &document,
+            &MergeAiContext::default(),
+        );
+
+        assert!(prompt.contains("TARGET-LOCAL NEIGHBORHOODS"));
+        assert!(prompt.contains("@click=\"openDropdown\""));
+        assert!(prompt.contains("TARGET ABSENT IN THIS PANE"));
+        assert!(prompt.contains("UNRESOLVED TARGET OMITTED"));
+        assert!(prompt.contains("class=\"p-select-trigger\""));
+        assert!(prompt.contains("CROSS-TARGET RELATIONSHIP EVIDENCE"));
+        assert!(prompt.contains("possible relocation or consolidation"));
+        assert!(prompt.contains("broader or shared execution point"));
     }
 
     #[test]
