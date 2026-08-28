@@ -36720,13 +36720,15 @@ fn searchable_branch_dropdown(
         });
     let filter_id = id.with("branch_filter");
     let filter_input_id = filter_id.with("input");
-    let popup_was_open = egui::ComboBox::is_open(ui.ctx(), id);
+    let mut popup_was_open = false;
     let mut changed = false;
     let mut selected_option = false;
 
     let combo_response = ui
         .scope(|ui| {
             apply_recessed_dropdown_visuals(ui);
+            let button_id = ui.make_persistent_id(id);
+            popup_was_open = egui::ComboBox::is_open(ui.ctx(), button_id);
             egui::ComboBox::from_id_salt(id)
                 .width(width)
                 .selected_text(selected_text)
@@ -36795,14 +36797,24 @@ fn searchable_branch_dropdown(
                 })
         })
         .inner;
+    let combo_button_id = combo_response.response.id;
     paint_recessed_control_shadow(ui, combo_response.response.rect);
-    if combo_response.response.clicked() && !popup_was_open {
+    if combo_response.response.clicked()
+        && !popup_was_open
+        && egui::ComboBox::is_open(ui.ctx(), combo_button_id)
+    {
         ui.ctx()
             .data_mut(|data| data.insert_temp(filter_id, String::new()));
         ui.memory_mut(|memory| memory.request_focus(filter_input_id));
     }
     if selected_option {
         ui.memory_mut(|memory| memory.close_popup());
+    }
+    if !egui::ComboBox::is_open(ui.ctx(), combo_button_id) {
+        // The popup owns this text edit only while it is visible. Keeping its id focused after
+        // closing produces an invalid AccessKit tree (and panics on Windows), most visibly when
+        // the combo button is double-clicked to open and immediately close the popup.
+        ui.memory_mut(|memory| memory.surrender_focus(filter_input_id));
     }
     changed
 }
@@ -47218,6 +47230,75 @@ diff --git a/file.txt b/file.txt
         assert!(
             (label_center - combo_center).abs() <= 1.0,
             "label center {label_center} != combo center {combo_center}"
+        );
+    }
+
+    #[test]
+    fn searchable_dropdown_double_click_releases_removed_filter_focus() {
+        fn click_input(time: f64, pos: Pos2) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 300.0))),
+                time: Some(time),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            }
+        }
+
+        fn render_dropdown(ctx: &egui::Context, input: egui::RawInput, selected: &mut String) {
+            ctx.begin_pass(input);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                searchable_branch_dropdown(
+                    ui,
+                    egui::Id::new("double_click_searchable_dropdown"),
+                    selected,
+                    &[("main".to_owned(), "main".to_owned())],
+                    220.0,
+                    "Select branch",
+                    "Search branches",
+                );
+            });
+            let _ = ctx.end_pass();
+        }
+
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, theme::ThemeMode::Light, theme::ThemeAccent::Blue);
+        let mut selected = "main".to_owned();
+        let screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 300.0)));
+        render_dropdown(
+            &ctx,
+            egui::RawInput {
+                screen_rect,
+                ..Default::default()
+            },
+            &mut selected,
+        );
+
+        let combo_position = Pos2::new(80.0, 20.0);
+        render_dropdown(&ctx, click_input(1.0, combo_position), &mut selected);
+        let filter_input_id = egui::Id::new("double_click_searchable_dropdown")
+            .with("branch_filter")
+            .with("input");
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(filter_input_id));
+
+        render_dropdown(&ctx, click_input(1.1, combo_position), &mut selected);
+        assert_ne!(
+            ctx.memory(|memory| memory.focused()),
+            Some(filter_input_id),
+            "closing the searchable popup must not leave AccessKit focused on its removed input"
         );
     }
 
