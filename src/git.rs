@@ -2776,20 +2776,40 @@ pub fn unstage_all(root: impl AsRef<Path>) -> Result<()> {
     git_output(root.as_ref(), &["restore", "--staged", "--", "."]).map(|_| ())
 }
 
-pub fn discard_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
-    git_output(root.as_ref(), &["checkout", "--", path]).map(|_| ())
+pub fn discard_paths(root: impl AsRef<Path>, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["checkout".to_owned(), "--".to_owned()];
+    args.extend(paths.iter().cloned());
+    run_git_args(root.as_ref(), args).map(|_| ())
 }
 
-pub fn clean_untracked_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
-    git_output(root.as_ref(), &["clean", "-fd", "--", path]).map(|_| ())
+pub fn clean_untracked_paths(root: impl AsRef<Path>, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["clean".to_owned(), "-fd".to_owned(), "--".to_owned()];
+    args.extend(paths.iter().cloned());
+    run_git_args(root.as_ref(), args).map(|_| ())
 }
 
-pub fn remove_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
-    git_output(root.as_ref(), &["rm", "--", path]).map(|_| ())
+pub fn remove_paths(root: impl AsRef<Path>, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["rm".to_owned(), "--".to_owned()];
+    args.extend(paths.iter().cloned());
+    run_git_args(root.as_ref(), args).map(|_| ())
 }
 
-pub fn stop_tracking_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
-    git_output(root.as_ref(), &["rm", "--cached", "--", path]).map(|_| ())
+pub fn stop_tracking_paths(root: impl AsRef<Path>, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["rm".to_owned(), "--cached".to_owned(), "--".to_owned()];
+    args.extend(paths.iter().cloned());
+    run_git_args(root.as_ref(), args).map(|_| ())
 }
 
 pub fn create_worktree_patch_for_paths(
@@ -3201,25 +3221,39 @@ pub fn revert_patch_text(root: impl AsRef<Path>, patch: &str) -> Result<()> {
     result
 }
 
-pub fn add_to_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<()> {
+pub fn add_to_gitignore_patterns(root: impl AsRef<Path>, patterns: &[String]) -> Result<()> {
     let root = root.as_ref();
-    let pattern = normalize_gitignore_pattern(pattern);
-    if pattern.is_empty() {
+    let patterns = patterns
+        .iter()
+        .map(|pattern| normalize_gitignore_pattern(pattern))
+        .filter(|pattern| !pattern.is_empty())
+        .collect::<Vec<_>>();
+    if patterns.is_empty() {
         return Ok(());
     }
 
     let ignore_path = root.join(".gitignore");
     let existing = fs::read_to_string(&ignore_path).unwrap_or_default();
-    if existing.lines().any(|line| line.trim() == pattern) {
+    let mut next = existing;
+    let mut known = next
+        .lines()
+        .map(|line| line.trim().to_owned())
+        .collect::<HashSet<_>>();
+    let mut changed = false;
+    for pattern in patterns {
+        if !known.insert(pattern.clone()) {
+            continue;
+        }
+        if !next.is_empty() && !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str(&pattern);
+        next.push('\n');
+        changed = true;
+    }
+    if !changed {
         return Ok(());
     }
-
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str(&pattern);
-    next.push('\n');
     fs::write(&ignore_path, next)
         .with_context(|| format!("write {}", ignore_path.display()))
         .map(|_| ())
@@ -4747,9 +4781,15 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
-        add_to_gitignore(&root, r".\src\").unwrap();
-        add_to_gitignore(&root, "src/").unwrap();
-        add_to_gitignore(&root, r"src\app.rs").unwrap();
+        add_to_gitignore_patterns(
+            &root,
+            &[
+                r".\src\".to_owned(),
+                "src/".to_owned(),
+                r"src\app.rs".to_owned(),
+            ],
+        )
+        .unwrap();
 
         let content = fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(content, "src/\nsrc/app.rs\n");
@@ -5318,21 +5358,38 @@ mod tests {
         git_output(&root, &["config", "user.email", "tester@example.com"])?;
         git_output(&root, &["config", "user.name", "Git Agent Test"])?;
 
-        fs::write(root.join("tracked.txt"), "tracked\n")?;
-        fs::write(root.join("cached.txt"), "cached\n")?;
+        for path in [
+            "tracked-a.txt",
+            "tracked-b.txt",
+            "cached-a.txt",
+            "cached-b.txt",
+        ] {
+            fs::write(root.join(path), "base\n")?;
+        }
         git_output(&root, &["add", "."])?;
         git_output(&root, &["commit", "-m", "base"])?;
 
-        remove_path(&root, "tracked.txt")?;
-        assert!(!root.join("tracked.txt").exists());
+        remove_paths(
+            &root,
+            &["tracked-a.txt".to_owned(), "tracked-b.txt".to_owned()],
+        )?;
+        assert!(!root.join("tracked-a.txt").exists());
+        assert!(!root.join("tracked-b.txt").exists());
         let removed_status = git_output(&root, &["status", "--short"])?;
-        assert!(removed_status.contains("D  tracked.txt"));
+        assert!(removed_status.contains("D  tracked-a.txt"));
+        assert!(removed_status.contains("D  tracked-b.txt"));
 
-        stop_tracking_path(&root, "cached.txt")?;
-        assert!(root.join("cached.txt").exists());
+        stop_tracking_paths(
+            &root,
+            &["cached-a.txt".to_owned(), "cached-b.txt".to_owned()],
+        )?;
+        assert!(root.join("cached-a.txt").exists());
+        assert!(root.join("cached-b.txt").exists());
         let cached_status = git_output(&root, &["status", "--short"])?;
-        assert!(cached_status.contains("D  cached.txt"));
-        assert!(cached_status.contains("?? cached.txt"));
+        assert!(cached_status.contains("D  cached-a.txt"));
+        assert!(cached_status.contains("D  cached-b.txt"));
+        assert!(cached_status.contains("?? cached-a.txt"));
+        assert!(cached_status.contains("?? cached-b.txt"));
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
@@ -5383,6 +5440,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a.txt", "b.txt", "c.txt"]
         );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn discard_and_clean_paths_update_every_requested_file() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-discard-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "core.autocrlf", "false"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        for path in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join(path), "base\n")?;
+        }
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        for path in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join(path), "changed\n")?;
+        }
+        for path in ["new-a.txt", "new-b.txt", "new-c.txt"] {
+            fs::write(root.join(path), "untracked\n")?;
+        }
+
+        discard_paths(&root, &["a.txt".to_owned(), "b.txt".to_owned()])?;
+        clean_untracked_paths(&root, &["new-a.txt".to_owned(), "new-b.txt".to_owned()])?;
+
+        assert_eq!(fs::read_to_string(root.join("a.txt"))?, "base\n");
+        assert_eq!(fs::read_to_string(root.join("b.txt"))?, "base\n");
+        assert_eq!(fs::read_to_string(root.join("c.txt"))?, "changed\n");
+        assert!(!root.join("new-a.txt").exists());
+        assert!(!root.join("new-b.txt").exists());
+        assert!(root.join("new-c.txt").exists());
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

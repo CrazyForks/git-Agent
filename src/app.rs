@@ -1908,8 +1908,7 @@ enum CommitMenuAction {
 #[derive(Clone, Debug)]
 enum WorktreeActionDialog {
     ConfirmDiscard {
-        path: String,
-        untracked: bool,
+        targets: Vec<WorktreeDiscardTarget>,
     },
     ConfirmDiscardAll,
     ResolveConflicts {
@@ -2535,6 +2534,12 @@ struct SelectedWorktreeFile {
     untracked: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorktreeDiscardTarget {
+    path: String,
+    untracked: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct CustomGitActionSettings {
@@ -2691,6 +2696,27 @@ fn worktree_action_paths_for_row(
     let mut paths = selection.paths(staged).iter().cloned().collect::<Vec<_>>();
     paths.sort();
     paths
+}
+
+fn worktree_discard_targets_for_row(
+    selection: &WorktreeSelectionState,
+    files: &[WorktreeFile],
+    staged: bool,
+    row: &WorktreeFile,
+) -> Vec<WorktreeDiscardTarget> {
+    let paths = worktree_action_paths_for_row(selection, staged, &row.path);
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            files
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| WorktreeDiscardTarget {
+                    path,
+                    untracked: file.index_status == '?',
+                })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5916,6 +5942,7 @@ impl GitAgentApp {
         let has_repo = self.active_repo_tab.is_some() && self.snapshot.is_some();
         let git_dialog_enabled = has_repo && !self.branch_actions_busy();
         let selected = self.selected_worktree_action_state();
+        let selected_targets = self.selected_worktree_discard_targets();
 
         match command {
             ActionsMenuCommand::OpenSelected
@@ -5926,7 +5953,12 @@ impl GitAgentApp {
             ActionsMenuCommand::StageSelected => {
                 git_dialog_enabled && selected.as_ref().is_some_and(|file| !file.staged)
             }
-            ActionsMenuCommand::RemoveSelected | ActionsMenuCommand::LineReview => {
+            ActionsMenuCommand::RemoveSelected => {
+                git_dialog_enabled
+                    && !selected_targets.is_empty()
+                    && selected_targets.iter().all(|target| !target.untracked)
+            }
+            ActionsMenuCommand::LineReview => {
                 git_dialog_enabled && selected.as_ref().is_some_and(|file| !file.untracked)
             }
             ActionsMenuCommand::UnstageSelected => {
@@ -5958,9 +5990,9 @@ impl GitAgentApp {
                 })
             }
             ActionsMenuCommand::RemoveSelected => {
-                if let Some(file) = self.selected_worktree_action_state() {
-                    self.handle_worktree_action(WorktreeMenuAction::Remove { path: file.path });
-                }
+                self.handle_worktree_action(WorktreeMenuAction::Remove {
+                    paths: self.selected_worktree_action_paths(),
+                });
             }
             ActionsMenuCommand::UnstageSelected => {
                 self.handle_worktree_action(WorktreeMenuAction::Unstage {
@@ -5971,12 +6003,9 @@ impl GitAgentApp {
                 self.stage_toggle_current_repository();
             }
             ActionsMenuCommand::DiscardSelected => {
-                if let Some(file) = self.selected_worktree_action_state() {
-                    self.handle_worktree_action(WorktreeMenuAction::Discard {
-                        path: file.path,
-                        untracked: file.untracked,
-                    });
-                }
+                self.handle_worktree_action(WorktreeMenuAction::Discard {
+                    targets: self.selected_worktree_discard_targets(),
+                });
             }
             ActionsMenuCommand::SelectedHistory => self.open_selected_worktree_history(),
             ActionsMenuCommand::LineReview => self.open_selected_worktree_blame(),
@@ -6005,6 +6034,24 @@ impl GitAgentApp {
             return Vec::new();
         };
         worktree_action_paths_for_row(&self.worktree_selection, selected.staged, &selected.path)
+    }
+
+    fn selected_worktree_discard_targets(&self) -> Vec<WorktreeDiscardTarget> {
+        let Some(selected) = self.selected_worktree_file.as_ref() else {
+            return Vec::new();
+        };
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let files = if selected.staged {
+            &snapshot.staged
+        } else {
+            &snapshot.unstaged
+        };
+        let Some(row) = files.iter().find(|file| file.path == selected.path) else {
+            return Vec::new();
+        };
+        worktree_discard_targets_for_row(&self.worktree_selection, files, selected.staged, row)
     }
 
     fn selected_worktree_absolute_path(&self) -> Option<PathBuf> {
@@ -12379,6 +12426,14 @@ impl GitAgentApp {
                 requested_top_menu == Some(TopMenu::Actions),
                 |ui| {
                     let selected_worktree_action_state = self.selected_worktree_action_state();
+                    let selected_worktree_action_paths = self.selected_worktree_action_paths();
+                    let selected_worktree_discard_targets =
+                        self.selected_worktree_discard_targets();
+                    let selected_worktree_actions_all_tracked = !selected_worktree_discard_targets
+                        .is_empty()
+                        && selected_worktree_discard_targets
+                            .iter()
+                            .all(|target| !target.untracked);
                     let selected_conflict_path = self.selected_or_first_conflict_path();
                     let rebase_in_progress = self
                         .snapshot
@@ -12498,19 +12553,14 @@ impl GitAgentApp {
                     }
                     if menu_text_button(
                         ui,
-                        git_dialog_enabled
-                            && selected_worktree_action_state
-                                .as_ref()
-                                .is_some_and(|file| !file.untracked),
+                        git_dialog_enabled && selected_worktree_actions_all_tracked,
                         menu_label(self.language, "actions_stop_tracking"),
                     )
                     .clicked()
                     {
-                        if let Some(file) = selected_worktree_action_state.clone() {
-                            self.handle_worktree_action(WorktreeMenuAction::StopTracking {
-                                path: file.path,
-                            });
-                        }
+                        self.handle_worktree_action(WorktreeMenuAction::StopTracking {
+                            paths: selected_worktree_action_paths.clone(),
+                        });
                         ui.close_menu();
                     }
                     if menu_text_button(
@@ -12520,11 +12570,12 @@ impl GitAgentApp {
                     )
                     .clicked()
                     {
-                        if let Some(file) = selected_worktree_action_state.clone() {
-                            self.handle_worktree_action(WorktreeMenuAction::AddToGitIgnore {
-                                pattern: normalize_worktree_path(&file.display_path),
-                            });
-                        }
+                        self.handle_worktree_action(WorktreeMenuAction::AddToGitIgnore {
+                            patterns: selected_worktree_action_paths
+                                .iter()
+                                .map(|path| normalize_worktree_path(path))
+                                .collect(),
+                        });
                         ui.close_menu();
                     }
                     if menu_shortcut_button(
@@ -15287,15 +15338,17 @@ impl GitAgentApp {
             WorktreeMenuAction::UnstageAll => {
                 self.execute_git_action(|root| git::unstage_all(root));
             }
-            WorktreeMenuAction::Discard { path, untracked } => {
-                self.pending_worktree_action =
-                    Some(WorktreeActionDialog::ConfirmDiscard { path, untracked });
+            WorktreeMenuAction::Discard { targets } => {
+                if !targets.is_empty() {
+                    self.pending_worktree_action =
+                        Some(WorktreeActionDialog::ConfirmDiscard { targets });
+                }
             }
-            WorktreeMenuAction::Remove { path } => {
-                self.execute_git_action(move |root| git::remove_path(root, &path));
+            WorktreeMenuAction::Remove { paths } => {
+                self.execute_git_action(move |root| git::remove_paths(root, &paths));
             }
-            WorktreeMenuAction::StopTracking { path } => {
-                self.execute_git_action(move |root| git::stop_tracking_path(root, &path));
+            WorktreeMenuAction::StopTracking { paths } => {
+                self.execute_git_action(move |root| git::stop_tracking_paths(root, &paths));
             }
             WorktreeMenuAction::ResolveConflict { path } => {
                 self.pending_worktree_action = Some(WorktreeActionDialog::ResolveConflicts {
@@ -15303,8 +15356,10 @@ impl GitAgentApp {
                     select_after_refresh: None,
                 });
             }
-            WorktreeMenuAction::AddToGitIgnore { pattern } => {
-                self.execute_git_action(move |root| git::add_to_gitignore(root, &pattern));
+            WorktreeMenuAction::AddToGitIgnore { patterns } => {
+                self.execute_git_action(move |root| {
+                    git::add_to_gitignore_patterns(root, &patterns)
+                });
             }
         }
     }
@@ -17153,21 +17208,30 @@ impl GitAgentApp {
             None;
 
         match dialog {
-            WorktreeActionDialog::ConfirmDiscard { path, untracked } => {
+            WorktreeActionDialog::ConfirmDiscard { targets } => {
                 compact_action_dialog(
                     ctx,
                     self.tr("worktree.discard"),
                     ACTION_DIALOG_WIDTH,
                     |ui| {
-                        ui.label(RichText::new(&path).monospace().color(theme::text()));
-                        ui.label(
-                            RichText::new(if untracked {
-                                self.tr("worktree.discard_untracked_warning")
-                            } else {
-                                self.tr("worktree.discard_tracked_warning")
-                            })
-                            .color(theme::warning()),
-                        );
+                        let path_list = targets
+                            .iter()
+                            .map(|target| target.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ui.label(RichText::new(path_list).monospace().color(theme::text()));
+                        if targets.iter().any(|target| !target.untracked) {
+                            ui.label(
+                                RichText::new(self.tr("worktree.discard_tracked_warning"))
+                                    .color(theme::warning()),
+                            );
+                        }
+                        if targets.iter().any(|target| target.untracked) {
+                            ui.label(
+                                RichText::new(self.tr("worktree.discard_untracked_warning"))
+                                    .color(theme::warning()),
+                            );
+                        }
                         ui.add_space(4.0);
                         dialog_footer_row(ui, |ui| {
                             if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
@@ -17178,13 +17242,19 @@ impl GitAgentApp {
                                 .clicked()
                                 || submit_requested
                             {
-                                let path = path.clone();
+                                let tracked = targets
+                                    .iter()
+                                    .filter(|target| !target.untracked)
+                                    .map(|target| target.path.clone())
+                                    .collect::<Vec<_>>();
+                                let untracked = targets
+                                    .iter()
+                                    .filter(|target| target.untracked)
+                                    .map(|target| target.path.clone())
+                                    .collect::<Vec<_>>();
                                 execute = Some(Box::new(move |root| {
-                                    if untracked {
-                                        git::clean_untracked_path(root, &path)
-                                    } else {
-                                        git::discard_path(root, &path)
-                                    }
+                                    git::discard_paths(root, &tracked)?;
+                                    git::clean_untracked_paths(root, &untracked)
                                 }));
                                 close_after = true;
                             }
@@ -17200,7 +17270,7 @@ impl GitAgentApp {
                 }
                 if keep_open {
                     self.pending_worktree_action =
-                        Some(WorktreeActionDialog::ConfirmDiscard { path, untracked });
+                        Some(WorktreeActionDialog::ConfirmDiscard { targets });
                 }
             }
             WorktreeActionDialog::ConfirmDiscardAll => {
@@ -23303,11 +23373,11 @@ enum WorktreeMenuAction {
     StageAll,
     Unstage { paths: Vec<String> },
     UnstageAll,
-    Discard { path: String, untracked: bool },
-    Remove { path: String },
-    StopTracking { path: String },
+    Discard { targets: Vec<WorktreeDiscardTarget> },
+    Remove { paths: Vec<String> },
+    StopTracking { paths: Vec<String> },
     ResolveConflict { path: String },
-    AddToGitIgnore { pattern: String },
+    AddToGitIgnore { patterns: Vec<String> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31722,6 +31792,7 @@ fn worktree_table(
                                         let response = worktree_file_row(
                                             ui,
                                             file,
+                                            files,
                                             staged,
                                             row_selected,
                                             selection,
@@ -31760,6 +31831,7 @@ fn worktree_table(
                                 let response = worktree_file_row(
                                     ui,
                                     file,
+                                    files,
                                     staged,
                                     row_selected,
                                     selection,
@@ -33261,7 +33333,7 @@ fn worktree_directory_row(
             .clicked()
         {
             *action = Some(WorktreeMenuAction::AddToGitIgnore {
-                pattern: format!("{}/", path.trim_end_matches('/')),
+                patterns: vec![format!("{}/", path.trim_end_matches('/'))],
             });
             ui.close_menu();
         }
@@ -33273,6 +33345,7 @@ fn worktree_directory_row(
 fn worktree_file_row(
     ui: &mut Ui,
     file: &WorktreeFile,
+    files: &[WorktreeFile],
     staged: bool,
     selected: bool,
     selection: &WorktreeSelectionState,
@@ -33282,6 +33355,7 @@ fn worktree_file_row(
     path_label: &str,
 ) -> egui::Response {
     let action_paths = worktree_action_paths_for_row(selection, staged, &file.path);
+    let discard_targets = worktree_discard_targets_for_row(selection, files, staged, file);
     let status = if file.is_conflicted() {
         "U".to_owned()
     } else if staged {
@@ -33376,8 +33450,7 @@ fn worktree_file_row(
         }
         if ui.button(i18n::t(language, "worktree.discard")).clicked() {
             *action = Some(WorktreeMenuAction::Discard {
-                path: file.path.clone(),
-                untracked: file.index_status == '?',
+                targets: discard_targets.clone(),
             });
             ui.close_menu();
         }
@@ -33386,7 +33459,10 @@ fn worktree_file_row(
             .clicked()
         {
             *action = Some(WorktreeMenuAction::AddToGitIgnore {
-                pattern: normalize_worktree_path(&file.display_path),
+                patterns: action_paths
+                    .iter()
+                    .map(|path| normalize_worktree_path(path))
+                    .collect(),
             });
             ui.close_menu();
         }
@@ -38798,6 +38874,79 @@ mod ui_tests {
     }
 
     #[test]
+    fn worktree_discard_targets_keep_the_entire_mixed_selection() {
+        let files = [
+            WorktreeFile {
+                path: "a.txt".to_owned(),
+                display_path: "a.txt".to_owned(),
+                ..Default::default()
+            },
+            WorktreeFile {
+                path: "b.txt".to_owned(),
+                display_path: "b.txt".to_owned(),
+                index_status: '?',
+                ..Default::default()
+            },
+            WorktreeFile {
+                path: "c.txt".to_owned(),
+                display_path: "c.txt".to_owned(),
+                ..Default::default()
+            },
+        ];
+        let mut selection = WorktreeSelectionState::default();
+        for (index, file) in files.iter().enumerate() {
+            selection.apply(
+                &files,
+                &file.path,
+                false,
+                WorktreeSelectionModifiers {
+                    ctrl: index > 0,
+                    shift: false,
+                },
+            );
+        }
+
+        assert_eq!(
+            worktree_discard_targets_for_row(&selection, &files, false, &files[2]),
+            vec![
+                WorktreeDiscardTarget {
+                    path: "a.txt".to_owned(),
+                    untracked: false,
+                },
+                WorktreeDiscardTarget {
+                    path: "b.txt".to_owned(),
+                    untracked: true,
+                },
+                WorktreeDiscardTarget {
+                    path: "c.txt".to_owned(),
+                    untracked: false,
+                },
+            ]
+        );
+
+        let outside_selection = WorktreeFile {
+            path: "outside.txt".to_owned(),
+            display_path: "outside.txt".to_owned(),
+            index_status: '?',
+            ..Default::default()
+        };
+        let mut files_with_outside = files.to_vec();
+        files_with_outside.push(outside_selection.clone());
+        assert_eq!(
+            worktree_discard_targets_for_row(
+                &selection,
+                &files_with_outside,
+                false,
+                &outside_selection,
+            ),
+            vec![WorktreeDiscardTarget {
+                path: "outside.txt".to_owned(),
+                untracked: true,
+            }]
+        );
+    }
+
+    #[test]
     fn worktree_row_actions_target_the_full_selection_only_when_the_row_is_selected() {
         let mut selection = WorktreeSelectionState::default();
         selection
@@ -42766,7 +42915,7 @@ mod ui_tests {
             "self.apply_patch_file();",
             "self.copy_selected_worktree_file_path(ui.ctx());",
             "WorktreeMenuAction::StopTracking",
-            ".is_some_and(|file| !file.untracked)",
+            "selected_worktree_actions_all_tracked",
         ] {
             assert!(actions_source.contains(required), "{required}");
         }
@@ -42802,10 +42951,10 @@ mod ui_tests {
         let handler_source = &implementation_source[handler_start..handler_start + handler_end];
 
         for required in [
-            "WorktreeMenuAction::Remove { path }",
-            "git::remove_path(root, &path)",
-            "WorktreeMenuAction::StopTracking { path }",
-            "git::stop_tracking_path(root, &path)",
+            "WorktreeMenuAction::Remove { paths }",
+            "git::remove_paths(root, &paths)",
+            "WorktreeMenuAction::StopTracking { paths }",
+            "git::stop_tracking_paths(root, &paths)",
         ] {
             assert!(handler_source.contains(required), "{required}");
         }
@@ -46031,7 +46180,7 @@ mod ui_tests {
             ("fn archive_action_modal(", "fn merge_action_modal("),
             ("fn merge_action_modal(", "fn stash_action_modal("),
             (
-                "WorktreeActionDialog::ConfirmDiscard { path, untracked } =>",
+                "WorktreeActionDialog::ConfirmDiscard { targets } =>",
                 "WorktreeActionDialog::ResolveConflicts",
             ),
             ("fn stash_action_modal(", "fn branch_action_modal("),
@@ -46069,7 +46218,7 @@ mod ui_tests {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let dialog_start = implementation_source
-            .find("WorktreeActionDialog::ConfirmDiscard { path, untracked } =>")
+            .find("WorktreeActionDialog::ConfirmDiscard { targets } =>")
             .unwrap();
         let dialog_end = implementation_source[dialog_start..]
             .find("WorktreeActionDialog::ConfirmDiscardAll")
