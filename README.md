@@ -56,9 +56,3 @@ git push origin v0.1.0
 ```
 
 The release assets are generated automatically from the workflow build outputs.
-
-## Support
-
-If this project helps you, you can support it on 爱发电:
-
-https://ifdian.net/a/adoin
