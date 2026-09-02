@@ -254,6 +254,11 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ("about.title", "\u{5173}\u{4e8e} Git Agent"),
     ("about.version", "\u{7248}\u{672c}"),
     ("about.repository", "\u{9879}\u{76ee}\u{4e3b}\u{9875}"),
+    ("support.menu", "我想当金主爸爸"),
+    (
+        "support.kofi_hint",
+        "在浏览器中打开 Ko-fi，支持 Git Agent 的开发",
+    ),
     ("tutorial.menu", "\u{65b0}\u{624b}\u{6559}\u{7a0b}"),
     ("tutorial.close", "\u{5173}\u{95ed}\u{6559}\u{7a0b}"),
     ("tutorial.previous", "\u{4e0a}\u{4e00}\u{6b65}"),
@@ -2101,6 +2106,11 @@ const EN: &[(&str, &str)] = &[
     ("about.title", "About Git Agent"),
     ("about.version", "Version"),
     ("about.repository", "Project home"),
+    ("support.menu", "Become a Supporter"),
+    (
+        "support.kofi_hint",
+        "Open Ko-fi in your browser to support Git Agent development",
+    ),
     ("tutorial.menu", "Beginner Tutorial"),
     ("tutorial.close", "Close tutorial"),
     ("tutorial.previous", "Previous"),
@@ -3410,6 +3420,15 @@ const ZH: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn support_menu_labels_are_translated() {
+        assert_eq!(t(Language::Chinese, "support.menu"), "我想当金主爸爸");
+        assert_eq!(t(Language::English, "support.menu"), "Become a Supporter");
+        for language in [Language::Chinese, Language::English] {
+            assert!(t(language, "support.kofi_hint").contains("Ko-fi"));
+        }
+    }
 
     #[test]
     fn chinese_labels_are_not_mojibake() {

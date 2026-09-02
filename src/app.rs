@@ -49,6 +49,7 @@ use crate::{
     updater::{self, InstallOutcome, UpdateRelease},
 };
 
+const KOFI_SUPPORT_URL: &str = "https://ko-fi.com/adoin";
 const TITLE_BAR_HEIGHT: f32 = 32.0;
 const WINDOW_RESIZE_BORDER: f32 = 8.0;
 const TITLE_DRAG_TOP_INSET: f32 = WINDOW_RESIZE_BORDER + 1.0;
@@ -12765,6 +12766,8 @@ impl GitAgentApp {
                         self.start_update_check();
                         ui.close_menu();
                     }
+                    menu_group_gap(ui);
+                    support_menu_item(ui, self.language);
                 },
             );
         });
@@ -26264,6 +26267,18 @@ fn menu_text_button_hover_fill() -> Color32 {
 
 fn menu_text_button(ui: &mut Ui, enabled: bool, label: &str) -> egui::Response {
     menu_text_button_with_text(ui, enabled, label.to_owned())
+}
+
+fn support_menu_item(ui: &mut Ui, language: Language) -> egui::Response {
+    let response = menu_text_button(ui, true, i18n::t(language, "support.menu"))
+        .on_hover_text(i18n::t(language, "support.kofi_hint"));
+    if response.clicked() {
+        // Let the native integration open the browser after this frame, without doing
+        // process or network work in the menu's paint path or touching repository state.
+        ui.ctx().open_url(egui::OpenUrl::new_tab(KOFI_SUPPORT_URL));
+        ui.close_menu();
+    }
+    response
 }
 
 fn menu_text_button_with_text(ui: &mut Ui, enabled: bool, text: String) -> egui::Response {
@@ -51020,7 +51035,10 @@ diff --git a/file.txt b/file.txt
         let update = help_menu
             .find("menu_label(self.language, \"check_updates\")")
             .unwrap();
-        assert!(tutorial < about && about < update);
+        let support = help_menu
+            .find("support_menu_item(ui, self.language);")
+            .unwrap();
+        assert!(tutorial < about && about < update && update < support);
         assert!(help_menu.contains("self.start_beginner_tutorial();"));
         assert!(help_menu.contains("self.about_open = true;"));
         assert!(help_menu.contains("self.start_update_check();"));
@@ -51068,6 +51086,75 @@ diff --git a/file.txt b/file.txt
         assert!(modal.contains("!task_busy"));
         assert!(modal.contains("update.download_install"));
         assert!(modal.contains("self.start_update_install();"));
+    }
+
+    #[test]
+    fn support_menu_item_opens_only_kofi_on_click_in_both_languages() {
+        fn render(
+            ctx: &egui::Context,
+            language: Language,
+            events: Vec<egui::Event>,
+        ) -> (Rect, Vec<egui::OutputCommand>) {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 300.0))),
+                events,
+                ..Default::default()
+            });
+            let rect = egui::CentralPanel::default()
+                .show(ctx, |ui| {
+                    let response = support_menu_item(ui, language);
+                    assert!(
+                        response.enabled(),
+                        "support does not depend on an open repository"
+                    );
+                    response.rect
+                })
+                .inner;
+            (rect, ctx.end_pass().platform_output.commands)
+        }
+
+        assert_eq!(KOFI_SUPPORT_URL, "https://ko-fi.com/adoin");
+        assert!(include_str!("../README.md").contains(KOFI_SUPPORT_URL));
+        assert_eq!(
+            include_str!("../.github/FUNDING.yml").trim(),
+            "ko_fi: adoin"
+        );
+        for language in [Language::Chinese, Language::English] {
+            let ctx = egui::Context::default();
+            let (rect, commands) = render(&ctx, language, vec![]);
+            assert!(commands.is_empty(), "rendering must not open the browser");
+            let pos = rect.center();
+            let (_, commands) = render(
+                &ctx,
+                language,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(
+                commands,
+                vec![egui::OutputCommand::OpenUrl(egui::OpenUrl::new_tab(
+                    KOFI_SUPPORT_URL
+                ))]
+            );
+            let (_, commands) = render(&ctx, language, vec![]);
+            assert!(
+                commands.is_empty(),
+                "later frames must not reopen the browser"
+            );
+        }
     }
 
     #[test]

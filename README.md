@@ -115,8 +115,10 @@ AI is an optional aid to reviewing conflicts, not an unattended merge service.
 4. Review the explanations and proposed changes, apply the ones you accept, and inspect
    the resulting code before saving. Run your project's tests before completing the merge.
 
-**Upcoming feature:** batch application of AI suggestions is being prepared for a future
-release. It is not yet included in the published `v1.3.14` installers or the default branch.
+**New in v1.4.0:** use **Apply all suggestions** next to the AI analysis button to apply all
+actionable suggestions in one undoable step. Manual-only advice remains for review, and
+stale or conflicting edits reject the entire batch. Applying suggestions does not save the
+file automatically; inspect the result before saving.
 
 ### Privacy and credentials
 

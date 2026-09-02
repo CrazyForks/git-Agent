@@ -1117,7 +1117,7 @@ impl MergeDocument {
         Ok(())
     }
 
-    fn apply_ai_middle_edit(&mut self, edit: &MergeAiMiddleEdit) -> Result<(), String> {
+    fn ai_middle_edit_location(&self, edit: &MergeAiMiddleEdit) -> Result<(usize, usize), String> {
         if edit.expected_text.contains('\r') || edit.expected_text.contains('\n') {
             return Err("AI middle edit expected_text must fit within one logical line".to_owned());
         }
@@ -1148,13 +1148,41 @@ impl MergeDocument {
                 matches.len()
             ));
         };
-        let line = &mut self.lines[*line_index];
-        let end = *offset + expected.len();
-        line.result.replace_range(
-            *offset..end,
-            &normalize_merge_ai_code(&edit.replacement_text),
-        );
-        line.include_in_result = !line.result.is_empty();
+        Ok((*line_index, *offset))
+    }
+
+    fn apply_ai_middle_edits<'a>(
+        &mut self,
+        edits: impl IntoIterator<Item = &'a MergeAiMiddleEdit>,
+    ) -> Result<(), String> {
+        // Resolve every anchor against the same original Middle result. Shared edits are
+        // applied once; disjoint edits on one line must not shift each other's offsets.
+        let mut seen = HashSet::new();
+        let mut replacements = Vec::new();
+        for edit in edits {
+            let replacement = normalize_merge_ai_code(&edit.replacement_text);
+            if !seen.insert((edit.expected_text.as_str(), replacement.clone())) {
+                continue;
+            }
+            let (line_index, offset) = self.ai_middle_edit_location(edit)?;
+            replacements.push((
+                line_index,
+                offset,
+                offset + edit.expected_text.len(),
+                replacement,
+            ));
+        }
+        replacements.sort_by_key(|(line, start, _, _)| (*line, *start));
+        for pair in replacements.windows(2) {
+            if pair[0].0 == pair[1].0 && pair[0].2 > pair[1].1 {
+                return Err("AI suggestions contain overlapping Middle edits".to_owned());
+            }
+        }
+        for (line_index, start, end, replacement) in replacements.into_iter().rev() {
+            let line = &mut self.lines[line_index];
+            line.result.replace_range(start..end, &replacement);
+            line.include_in_result = !line.result.is_empty();
+        }
         Ok(())
     }
 
@@ -1870,77 +1898,151 @@ impl MergeToolApp {
     }
 
     fn apply_ai_suggestion(&mut self, target: MergeLineActionTarget) {
-        if self.manual_result_override {
+        self.apply_ai_suggestions(&[target]);
+    }
+
+    fn ai_suggestion_actions_enabled(&self) -> bool {
+        self.load_task.is_none()
+            && self.write_task.is_none()
+            && self.ai_task.is_none()
+            && !self.manual_result_override
+    }
+
+    fn actionable_ai_suggestion_count(&self) -> usize {
+        self.ai_suggestions
+            .values()
+            .filter(|suggestion| suggestion.is_actionable())
+            .count()
+    }
+
+    fn apply_all_ai_suggestions(&mut self) {
+        let mut targets = self
+            .ai_suggestions
+            .values()
+            .filter(|suggestion| suggestion.is_actionable())
+            .map(|suggestion| suggestion.target)
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|target| match target {
+            MergeLineActionTarget::Conflict(index) => (0, *index),
+            MergeLineActionTarget::BaseOnlyGroup(index) => (1, *index),
+        });
+        self.apply_ai_suggestions(&targets);
+    }
+
+    fn apply_ai_suggestions(&mut self, targets: &[MergeLineActionTarget]) {
+        if !self.ai_suggestion_actions_enabled() || targets.is_empty() {
             return;
         }
-        let Some(suggestion) = self.ai_suggestions.get(&target).cloned() else {
+        let Some(suggestions) = targets
+            .iter()
+            .map(|target| self.ai_suggestions.get(target).cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
             return;
         };
         let mut updated_document = self.document.clone();
         let apply_result = (|| -> Result<(), String> {
-            match suggestion.choice {
-                MergeAiChoice::Local | MergeAiChoice::Remote => {
-                    let chosen_side = if suggestion.choice == MergeAiChoice::Local {
-                        MergeSide::Local
-                    } else {
-                        MergeSide::Remote
-                    };
-                    match target {
-                        MergeLineActionTarget::Conflict(conflict_index) => {
-                            updated_document.apply_conflict(conflict_index, chosen_side)
-                        }
-                        MergeLineActionTarget::BaseOnlyGroup(line_index) => {
-                            let group = base_only_display_groups(&updated_document)
-                                .into_iter()
-                                .find(|group| group.line_index == line_index)
-                                .ok_or_else(|| {
-                                    format!("deletion target {line_index} is no longer available")
-                                })?;
-                            if chosen_side == group.missing_side {
-                                updated_document
-                                    .take_base_only_group(line_index, group.missing_side);
-                            } else {
-                                updated_document
-                                    .drop_base_only_group(line_index, group.missing_side);
+            updated_document.apply_ai_middle_edits(
+                suggestions
+                    .iter()
+                    .flat_map(|suggestion| &suggestion.middle_edits),
+            )?;
+            for suggestion in &suggestions {
+                let target = suggestion.target;
+                if let MergeLineActionTarget::Conflict(index) = target {
+                    if updated_document.conflicts.get(index).is_none()
+                        || (!updated_document.conflict_side_unresolved(index, MergeSide::Local)
+                            && !updated_document.conflict_side_unresolved(index, MergeSide::Remote))
+                    {
+                        return Err(format!("conflict target {index} is no longer available"));
+                    }
+                }
+                match suggestion.choice {
+                    MergeAiChoice::Local | MergeAiChoice::Remote => {
+                        let chosen_side = if suggestion.choice == MergeAiChoice::Local {
+                            MergeSide::Local
+                        } else {
+                            MergeSide::Remote
+                        };
+                        match target {
+                            MergeLineActionTarget::Conflict(conflict_index) => {
+                                updated_document.apply_conflict(conflict_index, chosen_side)
+                            }
+                            MergeLineActionTarget::BaseOnlyGroup(line_index) => {
+                                let group = base_only_display_groups(&updated_document)
+                                    .into_iter()
+                                    .find(|group| group.line_index == line_index)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "deletion target {line_index} is no longer available"
+                                        )
+                                    })?;
+                                if chosen_side == group.missing_side {
+                                    updated_document
+                                        .take_base_only_group(line_index, group.missing_side);
+                                } else {
+                                    updated_document
+                                        .drop_base_only_group(line_index, group.missing_side);
+                                }
                             }
                         }
                     }
+                    MergeAiChoice::Manual => {
+                        let replacement = suggestion.manual_result.as_deref().ok_or_else(|| {
+                            "manual AI suggestion does not contain an applicable result".to_owned()
+                        })?;
+                        updated_document.apply_ai_manual_target(target, replacement)?;
+                    }
                 }
-                MergeAiChoice::Manual => {
-                    let replacement = suggestion.manual_result.as_deref().ok_or_else(|| {
-                        "manual AI suggestion does not contain an applicable result".to_owned()
-                    })?;
-                    updated_document.apply_ai_manual_target(target, replacement)?;
-                }
-            }
-            for edit in &suggestion.middle_edits {
-                updated_document.apply_ai_middle_edit(edit)?;
             }
             Ok(())
         })();
         if let Err(error) = apply_result {
             crate::diagnostics::merge_ai_trace(
                 "ui.apply_rejected",
-                &format!("target={target:?} error={error}"),
+                &format!("targets={targets:?} error={error}"),
             );
             self.ai_analysis_error = Some(error);
             return;
         }
         let before = self.snapshot();
         self.document = updated_document;
-        self.ai_suggestions.remove(&target);
+        let applied_targets = targets.iter().copied().collect::<HashSet<_>>();
+        self.ai_suggestions
+            .retain(|target, _| !applied_targets.contains(target));
+        let applied_middle_edits = suggestions
+            .iter()
+            .flat_map(|suggestion| &suggestion.middle_edits)
+            .map(|edit| {
+                (
+                    edit.expected_text.clone(),
+                    normalize_merge_ai_code(&edit.replacement_text),
+                )
+            })
+            .collect::<HashSet<_>>();
+        // Applying one card and then "all" must not repeat a shared companion edit.
+        for suggestion in self.ai_suggestions.values_mut() {
+            suggestion.middle_edits.retain(|edit| {
+                !applied_middle_edits.contains(&(
+                    edit.expected_text.clone(),
+                    normalize_merge_ai_code(&edit.replacement_text),
+                ))
+            });
+        }
         self.ai_overlay_offsets
-            .retain(|(current, _), _| *current != target);
+            .retain(|(current, _), _| !applied_targets.contains(current));
+        self.ai_logged_missing_anchors
+            .retain(|(current, _)| !applied_targets.contains(current));
+        self.ai_analysis_error = None;
         self.result_text = self.document.result_text();
-        self.reset_manual_result_lines();
+        self.manual_result_lines = merge_result_display_rows(&self.document)
+            .into_iter()
+            .map(|row| row.text.to_owned())
+            .collect();
         self.finish_document_edit(before);
         crate::diagnostics::merge_ai_trace(
             "ui.applied",
-            &format!(
-                "target={target:?} choice={:?} middle_edits={}",
-                suggestion.choice,
-                suggestion.middle_edits.len()
-            ),
+            &format!("targets={targets:?} suggestions={}", suggestions.len()),
         );
     }
 
@@ -5283,6 +5385,22 @@ fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
                                 .small()
                                 .color(palette.accent),
                         );
+                    } else if !app.ai_suggestions.is_empty() {
+                        let count = app.actionable_ai_suggestion_count();
+                        if ui
+                            .add_enabled(
+                                app.ai_suggestion_actions_enabled() && count > 0,
+                                egui::Button::new(format!(
+                                    "{} ({count})",
+                                    mt(app.language, "ai_apply_all")
+                                )),
+                            )
+                            .on_hover_text(mt(app.language, "ai_apply_all_hint"))
+                            .clicked()
+                        {
+                            app.apply_all_ai_suggestions();
+                            ui.ctx().request_repaint();
+                        }
                     } else if let Some(notice) = app.ai_notice {
                         let text = match notice {
                             MergeAiNotice::Completed {
@@ -6023,7 +6141,7 @@ fn merge_ai_suggestion_overlays(
     remote_geometry: &MergePanelGeometry,
     palette: MergePalette,
 ) -> Option<MergeAiOverlayAction> {
-    if app.ai_task.is_some() || app.manual_result_override {
+    if !app.ai_suggestion_actions_enabled() {
         return None;
     }
     // Copy only small stable keys. Cloning complete AI suggestions here used to duplicate long
@@ -10388,6 +10506,10 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (MergeLanguage::Chinese, "ai_choose_remote") => "建议采用右边",
         (MergeLanguage::Chinese, "ai_manual") => "建议在中间手动处理",
         (MergeLanguage::Chinese, "ai_apply_suggestion") => "确定采用建议",
+        (MergeLanguage::Chinese, "ai_apply_all") => "应用所有建议",
+        (MergeLanguage::Chinese, "ai_apply_all_hint") => {
+            "一次应用所有可执行建议；需人工处理的建议保留。可一次撤销，不自动保存文件；若建议失效或修改冲突，整批不应用。"
+        }
         (MergeLanguage::Chinese, "ai_apply_hint") => "仅将建议应用到合并结果；不会自动保存文件",
         (MergeLanguage::Chinese, "ai_ignore") => "忽略此建议",
         (MergeLanguage::Chinese, "ai_sources_unavailable") => "AI 分析需要三个版本的已加载内容",
@@ -10455,6 +10577,10 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (_, "ai_choose_remote") => "Recommend Right",
         (_, "ai_manual") => "Edit in Middle manually",
         (_, "ai_apply_suggestion") => "Apply suggestion",
+        (_, "ai_apply_all") => "Apply all suggestions",
+        (_, "ai_apply_all_hint") => {
+            "Apply all actionable suggestions in one undoable step; manual-only advice remains. Does not save the file. Stale or conflicting edits reject the entire batch."
+        }
         (_, "ai_apply_hint") => {
             "Updates the merge result only; it does not save the file automatically."
         }
@@ -11954,6 +12080,257 @@ export function quote(total: number): number {
         assert!(app.document.conflict_side_resolved(0, MergeSide::Local));
         assert!(app.document.conflict_side_resolved(0, MergeSide::Remote));
         assert!(!app.ai_suggestions.contains_key(&target));
+    }
+
+    fn test_ai_suggestion(
+        target: MergeLineActionTarget,
+        choice: MergeAiChoice,
+    ) -> MergeAiSuggestion {
+        MergeAiSuggestion {
+            target,
+            choice,
+            reason_zh: "测试建议".to_owned(),
+            reason_en: "Test suggestion".to_owned(),
+            manual_result: None,
+            middle_edits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn apply_all_ai_suggestions_is_one_edit_including_deletions_and_shared_middle_edits() {
+        let mut app = MergeToolApp::new(test_merge_args(), navigation_matrix_document());
+        let shared_edit = MergeAiMiddleEdit {
+            expected_text: "stable-a".to_owned(),
+            replacement_text: "stable-a-updated".to_owned(),
+        };
+        for (index, choice) in [
+            MergeAiChoice::Local,
+            MergeAiChoice::Remote,
+            MergeAiChoice::Manual,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = MergeLineActionTarget::Conflict(index);
+            let mut suggestion = test_ai_suggestion(target, choice);
+            if index == 2 {
+                suggestion.manual_result = Some("conflict-c = combined".to_owned());
+            }
+            suggestion.middle_edits.push(shared_edit.clone());
+            app.ai_suggestions.insert(target, suggestion);
+        }
+        for group in base_only_display_groups(&app.document) {
+            let target = MergeLineActionTarget::BaseOnlyGroup(group.line_index);
+            let choice = match group.missing_side {
+                MergeSide::Local => MergeAiChoice::Local,
+                MergeSide::Remote => MergeAiChoice::Remote,
+            };
+            app.ai_suggestions
+                .insert(target, test_ai_suggestion(target, choice));
+        }
+        let before = app.snapshot();
+        let epoch = app.display_epoch;
+        let highlight_revision = app.result_highlight_revision;
+        app.ai_analysis_error = Some("old error".to_owned());
+
+        app.apply_all_ai_suggestions();
+
+        assert!(app.ai_suggestions.is_empty());
+        assert!(app.ai_analysis_error.is_none());
+        assert_eq!(app.unresolved_conflict_count(), 0);
+        for text in [
+            "conflict-a = local",
+            "conflict-b = remote",
+            "conflict-c = combined",
+            "stable-a-updated",
+        ] {
+            assert!(app.result_text.contains(text), "{text}");
+        }
+        assert!(!app.result_text.contains("stable-a-updated-updated"));
+        assert!(!app.result_text.contains("delete-from-"));
+        assert_eq!(app.undo_stack.len(), 1);
+        assert_eq!(app.display_epoch, epoch + 1);
+        assert_eq!(app.result_highlight_revision, highlight_revision + 1);
+        assert!(app.write_task.is_none());
+        let after = app.snapshot();
+        assert!(app.undo());
+        assert_eq!(app.snapshot(), before);
+        assert!(app.redo());
+        assert_eq!(app.snapshot(), after);
+    }
+
+    #[test]
+    fn apply_all_ai_suggestions_keeps_manual_only_advice_and_empty_batches_are_noops() {
+        let mut app = MergeToolApp::new(test_merge_args(), navigation_matrix_document());
+        let manual = MergeLineActionTarget::Conflict(1);
+        app.ai_suggestions
+            .insert(manual, test_ai_suggestion(manual, MergeAiChoice::Manual));
+        assert_eq!(app.actionable_ai_suggestion_count(), 0);
+        let before = app.snapshot();
+        app.apply_all_ai_suggestions();
+        assert_eq!(app.snapshot(), before);
+        assert!(app.undo_stack.is_empty());
+
+        let local = MergeLineActionTarget::Conflict(0);
+        app.ai_suggestions
+            .insert(local, test_ai_suggestion(local, MergeAiChoice::Local));
+        assert_eq!(app.actionable_ai_suggestion_count(), 1);
+        app.apply_all_ai_suggestions();
+        assert_eq!(app.ai_suggestions.len(), 1);
+        assert!(app.ai_suggestions.contains_key(&manual));
+        assert_eq!(app.unresolved_conflict_count(), 2);
+    }
+
+    #[test]
+    fn apply_all_ai_suggestions_rejects_stale_or_overlapping_edits_without_partial_changes() {
+        for failure in [
+            "missing_middle",
+            "overlapping_middle",
+            "missing_target",
+            "resolved_target",
+        ] {
+            let mut app = MergeToolApp::new(test_merge_args(), navigation_matrix_document());
+            for index in 0..2 {
+                let target = MergeLineActionTarget::Conflict(index);
+                let mut suggestion = test_ai_suggestion(target, MergeAiChoice::Local);
+                suggestion.middle_edits.push(MergeAiMiddleEdit {
+                    expected_text: if index == 0 { "stable-a" } else { "stable-b" }.to_owned(),
+                    replacement_text: "updated".to_owned(),
+                });
+                app.ai_suggestions.insert(target, suggestion);
+            }
+            match failure {
+                "missing_middle" => {
+                    app.ai_suggestions
+                        .get_mut(&MergeLineActionTarget::Conflict(1))
+                        .unwrap()
+                        .middle_edits[0]
+                        .expected_text = "missing anchor".to_owned();
+                }
+                "overlapping_middle" => {
+                    app.ai_suggestions
+                        .get_mut(&MergeLineActionTarget::Conflict(1))
+                        .unwrap()
+                        .middle_edits[0]
+                        .expected_text = "stable-a".to_owned();
+                    app.ai_suggestions
+                        .get_mut(&MergeLineActionTarget::Conflict(1))
+                        .unwrap()
+                        .middle_edits[0]
+                        .replacement_text = "different replacement".to_owned();
+                }
+                "missing_target" => {
+                    let target = MergeLineActionTarget::Conflict(99);
+                    app.ai_suggestions
+                        .insert(target, test_ai_suggestion(target, MergeAiChoice::Remote));
+                }
+                "resolved_target" => app.document.apply_conflict(1, MergeSide::Remote),
+                _ => unreachable!(),
+            }
+            let before = app.snapshot();
+            app.apply_all_ai_suggestions();
+            assert_eq!(app.snapshot(), before, "{failure}");
+            assert!(app.ai_analysis_error.is_some(), "{failure}");
+            assert!(app.undo_stack.is_empty(), "{failure}");
+        }
+    }
+
+    #[test]
+    fn ai_middle_batch_edits_use_original_offsets_on_the_same_line() {
+        let mut document = three_way_merge("alpha beta\n", "alpha beta\n", "alpha beta\n");
+        let edits = [
+            MergeAiMiddleEdit {
+                expected_text: "alpha".to_owned(),
+                replacement_text: "longer-alpha".to_owned(),
+            },
+            MergeAiMiddleEdit {
+                expected_text: "beta".to_owned(),
+                replacement_text: "B".to_owned(),
+            },
+        ];
+        document.apply_ai_middle_edits(&edits).unwrap();
+        assert_eq!(document.result_text(), "longer-alpha B\n");
+    }
+
+    #[test]
+    fn apply_one_then_all_ai_suggestions_does_not_repeat_shared_middle_edits() {
+        let mut app = MergeToolApp::new(test_merge_args(), navigation_matrix_document());
+        for index in 0..2 {
+            let target = MergeLineActionTarget::Conflict(index);
+            let mut suggestion = test_ai_suggestion(target, MergeAiChoice::Local);
+            suggestion.middle_edits.push(MergeAiMiddleEdit {
+                expected_text: "stable-a".to_owned(),
+                replacement_text: "stable-a-updated".to_owned(),
+            });
+            app.ai_suggestions.insert(target, suggestion);
+        }
+        let before = app.snapshot();
+        app.apply_ai_suggestion(MergeLineActionTarget::Conflict(0));
+        assert!(
+            app.ai_suggestions[&MergeLineActionTarget::Conflict(1)]
+                .middle_edits
+                .is_empty()
+        );
+        app.apply_all_ai_suggestions();
+        assert!(app.result_text.contains("stable-a-updated"));
+        assert!(!app.result_text.contains("stable-a-updated-updated"));
+        assert!(app.ai_suggestions.is_empty());
+        assert!(app.undo());
+        assert!(app.undo());
+        assert_eq!(app.snapshot(), before);
+    }
+
+    #[test]
+    fn single_and_bulk_ai_applications_share_the_busy_and_manual_edit_gate() {
+        for blocked_by in ["analysis", "loading", "writing", "manual"] {
+            let mut app = MergeToolApp::new(test_merge_args(), navigation_matrix_document());
+            let target = MergeLineActionTarget::Conflict(0);
+            app.ai_suggestions
+                .insert(target, test_ai_suggestion(target, MergeAiChoice::Local));
+            match blocked_by {
+                "analysis" => app.ai_task = Some(mpsc::channel().1),
+                "loading" => app.load_task = Some(mpsc::channel().1),
+                "writing" => app.write_task = Some(mpsc::channel().1),
+                "manual" => app.manual_result_override = true,
+                _ => unreachable!(),
+            }
+            let before = app.snapshot();
+            assert!(!app.ai_suggestion_actions_enabled());
+            app.apply_all_ai_suggestions();
+            app.apply_ai_suggestion(target);
+            assert_eq!(app.snapshot(), before, "{blocked_by}");
+            assert!(app.undo_stack.is_empty());
+        }
+    }
+
+    #[test]
+    fn ai_apply_all_entry_is_next_to_analysis_and_localized() {
+        let source = include_str!("merge_tool.rs");
+        let toolbar = source
+            .split("fn merge_toolbar(")
+            .nth(1)
+            .unwrap()
+            .split("fn merge_toolbar_ai_button(")
+            .next()
+            .unwrap();
+        for required in [
+            "ai_apply_all",
+            "ai_apply_all_hint",
+            "actionable_ai_suggestion_count()",
+            "app.ai_suggestion_actions_enabled() && count > 0",
+            "app.apply_all_ai_suggestions()",
+        ] {
+            assert!(toolbar.contains(required), "{required}");
+        }
+        assert!(
+            toolbar.find("merge_toolbar_ai_button(").unwrap()
+                < toolbar.find("ai_apply_all").unwrap()
+        );
+        assert_eq!(mt(MergeLanguage::Chinese, "ai_apply_all"), "应用所有建议");
+        assert_eq!(
+            mt(MergeLanguage::English, "ai_apply_all"),
+            "Apply all suggestions"
+        );
     }
 
     #[test]
