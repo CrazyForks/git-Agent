@@ -1,5 +1,7 @@
 # Git Agent
 
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 A native desktop Git client for **Windows, macOS, and Linux**, built with Rust and egui.
 Manage repositories, review changes, explore history, and resolve conflicts in one place,
 with optional AI assistance for three-way merges.
@@ -229,6 +231,23 @@ welcome.
 
 ## License
 
-This repository does not currently include a `LICENSE` file. No open-source license is
-declared here; contact the maintainer to clarify licensing before reusing or redistributing
-the code.
+Git Agent is **source-available**, licensed under the **Apache License 2.0, subject to
+Commons Clause License Condition v1.0**. Both parts apply together; this is neither
+unmodified Apache 2.0 nor a choice of licenses, and it is not an OSI-approved open-source license.
+Read the complete [LICENSE](LICENSE) and the attribution [NOTICE](NOTICE).
+
+- Personal use and internal business use are permitted, including using Git Agent to
+  develop commercial projects, subject to the license conditions.
+- The license does not grant the right to "Sell" the software as defined by Commons Clause:
+  providing a third party, for a fee or other consideration, a product or service whose
+  value derives entirely or substantially from Git Agent's functionality. This is not
+  a blanket prohibition on every commercial activity or on genuinely independent products.
+- Redistribution must comply with the license and notice requirements. Modified files
+  must carry prominent change notices; applicable original copyright and attribution
+  notices must be retained. [NOTICE](NOTICE) identifies adoin and the original repository.
+- There is no additional project-specific ban on voluntary donations or sponsorship links.
+  Whether a particular payment falls within "Sell" depends on the actual arrangement.
+- Separately licensed third-party components keep their own licenses.
+
+This summary does not replace or add to the [LICENSE](LICENSE). See the
+[Commons Clause explanation](https://commonsclause.com/) for background.

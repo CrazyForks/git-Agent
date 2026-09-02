@@ -38,6 +38,8 @@ Source: "{#SourceDir}\git-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\git-agent-merge.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\git-agent-diff.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\theme.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Git Agent"; Filename: "{app}\git-agent.exe"; WorkingDir: "{app}"; IconFilename: "{app}\git-agent.exe"

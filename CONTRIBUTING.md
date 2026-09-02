@@ -5,6 +5,15 @@ macOS, and Linux; PowerShell is not a requirement for macOS or Linux development
 
 [Back to the README](README.md)
 
+## Licensing contributions
+
+Git Agent uses Apache License 2.0 **subject to Commons Clause License Condition v1.0**;
+the complete combined terms are in [LICENSE](LICENSE). It is source-available, not
+unmodified Apache-2.0 open-source software. Unless explicitly stated otherwise and agreed
+with the maintainer, intentional contributions are submitted under those same combined
+terms. Do not contribute code that you lack permission to submit under these terms.
+Preserve separately licensed third-party notices and identify third-party material clearly.
+
 ## Development prerequisites
 
 On every platform, install:

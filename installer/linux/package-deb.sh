@@ -19,7 +19,11 @@ mkdir -p \
   "$install_root" \
   "$package_root/usr/bin" \
   "$package_root/usr/share/applications" \
+  "$package_root/usr/share/doc/git-agent" \
   "$package_root/usr/share/icons/hicolor/64x64/apps"
+
+install -m 644 LICENSE "$package_root/usr/share/doc/git-agent/copyright"
+install -m 644 NOTICE "$package_root/usr/share/doc/git-agent/NOTICE"
 
 for executable in git-agent git-agent-merge git-agent-diff; do
   install -m 755 "$binary_dir/$executable" "$install_root/$executable"

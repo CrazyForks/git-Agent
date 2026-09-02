@@ -21,6 +21,9 @@ dmg_path="$output_dir/GitAgent-$version-macOS.dmg"
 rm -rf "$app_dir" "$iconset_dir" "$dmg_root" "$dmg_path"
 mkdir -p "$macos_dir" "$resources_dir" "$iconset_dir" "$dmg_root"
 
+install -m 644 LICENSE "$resources_dir/LICENSE"
+install -m 644 NOTICE "$resources_dir/NOTICE"
+
 for executable in git-agent git-agent-merge git-agent-diff; do
   install -m 755 "$binary_dir/$executable" "$macos_dir/$executable"
 done
