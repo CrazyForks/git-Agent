@@ -6,7 +6,7 @@
 更早版本请查看 [GitHub Releases](https://github.com/adoin/git-Agent/releases)。
 “未发布”条目属于开发中的改动，不代表最新下载包已包含这些功能。
 
-## 未发布
+## 1.4.2 — 2026-09-04
 
 ### 改进
 
