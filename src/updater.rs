@@ -57,6 +57,7 @@ struct GithubAsset {
 
 pub fn check_latest_release(current_version: &str) -> Result<UpdateRelease> {
     let response = ureq::get(LATEST_RELEASE_API)
+        .timeout(std::time::Duration::from_secs(20))
         .set("Accept", "application/vnd.github+json")
         .set("X-GitHub-Api-Version", "2022-11-28")
         .set("User-Agent", USER_AGENT)

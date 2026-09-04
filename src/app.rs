@@ -897,6 +897,9 @@ pub struct GitAgentApp {
     ssh_tool_action: Option<SshToolAction>,
     update_task: Option<Receiver<UpdateTaskResult>>,
     update_task_action: Option<UpdateTaskAction>,
+    update_check_silent: bool,
+    auto_check_updates: bool,
+    auto_update_check_pending: bool,
     ssh_agent_status_open: bool,
     ssh_load_key_prompt_open: bool,
     ssh_agent_status: Option<SshAgentStatus>,
@@ -2901,6 +2904,7 @@ struct LayoutPrefs {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct AppSettings {
+    auto_check_updates: bool,
     theme: SettingsThemeMode,
     theme_accent: SettingsThemeAccent,
     background_pattern_enabled: bool,
@@ -3164,6 +3168,7 @@ impl Default for SettingsLanguage {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            auto_check_updates: true,
             theme: SettingsThemeMode::Light,
             theme_accent: SettingsThemeAccent::Blue,
             background_pattern_enabled: false,
@@ -4642,6 +4647,9 @@ impl GitAgentApp {
             ssh_tool_action: None,
             update_task: None,
             update_task_action: None,
+            update_check_silent: false,
+            auto_check_updates: app_settings.auto_check_updates,
+            auto_update_check_pending: app_settings.auto_check_updates,
             ssh_agent_status_open: false,
             ssh_load_key_prompt_open: false,
             ssh_agent_status: None,
@@ -6576,11 +6584,33 @@ impl GitAgentApp {
     }
 
     fn start_update_check(&mut self) {
+        self.about_open = false;
+        self.update_dialog_open = true;
+        self.auto_update_check_pending = false;
+        if self.update_task.is_some() {
+            self.update_check_silent = false;
+            return;
+        }
+        self.start_update_check_task(false);
+    }
+
+    fn maybe_start_automatic_update_check(&mut self, ctx: &egui::Context) {
+        // Once per launch (or when enabled), never on the pointer-down drag path.
+        if !take_automatic_update_check(
+            self.auto_check_updates, &mut self.auto_update_check_pending,
+            self.update_task.is_some(), ctx.input(|input| input.pointer.primary_down()),
+        ) {
+            return;
+        }
+        self.start_update_check_task(true);
+        ctx.request_repaint();
+    }
+
+    fn start_update_check_task(&mut self, silent: bool) {
         if self.update_task.is_some() {
             return;
         }
-        self.about_open = false;
-        self.update_dialog_open = true;
+        self.update_check_silent = silent;
         self.update_release = None;
         self.update_error = None;
         self.update_installed = false;
@@ -6598,6 +6628,7 @@ impl GitAgentApp {
         if self.update_task.is_some() {
             return;
         }
+        self.update_check_silent = false;
         let Some(asset) = self
             .update_release
             .as_ref()
@@ -9061,7 +9092,9 @@ impl GitAgentApp {
             match receiver.try_recv() {
                 Ok((_, Ok(UpdateTaskOutput::Checked(release)))) => {
                     self.update_task_action = None;
-                    self.update_release = Some(release);
+                    if !self.update_check_silent || self.auto_check_updates {
+                        self.update_release = Some(release);
+                    }
                     self.update_error = None;
                     ctx.request_repaint();
                 }
@@ -9080,7 +9113,9 @@ impl GitAgentApp {
                 }
                 Ok((_, Err(error))) => {
                     self.update_task_action = None;
-                    self.update_error = Some(error.to_string());
+                    if !self.update_check_silent {
+                        self.update_error = Some(error.to_string());
+                    }
                     ctx.request_repaint();
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -9089,7 +9124,9 @@ impl GitAgentApp {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.update_task_action = None;
-                    self.update_error = Some(self.tr("update.stopped").to_owned());
+                    if !self.update_check_silent {
+                        self.update_error = Some(self.tr("update.stopped").to_owned());
+                    }
                     ctx.request_repaint();
                 }
             }
@@ -10109,6 +10146,7 @@ impl GitAgentApp {
             return;
         }
         let result = AppSettings {
+            auto_check_updates: self.auto_check_updates,
             theme: self.theme_mode.into(),
             theme_accent: self.theme_accent.into(),
             background_pattern_enabled: self.background_pattern_enabled,
@@ -10874,6 +10912,7 @@ impl App for GitAgentApp {
         theme::apply_if_needed(ctx, self.theme_mode, self.theme_accent);
         self.poll_font_tasks(ctx);
         self.poll_tasks(ctx);
+        self.maybe_start_automatic_update_check(ctx);
         self.clear_focus_before_repository_snapshot_ui(ctx);
         if self.exit_after_update_launch {
             self.exit_after_update_launch = false;
@@ -11955,6 +11994,18 @@ impl GitAgentApp {
                     include_rect(&mut window_control_rects, minimize.rect);
                     if minimize.clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    let available_release = self.update_release.as_ref().filter(|release| release.is_newer);
+                    if available_release.is_some() {
+                        let update = update_available_button(
+                            ui, self.language, self.update_task.is_none(),
+                        );
+                        include_rect(&mut window_control_rects, update.rect);
+                        if update.clicked() {
+                            self.about_open = false;
+                            self.update_check_silent = false;
+                            self.update_dialog_open = true;
+                        }
                     }
                 });
             });
@@ -21384,6 +21435,24 @@ impl GitAgentApp {
     fn global_general_settings(&mut self, ui: &mut Ui) {
         let language = self.language;
         settings_group_panel(ui, i18n::t(language, "settings.appearance"), |ui| {
+            settings_field(ui, i18n::t(language, "settings.language"), |ui| {
+                if settings_choice_button(
+                    ui,
+                    self.language == Language::Chinese,
+                    "\u{4e2d}\u{6587}",
+                    72.0,
+                )
+                .clicked()
+                {
+                    self.set_language(Language::Chinese);
+                }
+                if settings_choice_button(ui, self.language == Language::English, "English", 72.0)
+                    .clicked()
+                {
+                    self.set_language(Language::English);
+                }
+            });
+            ui.add_space(8.0);
             settings_field(ui, i18n::t(language, "settings.theme"), |ui| {
                 if settings_choice_button(
                     ui,
@@ -21437,27 +21506,21 @@ impl GitAgentApp {
             }
             ui.add_space(8.0);
             self.global_font_settings(ui);
-            ui.add_space(8.0);
-            settings_field(ui, i18n::t(language, "settings.language"), |ui| {
-                if settings_choice_button(
-                    ui,
-                    self.language == Language::Chinese,
-                    "\u{4e2d}\u{6587}",
-                    72.0,
-                )
-                .clicked()
-                {
-                    self.set_language(Language::Chinese);
-                }
-                if settings_choice_button(ui, self.language == Language::English, "English", 72.0)
-                    .clicked()
-                {
-                    self.set_language(Language::English);
-                }
-            });
         });
         ui.add_space(8.0);
         self.global_refresh_settings(ui);
+        ui.add_space(8.0);
+        settings_group_panel(ui, i18n::t(language, "update.settings_title"), |ui| {
+            let changed = action_checkbox(
+                ui, &mut self.auto_check_updates, i18n::t(language, "update.auto_check"),
+            ).changed();
+            ui.label(RichText::new(i18n::t(language, "update.auto_check_hint")).small().color(theme::muted()));
+            if changed {
+                self.auto_update_check_pending = self.auto_check_updates;
+                self.save_app_settings();
+                ui.ctx().request_repaint();
+            }
+        });
         ui.add_space(12.0);
         self.global_repository_workspaces_settings(ui);
     }
@@ -24218,6 +24281,31 @@ fn commit_ai_generate_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::R
     )
 }
 
+fn take_automatic_update_check(enabled: bool, pending: &mut bool, busy: bool, pointer_down: bool) -> bool {
+    if !enabled || !*pending || busy || pointer_down {
+        return false;
+    }
+    *pending = false;
+    true
+}
+
+fn update_available_button(ui: &mut Ui, language: Language, enabled: bool) -> egui::Response {
+    let response = text_action_button(
+        ui,
+        i18n::t(language, "update.available_button"),
+        Some(UiIcon::Update),
+        enabled,
+        TextActionTone::Primary,
+        Vec2::new(86.0, 24.0),
+    );
+    ui.painter().circle_filled(
+        Pos2::new(response.rect.right() - 4.0, response.rect.top() + 4.0),
+        3.0,
+        theme::warning(),
+    );
+    response
+}
+
 fn text_action_button(
     ui: &mut Ui,
     label: &str,
@@ -24985,6 +25073,7 @@ enum UiIcon {
     TreeView,
     FullPath,
     Refresh,
+    Update,
     Settings,
     Plus,
     Edit,
@@ -26302,6 +26391,7 @@ fn icon_source(icon: UiIcon) -> egui::ImageSource<'static> {
         UiIcon::TreeView => egui::include_image!("../assets/icons/tree-view.svg"),
         UiIcon::FullPath => egui::include_image!("../assets/icons/full-path.svg"),
         UiIcon::Refresh => egui::include_image!("../assets/icons/refresh.svg"),
+        UiIcon::Update => egui::include_image!("../assets/icons/update.svg"),
         UiIcon::Settings => egui::include_image!("../assets/icons/settings.svg"),
         UiIcon::Plus => egui::include_image!("../assets/icons/plus.svg"),
         UiIcon::Edit => egui::include_image!("../assets/icons/edit.svg"),
@@ -39585,6 +39675,7 @@ mod ui_tests {
         let settings = AppSettings {
             theme: SettingsThemeMode::Light,
             theme_accent: SettingsThemeAccent::Purple,
+            auto_check_updates: true,
             background_pattern_enabled: false,
             text_contrast: SettingsTextContrast::Soft,
             ui_font_family: Some("Microsoft YaHei UI".to_owned()),
@@ -51741,6 +51832,116 @@ diff --git a/file.txt b/file.txt
         assert!(modal.contains("!task_busy"));
         assert!(modal.contains("update.download_install"));
         assert!(modal.contains("self.start_update_install();"));
+    }
+
+    #[test]
+    fn automatic_update_setting_defaults_on_and_checks_once_without_interrupting_drag() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(old.auto_check_updates);
+        let disabled = AppSettings { auto_check_updates: false, ..AppSettings::default() };
+        let restored: AppSettings = serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.auto_check_updates);
+        let mut pending = true;
+        assert!(!take_automatic_update_check(false, &mut pending, false, false));
+        assert!(!take_automatic_update_check(true, &mut pending, true, false));
+        assert!(!take_automatic_update_check(true, &mut pending, false, true));
+        assert!(pending);
+        assert!(take_automatic_update_check(true, &mut pending, false, false));
+        assert!(!pending);
+        assert!(!take_automatic_update_check(true, &mut pending, false, false));
+        pending = true; // Enabling the setting requests one new check.
+        assert!(take_automatic_update_check(true, &mut pending, false, false));
+    }
+
+    #[test]
+    fn automatic_update_checks_are_silent_owned_and_never_install() {
+        let source = include_str!("app.rs");
+        let automatic = source.split("fn maybe_start_automatic_update_check(").nth(1).unwrap()
+            .split("fn start_update_check_task(").next().unwrap();
+        assert!(automatic.contains("take_automatic_update_check("));
+        assert!(automatic.contains("self.start_update_check_task(true)"));
+        assert!(!automatic.contains("update_dialog_open"));
+        assert!(!automatic.contains("start_update_install"));
+        let worker = source.split("fn start_update_check_task(").nth(1).unwrap()
+            .split("fn start_update_install(").next().unwrap();
+        assert!(worker.find("self.update_task = Some(receiver)").unwrap() < worker.find("thread::spawn").unwrap());
+        assert!(!worker.contains("update_dialog_open"));
+        assert!(!worker.contains("download_and_install"));
+        let poll = source.split("if let Some(receiver) = self.update_task.take()").nth(1).unwrap()
+            .split("if let Some(receiver) = self.create_patch_task.take()").next().unwrap();
+        assert!(poll.contains("if !self.update_check_silent || self.auto_check_updates"));
+        assert_eq!(poll.matches("if !self.update_check_silent {").count(), 2);
+        assert!(poll.contains("self.update_task = Some(receiver)"));
+        assert!(!poll.contains("update_dialog_open"));
+        assert!(!poll.contains("show_toast"));
+        let title = source.split("fn custom_title_bar(").nth(1).unwrap()
+            .split("fn desktop_menu_bar(").next().unwrap();
+        assert!(title.contains("filter(|release| release.is_newer)"));
+        assert!(title.contains("if available_release.is_some()"));
+        assert!(!source.split("#[cfg(test)]").next().unwrap().contains("preview_update_badge"));
+        assert!(title.contains("include_rect(&mut window_control_rects, update.rect)"));
+        assert!(title.contains("self.update_dialog_open = true"));
+        assert!(!title.contains("start_update_install"));
+        assert!(!title.contains("check_latest_release"));
+        assert!(include_str!("updater.rs").contains(".timeout(std::time::Duration::from_secs(20))"));
+    }
+
+    #[test]
+    fn general_settings_put_language_first() {
+        let source = include_str!("app.rs");
+        let general = source.split("fn global_general_settings(&mut self").nth(1).unwrap()
+            .split("fn global_font_settings(").next().unwrap();
+        let first_field = general.split("settings_field(").nth(1).unwrap();
+        assert!(first_field.starts_with("ui, i18n::t(language, \"settings.language\")"));
+        assert_eq!(general.matches("\"settings.language\"").count(), 1);
+        assert!(general.contains("self.set_language(Language::Chinese)"));
+        assert!(general.contains("self.set_language(Language::English)"));
+    }
+
+    #[test]
+    fn update_badge_fits_title_controls_and_is_excluded_from_drag_in_both_languages() {
+        let source = include_str!("app.rs");
+        let badge = source.split("fn update_available_button(").nth(1).unwrap()
+            .split("fn text_action_button(").next().unwrap();
+        assert!(badge.contains("Some(UiIcon::Update)"));
+        assert!(source.contains("UiIcon::Update => egui::include_image!(\"../assets/icons/update.svg\")"));
+        assert!(!badge.contains("Some(UiIcon::Refresh)"));
+        assert!(!badge.contains("on_hover"));
+        let ctx = egui::Context::default();
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            ctx.set_pixels_per_point(scale);
+            for language in [Language::Chinese, Language::English] {
+                for enabled in [true, false] {
+                    let output = ctx.run(egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 120.0))),
+                        ..Default::default()
+                    }, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let close = window_control_button(ui, "×", true);
+                                let maximize = window_control_button(ui, "□", false);
+                                let minimize = window_control_button(ui, "−", false);
+                                let badge = update_available_button(ui, language, enabled);
+                                assert_eq!(badge.enabled(), enabled);
+                                assert!((badge.rect.height() - 24.0).abs() < 0.5);
+                                assert!(badge.rect.right() <= minimize.rect.left());
+                                assert!(minimize.rect.right() <= maximize.rect.left());
+                                assert!(maximize.rect.right() <= close.rect.left());
+                                assert!((badge.rect.center().y - minimize.rect.center().y).abs() < 0.5);
+                                let controls = badge.rect.union(close.rect);
+                                let hit_map = TitleBarHitMap {
+                                    screen: ctx.screen_rect(), pixels_per_point: scale, language,
+                                    candidate: ctx.screen_rect(), menu_controls: Rect::NOTHING,
+                                    window_controls: controls,
+                                };
+                                assert_eq!(hit_map.hit(ctx.screen_rect(), scale, language, badge.rect.center()), TitleBarDragHit::WindowControls);
+                            });
+                        });
+                    });
+                    assert!(output.platform_output.commands.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

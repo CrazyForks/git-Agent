@@ -5,6 +5,18 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 1.4.4 — 2026-09-04
+
+### Added
+
+- Automatic update checks on startup, enabled by default and configurable in General settings. Checks run silently in the background; failures do not interrupt your work, and nothing is downloaded or installed automatically.
+- A prominent download-arrow button in the title bar appears only when a newer release is found. Click it to view update details; no unsolicited dialog or hover tooltip is shown.
+
+### Changed
+
+- Moved the interface language selector to the first row of General settings.
+- Limited update-check requests to 20 seconds and kept manual checks available through the Help menu.
+
 ## 1.4.3 — 2026-09-04
 
 ### Fixed
