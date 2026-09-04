@@ -71,6 +71,7 @@ changelog.feed(changelog_html)
 assert len(changelog.ids) == len(set(changelog.ids)), "Duplicate changelog IDs"
 assert 'data-language="zh"' in changelog_html and 'data-language="en"' in changelog_html
 assert re.search(r"<h2>\d+\.\d+\.\d+ — .+</h2>", changelog_html), "Missing version entry."
+assert not re.search(r"Unreleased|未发布", changelog_html, re.IGNORECASE), "Use versioned changelog entries, not unreleased placeholders."
 for value in changelog.urls:
     url = urlsplit(value)
     if not url.scheme and url.path and url.path != "./":

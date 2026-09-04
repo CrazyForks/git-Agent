@@ -4,7 +4,6 @@
 
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
-Unreleased entries describe development changes, not features in the latest downloadable package.
 
 ## 1.4.2 — 2026-09-04
 

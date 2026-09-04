@@ -80,7 +80,7 @@ def build():
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Git Agent 中英文更新日志 / Bilingual release changelog. Unreleased changes are clearly marked.">
+  <meta name="description" content="Git Agent 中英文版本更新日志 / Bilingual version changelog.">
   <title>更新日志 / Changelog — Git Agent</title>
   <link rel="canonical" href="https://git-agent.emssion.com/changelog.html">
   <link rel="icon" type="image/x-icon" sizes="256x256" href="favicon.ico?v=connected-1">

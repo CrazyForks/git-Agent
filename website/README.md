@@ -56,8 +56,11 @@ belong to those actual test runs and do not promise identical future model outpu
 Before publishing, run `python website/build_changelog.py` from the repository root.
 Edit `CHANGELOG.md` and `CHANGELOG.zh-CN.md` together; the generated
 `public/changelog.html` is committed with the site so deployments need no Markdown
-renderer. Mark planned releases as unreleased until they are actually published.
-On release day, replace that status with the release date in both sources and rebuild.
+renderer. Use explicit version numbers and dates, not an Unreleased section or placeholder.
+For each release, update both sources, rebuild, deploy the website, and verify the live
+changelog in both languages. A pushed tag alone does not mean installers are published:
+confirm the release workflow succeeded and GitHub Release assets exist before reporting
+the download as available. Report any build failure explicitly.
 The website navigation links to the matching language; without JavaScript the page
 shows both languages in full.
 

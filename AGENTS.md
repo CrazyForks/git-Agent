@@ -1,5 +1,16 @@
 # Project Rules
 
+## Release Completion
+
+When the user asks to release a version, update the package version and bilingual
+changelogs with an explicit version and date. Do not add Unreleased sections or
+unreleased-placeholder descriptions. Push the release tag, verify the release workflow
+and installer assets, and deploy the matching website changelog to the existing server.
+Verify the live Chinese and English pages; a repository push alone does not update them.
+Report build or deployment failures explicitly; never claim installers are available
+before GitHub has published them. Do not move an existing public tag without approval.
+Keep server credentials outside the repository.
+
 ## Long-Running State Transitions
 
 Any action that may take noticeable time, touch the working tree/index, change HEAD, use network,

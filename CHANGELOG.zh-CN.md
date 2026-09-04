@@ -4,7 +4,6 @@
 
 从 1.4.1 版本开始，在此记录面向用户的改动。
 更早版本请查看 [GitHub Releases](https://github.com/adoin/git-Agent/releases)。
-“未发布”条目属于开发中的改动，不代表最新下载包已包含这些功能。
 
 ## 1.4.2 — 2026-09-04
 
