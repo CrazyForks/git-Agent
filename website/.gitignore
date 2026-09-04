@@ -1,0 +1,14 @@
+# Local Python caches and preview/deployment output, not website sources.
+__pycache__/
+*.py[cod]
+.venv/
+*.log
+/git-agent-site-*.tar.gz
+
+# Local credentials must never be published or committed.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.ssh/

@@ -50,6 +50,13 @@ use crate::{
 };
 
 const KOFI_SUPPORT_URL: &str = "https://ko-fi.com/adoin";
+
+struct CommitAiTask {
+    root: PathBuf,
+    original_draft: String,
+    cancelled: std::sync::Arc<AtomicBool>,
+    receiver: Receiver<Result<crate::commit_ai::Suggestion, String>>,
+}
 const TITLE_BAR_HEIGHT: f32 = 32.0;
 const WINDOW_RESIZE_BORDER: f32 = 8.0;
 const TITLE_DRAG_TOP_INSET: f32 = WINDOW_RESIZE_BORDER + 1.0;
@@ -950,6 +957,7 @@ pub struct GitAgentApp {
     pending_lfs_action: Option<LfsActionDialog>,
     pending_git_flow_action: Option<GitFlowActionDialog>,
     commit_message: String,
+    commit_ai_task: Option<CommitAiTask>,
     commit_message_drafts: HashMap<String, String>,
     commit_state: RepoCommitState,
     focus_commit_message: bool,
@@ -1000,6 +1008,7 @@ pub struct GitAgentApp {
     custom_action_error: Option<String>,
     ai_models: Vec<LlmModelSettings>,
     selected_ai_model: Option<String>,
+    ai_commit_language: Language,
     ai_model_dialog: Option<AiModelDialog>,
     pending_ai_model_delete: Option<usize>,
     ai_secret_storage_error: Option<String>,
@@ -2901,6 +2910,8 @@ struct AppSettings {
     ai_models: Vec<LlmModelSettings>,
     #[serde(default)]
     selected_ai_model: Option<String>,
+    #[serde(default)]
+    ai_commit_language: Option<SettingsLanguage>,
     #[serde(default, skip_serializing)]
     ai_openai: AiProviderSettings,
     #[serde(default, skip_serializing)]
@@ -3160,6 +3171,7 @@ impl Default for AppSettings {
             custom_actions: Vec::new(),
             ai_models: Vec::new(),
             selected_ai_model: None,
+            ai_commit_language: None,
             ai_openai: AiProviderSettings::openai_compatible(),
             ai_claude: AiProviderSettings::claude(),
             ssh_client: SshClientKind::default(),
@@ -3172,6 +3184,11 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    fn effective_ai_commit_language(&self) -> Language {
+        // Older settings keep their previous output language on migration.
+        self.ai_commit_language.unwrap_or(self.language).into()
+    }
+
     fn load() -> Self {
         let Some(path) = app_settings_path() else {
             return Self::default();
@@ -4500,6 +4517,7 @@ fn layout_prefs_path() -> Option<PathBuf> {
 impl GitAgentApp {
     pub fn new(cc: &CreationContext<'_>) -> Self {
         let app_settings = AppSettings::load();
+        let ai_commit_language = app_settings.effective_ai_commit_language();
         theme::install(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         theme::set_text_contrast(&cc.egui_ctx, app_settings.text_contrast.into());
@@ -4683,6 +4701,7 @@ impl GitAgentApp {
             pending_lfs_action: None,
             pending_git_flow_action: None,
             commit_message: String::new(),
+            commit_ai_task: None,
             commit_message_drafts: HashMap::new(),
             commit_state: RepoCommitState::default(),
             focus_commit_message: false,
@@ -4737,6 +4756,7 @@ impl GitAgentApp {
             custom_action_error: None,
             ai_models: app_settings.ai_models.clone(),
             selected_ai_model: app_settings.selected_ai_model.clone(),
+            ai_commit_language,
             ai_model_dialog: None,
             pending_ai_model_delete: None,
             ai_secret_storage_error: app_settings.secret_storage_error.clone(),
@@ -6014,6 +6034,7 @@ impl GitAgentApp {
     }
 
     fn stage_toggle_current_repository(&mut self) {
+        if self.active_commit_ai_busy() { return; }
         self.pending_toolbar_single_click = None;
         self.active_view = MainView::Workspace;
         self.focus_commit_message = true;
@@ -6990,8 +7011,13 @@ impl GitAgentApp {
         }
     }
 
+    fn active_commit_ai_busy(&self) -> bool {
+        self.commit_ai_task.as_ref().is_some_and(|task| self.active_repo_root_matches(&task.root))
+    }
+
     fn branch_actions_busy(&self) -> bool {
         self.active_repo_has_pending_load()
+            || self.active_commit_ai_busy()
             || self.active_repo_gitignore_save_busy()
             || self.active_branch_checkout_busy()
             || self.active_remote_git_busy()
@@ -7770,7 +7796,7 @@ impl GitAgentApp {
     }
 
     fn start_github_credential_login(&mut self) {
-        if self.remote_git_busy() || self.loading_repo {
+        if self.remote_git_busy() || self.loading_repo || self.active_commit_ai_busy() {
             return;
         }
 
@@ -7939,7 +7965,7 @@ impl GitAgentApp {
         status_key: &'static str,
         action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
     ) {
-        if self.remote_git_busy() || self.loading_repo {
+        if self.remote_git_busy() || self.loading_repo || self.active_commit_ai_busy() {
             return;
         }
         // Git actions reload the repository when complete. Persist the visible
@@ -8479,6 +8505,7 @@ impl GitAgentApp {
     }
 
     fn poll_tasks(&mut self, ctx: &egui::Context) {
+        self.poll_commit_ai_task(ctx);
         let mut repository_load_activity = false;
         if let Some(receiver) = self.workspace_repository_status_task.take() {
             match receiver.try_recv() {
@@ -10070,6 +10097,7 @@ impl GitAgentApp {
             custom_actions: self.custom_actions.clone(),
             ai_models: self.ai_models.clone(),
             selected_ai_model: self.selected_ai_model.clone(),
+            ai_commit_language: Some(self.ai_commit_language.into()),
             ai_openai: AiProviderSettings::openai_compatible(),
             ai_claude: AiProviderSettings::claude(),
             ssh_client: self.ssh_client,
@@ -13895,6 +13923,7 @@ impl GitAgentApp {
     }
 
     fn workspace_view(&mut self, ui: &mut Ui) {
+        let ai_busy = self.active_commit_ai_busy();
         ui.add_space(WORKSPACE_HEADER_TOP_GAP);
         let Some(snapshot) = &self.snapshot else {
             empty_state(ui, self.loading_repo, self.language);
@@ -13939,7 +13968,7 @@ impl GitAgentApp {
                         ui,
                         Some(UiIcon::Warning),
                         self.tr("worktree.resolve_conflicts"),
-                        true,
+                        !ai_busy,
                     )
                     .clicked()
                     {
@@ -13952,7 +13981,7 @@ impl GitAgentApp {
                     ui,
                     None,
                     self.tr("worktree.stage_all"),
-                    has_unstaged,
+                    has_unstaged && !ai_busy,
                 )
                 .clicked()
                 {
@@ -13962,7 +13991,7 @@ impl GitAgentApp {
                     ui,
                     None,
                     self.tr("worktree.unstage_all"),
-                    has_staged,
+                    has_staged && !ai_busy,
                 )
                 .clicked()
                 {
@@ -14023,6 +14052,7 @@ impl GitAgentApp {
                 self.layout_prefs.save();
             }
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                if ai_busy { ui.disable(); }
                 ui.set_clip_rect(right_rect);
                 safe_set_min_size(ui, right_rect.size());
                 self.worktree_diff_viewer(ui);
@@ -14071,6 +14101,7 @@ impl GitAgentApp {
         worktree_action: &mut Option<WorktreeMenuAction>,
         selected_worktree_after_draw: &mut Option<WorktreeRowClick>,
     ) {
+        let ai_busy = self.active_commit_ai_busy();
         let body_size = ui.available_size();
         let (body_rect, _) = ui.allocate_exact_size(body_size, Sense::hover());
         let layout = workspace_main_layout(
@@ -14096,6 +14127,7 @@ impl GitAgentApp {
                 .unwrap_or_default();
             let collapsed_dirs = &mut self.worktree_collapsed_dirs;
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(layout.staged_rect), |ui| {
+                if ai_busy { ui.disable(); }
                 worktree_table(
                     ui,
                     &staged_title,
@@ -14132,6 +14164,7 @@ impl GitAgentApp {
             ui.allocate_new_ui(
                 egui::UiBuilder::new().max_rect(layout.unstaged_rect),
                 |ui| {
+                    if ai_busy { ui.disable(); }
                     worktree_table(
                         ui,
                         &unstaged_title,
@@ -15310,6 +15343,7 @@ impl GitAgentApp {
     }
 
     fn handle_worktree_action(&mut self, action: WorktreeMenuAction) {
+        if self.active_commit_ai_busy() { return; }
         match action {
             WorktreeMenuAction::OpenFile { path } => {
                 let Some(root) = self.active_repo_root() else {
@@ -15773,6 +15807,80 @@ impl GitAgentApp {
         self.worktree_diff_viewer(ui);
     }
 
+    fn start_commit_ai(&mut self, ctx: &egui::Context) {
+        if self.branch_actions_busy() || self.commit_ai_task.is_some() || self.commit_state.amend {
+            return;
+        }
+        let Some(root) = self.active_repo_root() else { return; };
+        let model_name = self.selected_ai_model.clone();
+        let chinese = self.ai_commit_language == Language::Chinese;
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        self.commit_ai_task = Some(CommitAiTask {
+            root: root.clone(), original_draft: self.commit_message.clone(), receiver,
+            cancelled: cancelled.clone(),
+        });
+        ctx.request_repaint();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = load_merge_ai_model_config(model_name.as_deref())
+                .and_then(|config| crate::commit_ai::generate(&root, &config, chinese, &cancelled));
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_commit_ai_task(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.commit_ai_task.take() else { return; };
+        match task.receiver.try_recv() {
+            Ok(_) if task.cancelled.load(Ordering::Relaxed) => {},
+            Ok(Ok(suggestion)) => {
+                if self.active_repo_root_matches(&task.root) && suggestion.root == task.root {
+                    if !self.commit_state.amend && replace_unchanged_commit_draft(
+                        &mut self.commit_message, &task.original_draft, suggestion.message,
+                    ) {
+                        self.save_commit_message_draft_for_active_repo();
+                        self.focus_commit_message = true;
+                    } else {
+                        self.show_toast(self.tr("commit.ai_draft_changed"));
+                    }
+                }
+            }
+            Ok(Err(error)) => self.error = Some(error),
+            Err(mpsc::TryRecvError::Disconnected) => self.error = Some(self.tr("commit.ai_disconnected").into()),
+            Err(mpsc::TryRecvError::Empty) => {
+                self.commit_ai_task = Some(task);
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+    }
+
+    fn commit_ai_controls(&mut self, ui: &mut Ui, staged_count: usize) {
+        if self.commit_ai_task.as_ref().is_some_and(|task| self.active_repo_root_matches(&task.root)) {
+            ui.spinner();
+            let cancelled = self.commit_ai_task.as_ref().unwrap().cancelled.clone();
+            if cancelled.load(Ordering::Relaxed) {
+                ui.label(self.tr("commit.ai_stopping"));
+            } else {
+                ui.label(self.tr("commit.ai_working"));
+                if ui.small_button(self.tr("commit.ai_cancel")).clicked() {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        let enabled = staged_count > 0 && !self.branch_actions_busy()
+            && self.commit_ai_task.is_none() && !self.commit_state.amend;
+        let hint = commit_ai_hover_text(self.language, self.selected_ai_model.as_deref());
+        let disabled_hint = format!("{hint}\n\n{}", self.tr("commit.ai_hint"));
+        let response = commit_ai_generate_button(ui, self.tr("commit.ai_generate"), enabled)
+            .on_hover_text(hint)
+            .on_disabled_hover_text(disabled_hint);
+        if response.clicked() {
+            self.start_commit_ai(ui.ctx());
+        }
+    }
+
     fn commit_panel(&mut self, ui: &mut Ui, staged_count: usize, panel_height: f32) {
         let (panel_rect, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), panel_height),
@@ -15803,6 +15911,7 @@ impl GitAgentApp {
                             self.commit_options_menu(ui);
                         });
                         self.commit_history_icon_menu(ui);
+                        self.commit_ai_controls(ui, staged_count);
                     });
                 });
                 ui.add_space(8.0);
@@ -21606,6 +21715,23 @@ impl GitAgentApp {
                 self.save_app_settings();
             }
             ui.add_space(8.0);
+            let language_before = self.ai_commit_language;
+            let selected_language_label = i18n::t(language, match self.ai_commit_language {
+                Language::English => "settings.ai_commit_language_english",
+                Language::Chinese => "settings.ai_commit_language_chinese",
+            });
+            settings_field(ui, i18n::t(language, "settings.ai_commit_language"), |ui| {
+                recessed_combo_box(ui, "settings_ai_commit_language", selected_language_label, Some(250.0), |ui| {
+                    ui.selectable_value(&mut self.ai_commit_language, Language::English,
+                        i18n::t(language, "settings.ai_commit_language_english"));
+                    ui.selectable_value(&mut self.ai_commit_language, Language::Chinese,
+                        i18n::t(language, "settings.ai_commit_language_chinese"));
+                });
+            });
+            if self.ai_commit_language != language_before {
+                self.save_app_settings();
+            }
+            ui.add_space(8.0);
             settings_field(ui, i18n::t(language, "settings.ai_model_pool"), |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if self.ai_models.is_empty() {
@@ -23957,9 +24083,33 @@ enum TextActionTone {
 }
 
 fn disabled_primary_action_foreground() -> Color32 {
-    // Keep disabled confirmation buttons legible on every accent hue without making them look
-    // as active as the pure-white enabled state.
-    Color32::from_gray(210)
+    Color32::WHITE.gamma_multiply(0.78)
+}
+
+fn disabled_primary_action_fill() -> Color32 {
+    theme::accent_deep().gamma_multiply(0.55)
+}
+
+fn paint_disabled_primary_action(ui: &Ui, rect: Rect, label: &str, icon: Option<UiIcon>) {
+    let mut painter = ui.painter().clone();
+    // Match the original Commit button exactly, without a second egui disabled fade.
+    painter.set_fade_to_color(None);
+    let foreground = disabled_primary_action_foreground();
+    painter.rect_filled(rect, CornerRadius::same(4), disabled_primary_action_fill());
+    let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(12.0), foreground);
+    let icon_space = if icon.is_some() { 21.0 } else { 0.0 };
+    let left = rect.center().x - (galley.size().x + icon_space) * 0.5;
+    if let Some(icon) = icon {
+        let icon_rect = Rect::from_min_size(Pos2::new(left, rect.center().y - 6.5), Vec2::splat(13.0));
+        match egui::Image::new(icon_source(icon)).load_for_size(ui.ctx(), icon_rect.size()) {
+            Ok(egui::load::TexturePoll::Ready { texture }) => {
+                painter.image(texture.id, icon_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), foreground);
+            }
+            Ok(egui::load::TexturePoll::Pending { .. }) => ui.ctx().request_repaint(),
+            Err(_) => {}
+        }
+    }
+    painter.galley(Pos2::new(left + icon_space, rect.center().y - galley.size().y * 0.5), galley, foreground);
 }
 
 fn destructive_action_color() -> Color32 {
@@ -23970,6 +24120,34 @@ fn destructive_action_hover_fill() -> Color32 {
     Color32::from_rgba_unmultiplied(220, 76, 70, 30)
 }
 
+fn replace_unchanged_commit_draft(draft: &mut String, original: &str, generated: String) -> bool {
+    if draft != original {
+        return false;
+    }
+    *draft = generated;
+    true
+}
+
+fn commit_ai_hover_text(language: Language, model: Option<&str>) -> String {
+    format!("{}: {}\n\n{}",
+        i18n::t(language, "commit.ai_model"),
+        model.unwrap_or_else(|| i18n::t(language, "settings.ai_model_none")),
+        i18n::t(language, "commit.ai_privacy"),
+    )
+}
+
+fn commit_ai_generate_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    let width = (dialog_inline_action_button_width(ui, label) + 20.0).max(112.0);
+    text_action_button(
+        ui,
+        label,
+        Some(UiIcon::Ai),
+        enabled,
+        TextActionTone::Primary,
+        Vec2::new(width, 30.0),
+    )
+}
+
 fn text_action_button(
     ui: &mut Ui,
     label: &str,
@@ -23978,6 +24156,13 @@ fn text_action_button(
     tone: TextActionTone,
     size: Vec2,
 ) -> egui::Response {
+    let enabled = enabled && ui.is_enabled();
+    if !enabled && tone == TextActionTone::Primary {
+        let (rect, response) = ui.add_enabled_ui(false, |ui| ui.allocate_exact_size(size, Sense::hover())).inner;
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, false, label));
+        paint_disabled_primary_action(ui, rect, label, icon);
+        return response;
+    }
     let foreground = if !enabled {
         if tone == TextActionTone::Primary {
             disabled_primary_action_foreground()
@@ -23997,7 +24182,7 @@ fn text_action_button(
             theme::accent_deep(),
             theme::accent(),
             theme::accent_deep(),
-            theme::accent_deep().gamma_multiply(0.55),
+            disabled_primary_action_fill(),
         ),
         TextActionTone::Secondary => (
             theme::panel_soft(),
@@ -24711,6 +24896,7 @@ fn resize_handle_rect(rect: Rect, vertical: bool) -> Rect {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiIcon {
+    Ai,
     Commit,
     Message,
     Hash,
@@ -25765,6 +25951,7 @@ fn commit_message_editor_ui(
 }
 
 fn commit_submit_button(ui: &mut Ui, rect: Rect, label: &str, enabled: bool) -> egui::Response {
+    let enabled = enabled && ui.is_enabled();
     let sense = if enabled {
         Sense::click()
     } else {
@@ -25776,23 +25963,17 @@ fn commit_submit_button(ui: &mut Ui, rect: Rect, label: &str, enabled: bool) -> 
     } else {
         response
     };
-    let fill = if enabled {
-        theme::accent_deep()
-    } else {
-        theme::accent_deep().gamma_multiply(0.55)
-    };
-    let text_color = if enabled {
-        Color32::WHITE
-    } else {
-        Color32::WHITE.gamma_multiply(0.78)
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
+    if !enabled {
+        paint_disabled_primary_action(ui, rect, label, None);
+        return response;
+    }
+    ui.painter().rect_filled(rect, CornerRadius::same(4), theme::accent_deep());
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(12.0),
-        text_color,
+        Color32::WHITE,
     );
 
     response
@@ -26020,6 +26201,7 @@ fn toolbar_icon(raw: &str, _label: &str) -> UiIcon {
 
 fn icon_source(icon: UiIcon) -> egui::ImageSource<'static> {
     match icon {
+        UiIcon::Ai => egui::include_image!("../assets/icons/ai.svg"),
         UiIcon::Commit => egui::include_image!("../assets/icons/commit.svg"),
         UiIcon::Message => egui::include_image!("../assets/icons/message.svg"),
         UiIcon::Hash => egui::include_image!("../assets/icons/hash.svg"),
@@ -38166,6 +38348,161 @@ fn strip_git_suffix(value: &str) -> &str {
 mod ui_tests {
     use super::*;
 
+    #[test]
+    fn disabled_primary_buttons_render_the_same_palette_as_commit() {
+        let icon = egui_extras::image::load_svg_bytes(include_bytes!("../assets/icons/ai.svg")).unwrap();
+        assert!(icon.pixels.iter().any(|pixel| pixel.a() > 0));
+        // Rasterized edge pixels are premultiplied by the SVG loader. Inspect the
+        // opaque stroke core rather than assuming RGB == alpha at every edge.
+        let core = icon.pixels.iter().max_by_key(|pixel| pixel.a()).unwrap();
+        assert!(core.a() > 200 && core.r() > 200 && core.r() == core.g() && core.g() == core.b(),
+            "AI icon must have white strokes, not black currentColor: {core:?}");
+        fn flatten<'a>(shape: &'a Shape, shapes: &mut Vec<&'a Shape>) {
+            if let Shape::Vec(children) = shape {
+                for child in children { flatten(child, shapes); }
+            } else { shapes.push(shape); }
+        }
+        for parent_disabled in [false, true] {
+            let ctx = egui::Context::default();
+            egui_extras::install_image_loaders(&ctx);
+            let mut rects = Vec::new();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if parent_disabled { ui.disable(); }
+                    let ai = commit_ai_generate_button(ui, "AI disabled", parent_disabled);
+                    assert!(!ai.enabled());
+                    assert!(!ai.clicked());
+                    rects.push(ai.rect);
+                    let rect = ui.allocate_exact_size(Vec2::new(112.0, 30.0), Sense::hover()).0;
+                    assert!(!commit_submit_button(ui, rect, "Commit disabled", parent_disabled).clicked());
+                    rects.push(rect);
+                });
+            });
+            let mut shapes = Vec::new();
+            for clipped in &output.shapes { flatten(&clipped.shape, &mut shapes); }
+            let ai_rect = rects[0];
+            let icon_mesh = shapes.iter().find_map(|shape| match shape {
+                Shape::Mesh(mesh) if !mesh.vertices.is_empty() && mesh.vertices.iter().all(|v| ai_rect.contains(v.pos)) => Some(mesh),
+                _ => None,
+            }).expect("disabled AI icon was painted");
+            assert!(icon_mesh.vertices.iter().all(|vertex| vertex.color == disabled_primary_action_foreground()));
+            for rect in rects {
+                let fill = shapes.iter().find_map(|s| match s {
+                    Shape::Rect(shape) if shape.rect == rect => Some(shape.fill),
+                    _ => None,
+                }).expect("button background was painted");
+                assert_eq!(fill, disabled_primary_action_fill());
+            }
+            for label in ["AI disabled", "Commit disabled"] {
+                let color = shapes.iter().find_map(|s| match s {
+                    Shape::Text(shape) if shape.galley.job.text == label => Some(shape.galley.job.sections[0].format.color),
+                    _ => None,
+                }).expect("button label was painted");
+                assert_eq!(color, disabled_primary_action_foreground());
+            }
+        }
+    }
+
+    #[test]
+    fn ai_commit_language_persists_independently_of_interface_language() {
+        for (output, interface, expected) in [
+            (SettingsLanguage::English, SettingsLanguage::Chinese, Language::English),
+            (SettingsLanguage::Chinese, SettingsLanguage::English, Language::Chinese),
+        ] {
+            let settings = AppSettings {
+                language: interface,
+                ai_commit_language: Some(output),
+                ..AppSettings::default()
+            };
+            let encoded = serde_json::to_string(&settings).unwrap();
+            let mut restored: AppSettings = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(restored.effective_ai_commit_language(), expected);
+            restored.language = output;
+            assert_eq!(restored.effective_ai_commit_language(), expected);
+        }
+    }
+
+    #[test]
+    fn ai_commit_language_migrates_old_settings_and_drives_generation() {
+        for (json, expected) in [
+            (r#"{"language":"English"}"#, Language::English),
+            (r#"{"language":"Chinese"}"#, Language::Chinese),
+        ] {
+            let settings: AppSettings = serde_json::from_str(json).unwrap();
+            assert_eq!(settings.effective_ai_commit_language(), expected);
+        }
+        let source = include_str!("app.rs");
+        let start = source.split("fn start_commit_ai(").nth(1).unwrap()
+            .split("fn poll_commit_ai_task(").next().unwrap();
+        assert!(start.contains("let chinese = self.ai_commit_language == Language::Chinese"));
+        assert!(!start.contains("let chinese = self.language"));
+        let settings = source.split("fn global_ai_settings(").nth(1).unwrap()
+            .split("fn ai_model_settings_modal(").next().unwrap();
+        assert!(settings.contains("settings_ai_commit_language"));
+        assert!(settings.contains("self.ai_commit_language != language_before"));
+        assert!(source.contains("ai_commit_language: Some(self.ai_commit_language.into())"));
+    }
+
+    #[test]
+    fn commit_ai_button_is_prominent_icon_labeled_and_respects_disabled_state() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for label in ["AI 生成", "AI generate"] {
+                    let enabled = commit_ai_generate_button(ui, label, true);
+                    assert!(enabled.enabled());
+                    assert!(enabled.rect.width() >= 112.0);
+                    assert!(enabled.rect.height() >= 30.0);
+                    let disabled = commit_ai_generate_button(ui, label, false);
+                    assert!(!disabled.enabled());
+                    assert!(!disabled.clicked());
+                }
+            });
+        });
+        let source = include_str!("app.rs");
+        let button = source.split("fn commit_ai_generate_button(").nth(1).unwrap()
+            .split("fn text_action_button(").next().unwrap();
+        assert!(button.contains("Some(UiIcon::Ai)"));
+        assert!(button.contains("TextActionTone::Primary"));
+        let controls = source.split("fn commit_ai_controls(").nth(1).unwrap()
+            .split("fn commit_panel(").next().unwrap();
+        assert!(controls.contains("on_disabled_hover_text"));
+        assert!(controls.contains(".on_hover_text(hint)"));
+        assert!(controls.contains("commit_ai_hover_text(self.language, self.selected_ai_model.as_deref())"));
+        assert!(controls.contains("self.start_commit_ai(ui.ctx());"));
+        assert!(!controls.contains("popup"));
+        assert!(!controls.contains("menu_button"));
+    }
+
+    #[test]
+    fn commit_ai_hover_tracks_current_model_in_both_languages() {
+        for language in [Language::English, Language::Chinese] {
+            let first = commit_ai_hover_text(language, Some("Model A"));
+            let switched = commit_ai_hover_text(language, Some("Model B"));
+            assert!(first.contains("Model A"));
+            assert!(!switched.contains("Model A"));
+            assert!(switched.contains("Model B"));
+            assert!(switched.contains(i18n::t(language, "commit.ai_privacy")));
+            assert!(commit_ai_hover_text(language, None)
+                .contains(i18n::t(language, "settings.ai_model_none")));
+        }
+    }
+
+    #[test]
+    fn commit_ai_writes_directly_but_preserves_concurrent_draft_edits() {
+        for original in ["", "An existing draft"] {
+            let mut draft = original.to_owned();
+            assert!(replace_unchanged_commit_draft(&mut draft, original, "feat: new message".into()));
+            assert_eq!(draft, "feat: new message");
+        }
+        for edited in ["User edited while waiting", ""] {
+            let mut draft = edited.to_owned();
+            assert!(!replace_unchanged_commit_draft(&mut draft, "Original draft", "feat: generated".into()));
+            assert_eq!(draft, edited);
+        }
+    }
+
     fn color_brightness(color: Color32) -> f32 {
         (0.299 * color.r() as f32 + 0.587 * color.g() as f32 + 0.114 * color.b() as f32) / 255.0
     }
@@ -39091,6 +39428,7 @@ mod ui_tests {
                 model_id: "gpt-5-mini".to_owned(),
             }],
             selected_ai_model: Some("OpenAI".to_owned()),
+            ai_commit_language: Some(SettingsLanguage::English),
             ai_openai: AiProviderSettings::openai_compatible(),
             ai_claude: AiProviderSettings::claude(),
             ssh_client: SshClientKind::OpenSsh,
@@ -45214,16 +45552,26 @@ mod ui_tests {
     }
 
     #[test]
-    fn disabled_primary_button_text_is_bright_but_distinct_from_enabled_text() {
+    fn disabled_primary_button_matches_commit_opacity_across_themes() {
         let disabled = disabled_primary_action_foreground();
-        assert_eq!(disabled, Color32::from_gray(210));
+        assert_eq!(disabled, Color32::WHITE.gamma_multiply(0.78));
         assert_ne!(disabled, Color32::WHITE);
+
+        // The reference Commit style is translucent white, not opaque gray.
+        // Compare composited colors rather than premultiplied RGB components.
+        fn over(foreground: Color32, background: Color32) -> Color32 {
+            let [r, g, b, a] = foreground.to_srgba_unmultiplied();
+            let alpha = a as f32 / 255.0;
+            let channel = |fg: u8, bg: u8| (fg as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8;
+            Color32::from_rgb(channel(r, background.r()), channel(g, background.g()), channel(b, background.b()))
+        }
 
         for mode in [theme::ThemeMode::Light, theme::ThemeMode::Dark] {
             for accent in theme::all_accents() {
                 let palette = theme::palette_for(mode, accent);
+                let background = over(palette.accent_deep.gamma_multiply(0.55), palette.panel);
                 assert!(
-                    color_brightness(disabled) > color_brightness(palette.muted),
+                    color_brightness(over(disabled, background)) > color_brightness(background),
                     "{mode:?} {accent:?}"
                 );
             }

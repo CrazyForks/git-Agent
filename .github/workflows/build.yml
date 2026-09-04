@@ -195,7 +195,7 @@ jobs:
             gh release create "$TAG_NAME" release-assets/* \
               --verify-tag \
               --title "Git Agent $TAG_NAME" \
-              --notes "Automated release for $TAG_NAME."
+              --notes "[English changelog](https://github.com/adoin/git-Agent/blob/$TAG_NAME/CHANGELOG.md) · [中文更新日志](https://github.com/adoin/git-Agent/blob/$TAG_NAME/CHANGELOG.zh-CN.md)"
           fi
 
   cleanup:

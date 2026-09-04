@@ -1,4 +1,5 @@
 pub mod app;
+mod commit_ai;
 pub mod diagnostics;
 pub mod dialog;
 pub mod diff_tool;

@@ -7,6 +7,7 @@ Manage repositories, review changes, explore history, and resolve conflicts in o
 with optional AI assistance for three-way merges.
 
 [Download](https://github.com/adoin/git-Agent/releases/latest) ·
+[Changelog](CHANGELOG.md) ·
 [Getting started](#getting-started) ·
 [Build from source](#build-from-source) ·
 [Contribute](CONTRIBUTING.md) ·
@@ -103,6 +104,28 @@ Do not disable system-wide security checks to launch it.
 
 Normal Git workflows do not require an AI model. Try unfamiliar or destructive operations
 in a disposable test repository before using them on important work.
+
+## AI commit messages (1.4.1+)
+
+In the workspace commit panel, hover over **AI generate** to see the current model
+and data-sharing notice; click once to start using the model selected in **Settings → AI**. Choose
+**Commit message language → English / Chinese** there independently of the interface language. Stage the
+changes first. The assistant describes business-level changes with a conventional
+commit subject and numbered details, and can read related files and search symbol
+references beyond the changed files.
+
+All code comes from a fixed index-tree snapshot, including unchanged tracked files;
+unstaged edits and untracked files are not included. The generated message replaces
+the commit editor text directly, with no separate preview or apply step. Edits you
+make while generation is running are preserved. Review the message before committing;
+generation never commits or pushes. Changes to the index or HEAD invalidate the
+result. Amend and rebase workflows
+are not supported by this entry point yet. Oversized diffs fail explicitly rather
+than silently summarizing only part of a commit.
+
+Staged diffs and requested context are sent to your configured provider, which may
+charge for calls. Common sensitive filenames are blocked, but this is not a secret
+scanner: review staged content before sending. AI descriptions still need human review.
 
 ## AI-assisted merging
 

@@ -1,0 +1,10 @@
+.changelog { max-width: 820px; padding-block: 48px 80px; overflow-wrap: anywhere; }
+.changelog h1 { white-space: normal; font-size: clamp(32px, 5vw, 48px); letter-spacing: -1px; }
+.changelog h2 { margin-top: 48px; padding-top: 24px; border-top: 1px solid #dce5ee; }
+.changelog h3 { margin-top: 28px; }
+.changelog p, .changelog li { line-height: 1.9; }
+.changelog li { margin-block: 10px; }
+.changelog a { color: var(--blue); text-decoration: underline; text-underline-offset: 3px; }
+.changelog ul { padding-left: 24px; }
+.changelog [hidden] { display: none; }
+.changelog .download-links { flex-wrap: wrap; margin-top: 48px; }
