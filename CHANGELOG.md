@@ -6,6 +6,12 @@ User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 Unreleased entries describe development changes, not features in the latest downloadable package.
 
+## Unreleased
+
+### Fixed
+
+- Corrected the logo's branch-to-node connections and restored fully hollow circular nodes. Window, installer, and website icon resources now share the same SVG artwork.
+
 ## 1.4.1 — 2026-09-04
 
 ### Added

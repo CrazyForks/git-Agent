@@ -88,140 +88,15 @@ fn install_panic_logger() {
 }
 
 fn app_icon_data() -> eframe::egui::IconData {
-    let size = 64;
-    let mut rgba = vec![0_u8; size * size * 4];
-    let green = [21, 196, 151, 255];
-    let blue = [47, 111, 234, 255];
-
-    paint_line_color(&mut rgba, size, 23, 17, 23, 47, 4, blue);
-    paint_line_color(&mut rgba, size, 23, 17, 23, 30, 4, green);
-    paint_quadratic_color(
-        &mut rgba,
-        size,
-        (23.0, 31.0),
-        (31.0, 31.0),
-        (42.0, 22.0),
-        4,
-        blue,
-    );
-
-    paint_ring(&mut rgba, size, 23, 17, 8, 4, green);
-    clear_disc(&mut rgba, size, 23, 17, 4);
-    paint_ring(&mut rgba, size, 23, 47, 8, 4, blue);
-    clear_disc(&mut rgba, size, 23, 47, 4);
-    paint_ring(&mut rgba, size, 42, 22, 8, 4, blue);
-    clear_disc(&mut rgba, size, 42, 22, 4);
-
+    // Use the same vector artwork as the title bar and generated installer icons.
+    // Rasterize once at startup, never in the title-bar painting/dragging path.
+    let image = egui_extras::image::load_svg_bytes(include_bytes!("../assets/icons/logo-ga.svg"))
+        .expect("embedded Git Agent logo must be valid SVG");
     eframe::egui::IconData {
-        rgba,
-        width: size as u32,
-        height: size as u32,
+        rgba: image.pixels.iter().flat_map(|pixel| pixel.to_srgba_unmultiplied()).collect(),
+        width: image.size[0] as u32,
+        height: image.size[1] as u32,
     }
-}
-
-fn paint_ring(
-    rgba: &mut [u8],
-    size: usize,
-    cx: usize,
-    cy: usize,
-    radius: usize,
-    width: usize,
-    color: [u8; 4],
-) {
-    let outer_sq = (radius * radius) as isize;
-    let inner = radius.saturating_sub(width);
-    let inner_sq = (inner * inner) as isize;
-    for y in cy.saturating_sub(radius)..=(cy + radius).min(size - 1) {
-        for x in cx.saturating_sub(radius)..=(cx + radius).min(size - 1) {
-            let dx = x as isize - cx as isize;
-            let dy = y as isize - cy as isize;
-            let dist_sq = dx * dx + dy * dy;
-            if dist_sq <= outer_sq && dist_sq >= inner_sq {
-                paint_pixel(rgba, size, x, y, color);
-            }
-        }
-    }
-}
-
-fn clear_disc(rgba: &mut [u8], size: usize, cx: usize, cy: usize, radius: usize) {
-    let radius_sq = (radius * radius) as isize;
-    for y in cy.saturating_sub(radius)..=(cy + radius).min(size - 1) {
-        for x in cx.saturating_sub(radius)..=(cx + radius).min(size - 1) {
-            let dx = x as isize - cx as isize;
-            let dy = y as isize - cy as isize;
-            if dx * dx + dy * dy <= radius_sq {
-                paint_pixel(rgba, size, x, y, [0, 0, 0, 0]);
-            }
-        }
-    }
-}
-
-fn paint_line_color(
-    rgba: &mut [u8],
-    size: usize,
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-    radius: usize,
-    color: [u8; 4],
-) {
-    let steps = x0.abs_diff(x1).max(y0.abs_diff(y1)).max(1);
-    for step in 0..=steps {
-        let t = step as f32 / steps as f32;
-        let x = (x0 as f32 + (x1 as f32 - x0 as f32) * t).round() as usize;
-        let y = (y0 as f32 + (y1 as f32 - y0 as f32) * t).round() as usize;
-        paint_disc(rgba, size, x, y, radius, color);
-    }
-}
-
-fn paint_quadratic_color(
-    rgba: &mut [u8],
-    size: usize,
-    start: (f32, f32),
-    control: (f32, f32),
-    end: (f32, f32),
-    radius: usize,
-    color: [u8; 4],
-) {
-    let steps = 48;
-    for step in 0..=steps {
-        let t = step as f32 / steps as f32;
-        let one_minus_t = 1.0 - t;
-        let x =
-            one_minus_t * one_minus_t * start.0 + 2.0 * one_minus_t * t * control.0 + t * t * end.0;
-        let y =
-            one_minus_t * one_minus_t * start.1 + 2.0 * one_minus_t * t * control.1 + t * t * end.1;
-        paint_disc(
-            rgba,
-            size,
-            x.round() as usize,
-            y.round() as usize,
-            radius,
-            color,
-        );
-    }
-}
-
-fn paint_disc(rgba: &mut [u8], size: usize, cx: usize, cy: usize, radius: usize, color: [u8; 4]) {
-    let radius_sq = (radius * radius) as isize;
-    for y in cy.saturating_sub(radius)..=(cy + radius).min(size - 1) {
-        for x in cx.saturating_sub(radius)..=(cx + radius).min(size - 1) {
-            let dx = x as isize - cx as isize;
-            let dy = y as isize - cy as isize;
-            if dx * dx + dy * dy <= radius_sq {
-                paint_pixel(rgba, size, x, y, color);
-            }
-        }
-    }
-}
-
-fn paint_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4]) {
-    let idx = (y * size + x) * 4;
-    rgba[idx] = color[0];
-    rgba[idx + 1] = color[1];
-    rgba[idx + 2] = color[2];
-    rgba[idx + 3] = color[3];
 }
 
 #[cfg(test)]
@@ -255,6 +130,35 @@ mod tests {
         assert!(include_str!("main.rs").contains("with_decorations(false)"));
         assert!(include_str!("main.rs").contains("DWMWA_WINDOW_CORNER_PREFERENCE"));
         assert!(include_str!("main.rs").contains("DWMWCP_ROUND"));
+    }
+
+    #[test]
+    fn logo_nodes_are_hollow_and_branches_form_one_connected_mark() {
+        let icon = app_icon_data();
+        let size = icon.width as usize;
+        let alpha = |x: usize, y: usize| icon.rgba[(y * size + x) * 4 + 3];
+        for (x, y) in [(23, 17), (23, 47), (42, 22)] {
+            // A real round hole, not the narrow slit left by a line through its center.
+            for dy in -2isize..=1 {
+                for dx in -2isize..=1 {
+                    assert_eq!(alpha((x as isize + dx) as usize, (y as isize + dy) as usize), 0);
+                }
+            }
+        }
+        for (x, y) in [(23, 24), (23, 30), (23, 34), (30, 29), (36, 25), (23, 41)] {
+            assert!(alpha(x, y) >= 200, "Gap at {x},{y}");
+        }
+        let mut visited = std::collections::HashSet::new();
+        let mut pending = vec![(23usize, 31usize)];
+        while let Some((x, y)) = pending.pop() {
+            if alpha(x, y) < 128 || !visited.insert((x, y)) { continue; }
+            for (nx, ny) in [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)] {
+                if nx < size && ny < size { pending.push((nx, ny)); }
+            }
+        }
+        assert_eq!(visited.len(), icon.rgba.chunks_exact(4).filter(|p| p[3] >= 128).count());
+        assert_eq!(include_bytes!("../assets/icons/logo-ga.svg"), include_bytes!("../website/public/assets/logo-ga.svg"));
+        assert_eq!(include_bytes!("../assets/icons/logo-ga.png"), include_bytes!("../website/public/assets/logo-ga.png"));
     }
 
     #[test]

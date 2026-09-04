@@ -83,7 +83,8 @@ def build():
   <meta name="description" content="Git Agent 中英文更新日志 / Bilingual release changelog. Unreleased changes are clearly marked.">
   <title>更新日志 / Changelog — Git Agent</title>
   <link rel="canonical" href="https://git-agent.emssion.com/changelog.html">
-  <link rel="icon" type="image/svg+xml" href="assets/logo-ga.svg">
+  <link rel="icon" type="image/x-icon" sizes="256x256" href="favicon.ico?v=connected-1">
+  <link rel="icon" type="image/svg+xml" sizes="any" href="assets/logo-ga.svg?v=connected-1">
   <link rel="stylesheet" href="styles.css?v=real-ui-2">
   <link rel="stylesheet" href="changelog.css?v=1">
   <script src="changelog.js?v=1" defer></script>
@@ -92,7 +93,7 @@ def build():
   <a class="skip-link" href="#main">跳转到更新日志 / Skip to changelog</a>
   <header class="site-header">
     <nav class="container nav-wrap" aria-label="Changelog navigation">
-      <a class="brand" href="./" data-home><img src="assets/logo-ga.svg" alt="" width="40" height="40"><span>Git Agent<span class="brand-dot">.</span></span></a>
+      <a class="brand" href="./" data-home><img src="assets/logo-ga.svg?v=connected-1" alt="" width="40" height="40"><span>Git Agent<span class="brand-dot">.</span></span></a>
       <a class="language-button" href="?lang=en" data-language-toggle>English ↗</a>
     </nav>
   </header>

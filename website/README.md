@@ -28,6 +28,11 @@ GitHub receives the visitor's normal network request when release metadata is lo
 If that request is blocked, the release-page links remain available.
 
 Product visuals must be actual application screenshots supplied by the maintainer.
+The page logos, SVG favicon, and `/favicon.ico` are generated from
+`assets/icons/logo-ga.svg` by `scripts/generate-brand-icons.cjs` (Node.js with `sharp`).
+After changing that source, regenerate all icon resources and bump the logo query
+version in `public/index.html` and `build_changelog.py` to refresh browser caches.
+
 Do not reconstruct application windows, fabricate commit histories, or simulate AI results
 as product demonstrations. The four PNGs are byte-for-byte copies of the maintainer's
 captures; do not redraw, recolor, or crop their contents:

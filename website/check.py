@@ -76,6 +76,16 @@ for value in changelog.urls:
     if not url.scheme and url.path and url.path != "./":
         assert (ROOT / url.path).is_file(), f"Missing changelog asset: {value}"
 assert "https://ko-fi.com/adoin" in changelog.urls
+for document in (page, changelog):
+    assert "assets/logo-ga.svg?v=connected-1" in document.urls
+    assert "favicon.ico?v=connected-1" in document.urls
+icons = ROOT.parent.parent / "assets" / "icons"
+for name in ("logo-ga.svg", "logo-ga.png"):
+    assert (ROOT / "assets" / name).read_bytes() == (icons / name).read_bytes(), f"Logo mismatch: {name}"
+favicon = (ROOT / "favicon.ico").read_bytes()
+assert favicon == (icons / "git-agent.ico").read_bytes(), "Favicon must match the app icon."
+assert favicon[:6] == bytes([0, 0, 1, 0, 1, 0])
+assert favicon[22:] == (ROOT / "assets" / "logo-ga.png").read_bytes()
 for filename in ("index.html", "styles.css", "captures.css", "app.js"):
     content = (ROOT / filename).read_text(encoding="utf-8")
     assert "\ufffd" not in content, f"Encoding error in {filename}"
