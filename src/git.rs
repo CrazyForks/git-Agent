@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, HashSet},
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
     sync::{Mutex, OnceLock, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -997,14 +999,17 @@ pub fn load_commit_details(root: impl AsRef<Path>, hash: &str) -> Result<CommitD
     })
 }
 
-pub fn search_commits_by_changed_file(root: impl AsRef<Path>, query: &str) -> Result<Vec<String>> {
+pub fn search_commits_by_changed_file(
+    root: impl AsRef<Path>, query: &str, cancelled: &AtomicBool,
+    mut on_paths: impl FnMut(Vec<String>),
+) -> Result<Vec<String>> {
     let raw_query = query.trim();
     if raw_query.is_empty() {
         return Ok(Vec::new());
     }
 
     let max_count = format!("--max-count={HISTORY_COMMIT_LIMIT}");
-    let path_output = git_output(
+    let path_output = search_git_output(
         root.as_ref(),
         &[
             "log",
@@ -1012,10 +1017,12 @@ pub fn search_commits_by_changed_file(root: impl AsRef<Path>, query: &str) -> Re
             &max_count,
             "--name-only",
             "--format=%x1e%H",
-        ],
+        ], cancelled,
     )?;
+    let mut hashes = parse_changed_file_search_log(&path_output, raw_query);
+    on_paths(hashes.clone());
     let content_regex = literal_git_regex(raw_query);
-    let content_output = git_output(
+    let content_output = search_git_output(
         root.as_ref(),
         &[
             "log",
@@ -1025,16 +1032,58 @@ pub fn search_commits_by_changed_file(root: impl AsRef<Path>, query: &str) -> Re
             "-G",
             &content_regex,
             "--format=%H",
-        ],
+        ], cancelled,
     )?;
 
-    let mut hashes = parse_changed_file_search_log(&path_output, raw_query);
+    let mut seen: HashSet<String> = hashes.iter().cloned().collect();
     for hash in parse_hash_lines(&content_output) {
-        if !hashes.iter().any(|existing| existing == &hash) {
+        if seen.insert(hash.clone()) {
             hashes.push(hash);
         }
     }
     Ok(hashes)
+}
+
+fn search_git_output(root: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<String> {
+    if cancelled.load(AtomicOrdering::Relaxed) { return Err(anyhow!("Search cancelled")); }
+    let mut child = git_command().arg("-C").arg(root).args(args)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    // Drain both pipes while waiting, so large filename output cannot block Git.
+    std::thread::scope(|scope| -> Result<String> {
+        let output = scope.spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).map(|_| bytes) });
+        let errors = scope.spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).map(|_| bytes) });
+        let status = loop {
+            if cancelled.load(AtomicOrdering::Relaxed) {
+                terminate_search_process(&mut child);
+                child.wait()?;
+                return Err(anyhow!("Search cancelled"));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(40)),
+                Err(error) => { terminate_search_process(&mut child); let _ = child.wait(); return Err(error.into()); }
+            }
+        };
+        let stdout = output.join().map_err(|_| anyhow!("Search output reader stopped"))??;
+        let stderr = errors.join().map_err(|_| anyhow!("Search diagnostic reader stopped"))??;
+        if !status.success() { return Err(anyhow!("{}", String::from_utf8_lossy(&stderr))); }
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
+    })
+}
+
+fn terminate_search_process(child: &mut std::process::Child) {
+    #[cfg(target_os = "windows")]
+    {
+        // Git for Windows' cmd/git.exe launches another git.exe. Kill the owned
+        // tree before its launcher exits, or pipe readers can wait on that orphan.
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    let _ = child.kill();
 }
 
 fn parse_changed_file_search_log(output: &str, query: &str) -> Vec<String> {
@@ -4452,6 +4501,53 @@ mod tests {
 
         assert!(!core_source.contains("load_commits("));
         assert!(core_source.contains("history_loaded: false"));
+    }
+
+    #[test]
+    fn file_search_reports_filename_matches_before_content_and_honors_cancel() -> Result<()> {
+        let root = init_patch_test_repo("file-search-progress")?;
+        fs::write(root.join("usePinService.ts"), "export const enabled = true;\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "file name match"])?;
+        let path_hash = git_output(&root, &["rev-parse", "HEAD"] )?.trim().to_owned();
+        fs::write(root.join("consumer.ts"), "usePinService();\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "content match"])?;
+        let content_hash = git_output(&root, &["rev-parse", "HEAD"] )?.trim().to_owned();
+        let cancelled = AtomicBool::new(false);
+        let mut partial = Vec::new();
+        let hashes = search_commits_by_changed_file(&root, "usePinService", &cancelled, |paths| partial = paths)?;
+        assert_eq!(partial, vec![path_hash.clone()]);
+        assert_eq!(hashes, vec![path_hash, content_hash]);
+        assert!(search_commits_by_changed_file(&root, "usePinService", &cancelled, |_| {
+            cancelled.store(true, AtomicOrdering::Relaxed);
+        }).is_err());
+        assert!(search_git_output(&root, &["not-a-command"], &cancelled).unwrap_err().to_string().contains("cancelled"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "read-only timing/cancellation check on GIT_AGENT_SEARCH_TEST_REPO"]
+    fn file_search_real_repository_timing_and_cancellation() -> Result<()> {
+        let root = PathBuf::from(std::env::var("GIT_AGENT_SEARCH_TEST_REPO")?);
+        let cancelled = AtomicBool::new(false);
+        let started = Instant::now();
+        let hashes = search_commits_by_changed_file(&root, "usePinService", &cancelled, |paths| {
+            eprintln!("filename phase: {:?}, {} matches", started.elapsed(), paths.len());
+        })?;
+        eprintln!("full search: {:?}, {} matches", started.elapsed(), hashes.len());
+        let started = Instant::now();
+        std::thread::scope(|scope| -> Result<()> {
+            let worker = scope.spawn(|| search_git_output(&root, &["log", "-G", "usePinService", "--format=%H"], &cancelled));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cancelled.store(true, AtomicOrdering::Relaxed);
+            assert!(worker.join().unwrap().is_err());
+            Ok(())
+        })?;
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        eprintln!("cancel and reap: {:?}", started.elapsed());
+        Ok(())
     }
 
     #[test]

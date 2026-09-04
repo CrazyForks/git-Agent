@@ -8,6 +8,12 @@ Unreleased entries describe development changes, not features in the latest down
 
 ## Unreleased
 
+### Changed
+
+- Enhanced commit search: file searches show filename matches before content matches, support cancellation with Git process cleanup, and use localized progress/error messages. Slow searches allow up to 120 seconds and clearly mark incomplete results.
+- Refined commit-detail cards: titles and branch lists are limited to two lines, with full content available in a single scrollable hover tooltip in both history and search.
+- Improved layout: increased the commit-search input height and aligned the commit panel's AI generation, history, and options controls on one centerline, with a more compact AI button.
+
 ### Fixed
 
 - Corrected the logo's branch-to-node connections and restored fully hollow circular nodes. Window, installer, and website icon resources now share the same SVG artwork.

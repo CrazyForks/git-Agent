@@ -57,6 +57,18 @@ struct CommitAiTask {
     cancelled: std::sync::Arc<AtomicBool>,
     receiver: Receiver<Result<crate::commit_ai::Suggestion, String>>,
 }
+
+struct FileSearchTask {
+    root: PathBuf,
+    cancelled: std::sync::Arc<AtomicBool>,
+    timed_out: bool,
+    // The first event contains filename matches; the final event includes content matches.
+    receiver: Receiver<(String, bool, anyhow::Result<Vec<String>>)>,
+}
+
+impl Drop for FileSearchTask {
+    fn drop(&mut self) { self.cancelled.store(true, Ordering::Relaxed); }
+}
 const TITLE_BAR_HEIGHT: f32 = 32.0;
 const WINDOW_RESIZE_BORDER: f32 = 8.0;
 const TITLE_DRAG_TOP_INSET: f32 = WINDOW_RESIZE_BORDER + 1.0;
@@ -174,7 +186,7 @@ const HISTORY_REF_BADGE_GAP: f32 = 6.0;
 const HISTORY_BOTTOM_MIN_HEIGHT: f32 = 230.0;
 const HISTORY_DETAILS_MIN_HEIGHT: f32 = 260.0;
 const HISTORY_LIST_MIN_HEIGHT: f32 = 260.0;
-const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(120);
 const CONTENT_PANEL_INSET_X: i8 = 14;
 const CONTENT_PANEL_INSET_Y: i8 = 12;
 const RESOURCE_ROW_HEIGHT: f32 = 30.0;
@@ -901,7 +913,8 @@ pub struct GitAgentApp {
     repo_source_task: Option<Receiver<anyhow::Result<PathBuf>>>,
     details_task: Option<Receiver<anyhow::Result<CommitDetails>>>,
     diff_task: Option<Receiver<anyhow::Result<FileDiff>>>,
-    file_search_task: Option<Receiver<(String, anyhow::Result<Vec<String>>)>>,
+    file_search_task: Option<FileSearchTask>,
+    file_search_complete: bool,
     blame_task: Option<Receiver<(String, anyhow::Result<Vec<git::BlameLine>>)>>,
     file_search_started_at: Option<Instant>,
     file_search_query: String,
@@ -4646,6 +4659,7 @@ impl GitAgentApp {
             details_task: None,
             diff_task: None,
             file_search_task: None,
+            file_search_complete: true,
             blame_task: None,
             file_search_started_at: None,
             file_search_query: String::new(),
@@ -9401,50 +9415,58 @@ impl GitAgentApp {
             }
         }
 
-        if let Some(receiver) = self.file_search_task.take() {
-            match receiver.try_recv() {
-                Ok((query, Ok(hashes))) => {
-                    self.file_search_started_at = None;
-                    if self.search_dimension == SearchDimension::Files
-                        && self.search_view_query.trim().to_lowercase() == query
-                    {
-                        self.file_search_query = query;
-                        self.file_search_hashes = hashes.into_iter().collect();
-                        self.search_selected_commit =
-                            self.search_filtered_commit_indices().first().copied();
-                        self.search_selected_file_path = None;
-                        self.search_selected_diff_rows.clear();
-                        if !self.select_first_search_changed_file_if_cached() {
-                            self.request_selected_search_details();
+        if let Some(mut task) = self.file_search_task.take() {
+            if self.active_repo_root_matches(&task.root) {
+                match task.receiver.try_recv() {
+                    Ok((query, finished, result)) => {
+                        if self.search_dimension == SearchDimension::Files
+                            && self.search_view_query.trim().to_lowercase() == query {
+                            if task.cancelled.load(Ordering::Relaxed) {
+                                if finished {
+                                    if task.timed_out { self.error = Some(self.tr("search.timeout").into()); }
+                                    else { self.show_toast(self.tr("search.cancelled")); }
+                                }
+                            } else {
+                                match result {
+                                    Ok(hashes) => {
+                                        self.file_search_query = query;
+                                        self.file_search_hashes = hashes.into_iter().collect();
+                                        self.file_search_complete = finished;
+                                        if self.search_selected_commit.is_none() {
+                                            self.search_selected_commit = self.search_filtered_commit_indices().first().copied();
+                                            self.search_selected_file_path = None;
+                                            self.search_selected_diff_rows.clear();
+                                            if !self.select_first_search_changed_file_if_cached() {
+                                                self.request_selected_search_details();
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        self.error = Some(format!("{}\n\n{error}", self.tr("search.failed")));
+                                    }
+                                }
+                            }
                         }
-                    }
-                    ctx.request_repaint();
-                }
-                Ok((query, Err(error))) => {
-                    self.file_search_started_at = None;
-                    if self.search_view_query.trim().to_lowercase() == query {
-                        self.error = Some(error.to_string());
-                    }
-                    ctx.request_repaint();
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    if self
-                        .file_search_started_at
-                        .is_some_and(|started| started.elapsed() > FILE_SEARCH_TIMEOUT)
-                    {
-                        self.file_search_started_at = None;
-                        self.error = Some("File search timed out".to_owned());
+                        if finished { self.file_search_started_at = None; }
+                        else { self.file_search_task = Some(task); }
                         ctx.request_repaint();
-                    } else {
-                        self.file_search_task = Some(receiver);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        if self.file_search_started_at.is_some_and(|started| started.elapsed() > FILE_SEARCH_TIMEOUT) {
+                            task.timed_out = true;
+                            task.cancelled.store(true, Ordering::Relaxed);
+                        }
+                        self.file_search_task = Some(task);
                         ctx.request_repaint_after(Duration::from_millis(80));
                     }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.file_search_started_at = None;
+                        self.error = Some(self.tr("search.disconnected").into());
+                        ctx.request_repaint();
+                    }
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.file_search_started_at = None;
-                    self.error = Some("File search stopped unexpectedly".to_owned());
-                    ctx.request_repaint();
-                }
+            } else {
+                self.file_search_started_at = None;
             }
         }
 
@@ -9855,6 +9877,7 @@ impl GitAgentApp {
     }
 
     fn start_file_change_search(&mut self) {
+        if self.file_search_task.is_some() { return; }
         let query = self.search_view_query.trim().to_lowercase();
         if query.is_empty() {
             self.file_search_task = None;
@@ -9870,12 +9893,21 @@ impl GitAgentApp {
             return;
         };
         let (sender, receiver) = mpsc::channel();
-        self.file_search_task = Some(receiver);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        self.file_search_task = Some(FileSearchTask { root: root.clone(), cancelled: cancelled.clone(), timed_out: false, receiver });
         self.file_search_started_at = Some(Instant::now());
+        self.file_search_complete = false;
+        self.file_search_query = query.clone();
+        self.file_search_hashes.clear();
+        self.search_selected_commit = None;
+        self.search_selected_file_path = None;
+        self.search_selected_diff_rows.clear();
         self.error = None;
         thread::spawn(move || {
-            let result = git::search_commits_by_changed_file(root, &query);
-            let _ = sender.send((query, result));
+            let result = git::search_commits_by_changed_file(root, &query, &cancelled, |hashes| {
+                let _ = sender.send((query.clone(), false, Ok(hashes)));
+            });
+            let _ = sender.send((query, true, result));
         });
     }
 
@@ -14294,14 +14326,14 @@ impl GitAgentApp {
 
                 ui.add_space(10.0);
                 let (filter_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::hover());
                 // Keep the recessed input and its text clear of the parent clip edge.
                 // TextEdit is frameless here, so using the full allocation would crop its
                 // left inset shadow and make the hint text look flush with the panel.
                 let filter_inner_rect = filter_rect.shrink2(Vec2::new(5.0, 0.0));
                 let dropdown_width = 120.0;
                 let gap = 10.0;
-                let control_height = 28.0;
+                let control_height = 36.0;
                 let control_top = filter_rect.top() + 2.0;
                 let file_search_busy = self.file_search_task.is_some();
                 let is_file_search = self.search_dimension == SearchDimension::Files;
@@ -14335,6 +14367,7 @@ impl GitAgentApp {
                             text_rect,
                             themed_singleline_text_edit(&mut self.search_view_query, &search_hint)
                                 .desired_width(text_rect.width())
+                                .min_size(text_rect.size())
                                 .vertical_align(Align::Center),
                         )
                     })
@@ -14388,11 +14421,29 @@ impl GitAgentApp {
                     .clicked();
                 if is_file_search && (search_submitted || search_button_clicked) {
                     self.start_file_change_search();
+                    ui.ctx().request_repaint();
                 }
 
                 ui.add_space(10.0);
+                let file_search_busy = self.file_search_task.is_some();
+                if file_search_busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(self.tr("search.running"));
+                        let task = self.file_search_task.as_ref().unwrap();
+                        if ui.add_enabled(!task.cancelled.load(Ordering::Relaxed), egui::Button::new(self.tr("search.cancel"))).clicked() {
+                            task.cancelled.store(true, Ordering::Relaxed);
+                        }
+                    });
+                    ui.ctx().request_repaint_after(Duration::from_millis(80));
+                } else if is_file_search && !self.file_search_complete && !self.file_search_query.is_empty() {
+                    ui.label(self.tr("search.partial"));
+                }
                 if rows.is_empty() {
-                    empty_list_panel(ui, self.tr("commit.no_matches"));
+                    let label = if file_search_busy { "search.running" }
+                        else if is_file_search && !self.file_search_complete && !self.file_search_query.is_empty() { "search.incomplete_empty" }
+                        else { "commit.no_matches" };
+                    empty_list_panel(ui, self.tr(label));
                     return;
                 }
 
@@ -15904,7 +15955,7 @@ impl GitAgentApp {
                     return;
                 }
 
-                ui.horizontal(|ui| {
+                commit_header_row(ui, |ui| {
                     panel_heading_inline(ui, self.tr("commit.panel"));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.menu_button(self.tr("commit.options"), |ui| {
@@ -24136,15 +24187,27 @@ fn commit_ai_hover_text(language: Language, model: Option<&str>) -> String {
     )
 }
 
+fn commit_header_row<R>(ui: &mut Ui, contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+    // Reserve the tallest control before placing any items. Otherwise the final AI
+    // button grows a horizontal row after the earlier menu/icon have been positioned.
+    let height = 26.0_f32.max(ui.spacing().interact_size.y)
+        .max(ui.text_style_height(&egui::TextStyle::Button) + ui.spacing().button_padding.y * 2.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), height),
+        Layout::left_to_right(Align::Center),
+        contents,
+    )
+}
+
 fn commit_ai_generate_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
-    let width = (dialog_inline_action_button_width(ui, label) + 20.0).max(112.0);
+    let width = inline_button_width(ui, label, 12.0, 88.0, 132.0, 34.0);
     text_action_button(
         ui,
         label,
         Some(UiIcon::Ai),
         enabled,
         TextActionTone::Primary,
-        Vec2::new(width, 30.0),
+        Vec2::new(width, 24.0),
     )
 }
 
@@ -25799,9 +25862,15 @@ fn placeholder_for_label(language: Language, label: &str) -> String {
 struct ThemedSinglelineTextEdit<'a> {
     inner: TextEdit<'a>,
     inset_shadow: bool,
+    full_control_rect: bool,
 }
 
 impl<'a> ThemedSinglelineTextEdit<'a> {
+    fn min_size(mut self, size: Vec2) -> Self {
+        self.inner = self.inner.min_size(size);
+        self.full_control_rect = true;
+        self
+    }
     fn id(mut self, id: egui::Id) -> Self {
         self.inner = self.inner.id(id);
         self
@@ -25836,7 +25905,12 @@ impl<'a> ThemedSinglelineTextEdit<'a> {
 
 impl egui::Widget for ThemedSinglelineTextEdit<'_> {
     fn ui(self, ui: &mut Ui) -> egui::Response {
-        let response = ui.add(self.inner);
+        let mut response = ui.add(self.inner);
+        if self.full_control_rect {
+            // egui 0.31 returns the inner text rect, despite allocating/hit-testing
+            // the outer rect. Height-constrained controls paint their full frame.
+            response.rect = response.rect.expand2(Vec2::new(8.0, 4.0));
+        }
         if self.inset_shadow {
             paint_recessed_control_shadow(ui, response.rect);
         }
@@ -25857,6 +25931,7 @@ fn themed_singleline_text_edit<'a>(
             .text_color(theme::text())
             .frame(false),
         inset_shadow: true,
+        full_control_rect: false,
     }
 }
 
@@ -29165,9 +29240,7 @@ fn commit_summary_card(
     let branches = details
         .map(|details| details.branches.as_slice())
         .filter(|branches| !branches.is_empty())
-        .map(|branches| branches.join(", "))
-        .or_else(|| (!fallback_branches.is_empty()).then(|| fallback_branches.join(", ")))
-        .unwrap_or_else(|| "—".to_owned());
+        .unwrap_or(fallback_branches.as_slice());
     let committer = details
         .map(|details| details.committer.trim())
         .filter(|committer| !committer.is_empty())
@@ -29177,9 +29250,9 @@ fn commit_summary_card(
     } else {
         commit.date.as_str()
     };
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
         commit_summary_icon(ui, UiIcon::Message, theme::accent());
-        commit_text_with_links_ui(ui, &commit.subject, commit_text_links, true);
+        commit_summary_subject(ui, &commit.subject, commit_text_links);
     });
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
@@ -29198,10 +29271,79 @@ fn commit_summary_card(
         if committer != commit.author {
             commit_summary_value(ui, UiIcon::User, committer, false, false);
         }
-        if branches != "—" {
-            commit_summary_value(ui, UiIcon::Branch, &branches, false, false);
-        }
     });
+    if !branches.is_empty() {
+        commit_summary_branches(ui, branches);
+    }
+}
+
+fn commit_branches_layout(value: &str, width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::simple(
+        value.to_owned(),
+        FontId::proportional(11.5),
+        theme::muted(),
+        width.max(1.0),
+    );
+    job.wrap.max_rows = 2;
+    job.wrap.overflow_character = Some('…');
+    job
+}
+
+fn commit_subject_layout(ui: &Ui, value: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    RichText::new(value).strong().color(theme::text()).append_to(
+        &mut job,
+        ui.style(),
+        egui::FontSelection::Default,
+        Align::Min,
+    );
+    job.wrap.max_width = ui.available_width().max(1.0);
+    job.wrap.max_rows = 2;
+    job.wrap.overflow_character = Some('…');
+    job
+}
+
+fn commit_summary_subject(ui: &mut Ui, value: &str, rules: &[CompiledCommitTextLink]) {
+    let galley = ui.fonts(|fonts| fonts.layout_job(commit_subject_layout(ui, value)));
+    if !galley.elided {
+        commit_text_with_links_ui(ui, value, rules, true);
+        return;
+    }
+    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), value)
+    });
+    ui.painter().galley(rect.min, galley, theme::text());
+    response.on_hover_ui(|ui| {
+        ui.set_max_width(480.0);
+        ui.style_mut().interaction.selectable_labels = true;
+        egui::ScrollArea::vertical()
+            .max_height(280.0)
+            .show(ui, |ui| commit_text_with_links_ui(ui, value, rules, true));
+    });
+}
+
+fn commit_summary_branches(ui: &mut Ui, branches: &[String]) -> egui::Response {
+    ui.horizontal_top(|ui| {
+        commit_summary_icon(ui, UiIcon::Branch, theme::muted());
+        let job = commit_branches_layout(&branches.join(", "), ui.available_width());
+        let galley = ui.fonts(|fonts| fonts.layout_job(job));
+        // Paint directly: Label adds its own unbounded tooltip for elided text.
+        let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), galley.text())
+        });
+        ui.painter().galley(rect.min, galley, theme::muted());
+        response.on_hover_ui(|ui| {
+            ui.set_max_width(480.0);
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(branches.join("\n")).selectable(true).wrap());
+                });
+        })
+    })
+    .inner
 }
 
 fn commit_summary_icon(ui: &mut Ui, icon: UiIcon, color: Color32) {
@@ -38452,8 +38594,8 @@ mod ui_tests {
                 for label in ["AI 生成", "AI generate"] {
                     let enabled = commit_ai_generate_button(ui, label, true);
                     assert!(enabled.enabled());
-                    assert!(enabled.rect.width() >= 112.0);
-                    assert!(enabled.rect.height() >= 30.0);
+                    assert!(enabled.rect.width() >= 88.0);
+                    assert_eq!(enabled.rect.height(), 24.0);
                     let disabled = commit_ai_generate_button(ui, label, false);
                     assert!(!disabled.enabled());
                     assert!(!disabled.clicked());
@@ -38473,6 +38615,42 @@ mod ui_tests {
         assert!(controls.contains("self.start_commit_ai(ui.ctx());"));
         assert!(!controls.contains("popup"));
         assert!(!controls.contains("menu_button"));
+    }
+
+    #[test]
+    fn commit_header_actions_share_a_centerline_with_compact_ai_button() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            ctx.set_pixels_per_point(scale);
+            for enabled in [true, false] {
+                for (ai_label, options_label) in [("AI 生成", "提交选项…"), ("AI generate", "Commit options…")] {
+                    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let (options, history, ai) = commit_header_row(ui, |ui| {
+                                panel_heading_inline(ui, "Commit");
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let options = ui.menu_button(options_label, |_| {}).response.rect;
+                                    let history = icon_button(ui, UiIcon::History, "History", true).rect;
+                                    let ai = commit_ai_generate_button(ui, ai_label, enabled).rect;
+                                    (options, history, ai)
+                                }).inner
+                            }).inner;
+                            assert!((options.center().y - ai.center().y).abs() <= 0.5 / scale,
+                                "Options {options:?}, AI {ai:?}, scale {scale}, enabled {enabled}");
+                            assert!((history.center().y - ai.center().y).abs() <= 0.5 / scale,
+                                "History {history:?}, AI {ai:?}, scale {scale}, enabled {enabled}");
+                            assert!(ai.right() <= history.left());
+                            assert!(history.right() <= options.left());
+                        });
+                    });
+                }
+            }
+        }
+        let source = include_str!("app.rs");
+        let panel = source.split("fn commit_panel(").nth(1).unwrap()
+            .split("fn rebase_commit_panel_body(").next().unwrap();
+        assert!(panel.contains("commit_header_row(ui,"));
     }
 
     #[test]
@@ -40633,6 +40811,121 @@ mod ui_tests {
         let search_end = source[search_start..].find("fn history_view(").unwrap();
         let search_source = &source[search_start..search_start + search_end];
         assert!(!search_source.contains("search_details_scroll"));
+    }
+
+    #[test]
+    fn commit_subject_summary_is_limited_to_two_rows_with_full_hover_content() {
+        let ctx = egui::Context::default();
+        let subject = "Merge branch 'feature/用户信息模块' of https://example.com/team/project ".repeat(20);
+        for scale in [1.0, 1.5, 2.0] {
+            ctx.set_pixels_per_point(scale);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for width in [120.0, 260.0, 520.0] {
+                        ui.scope(|ui| {
+                            ui.set_width(width);
+                            let galley = ui.fonts(|fonts| {
+                                fonts.layout_job(commit_subject_layout(ui, &subject))
+                            });
+                            assert_eq!(galley.rows.len(), 2);
+                            assert!(galley.elided);
+                            assert_eq!(galley.text(), subject);
+                            let top = ui.cursor().top();
+                            commit_summary_subject(ui, &subject, &[]);
+                            assert!(ui.min_rect().bottom() - top <= galley.size().y + 1.0);
+                        });
+                    }
+                    let short = ui.fonts(|fonts| {
+                        fonts.layout_job(commit_subject_layout(ui, "fix: typo"))
+                    });
+                    assert_eq!(short.rows.len(), 1);
+                    assert!(!short.elided);
+                });
+            });
+        }
+        let source = include_str!("app.rs");
+        let helper = source.split("fn commit_summary_subject(").nth(1).unwrap()
+            .split("fn commit_summary_branches(").next().unwrap();
+        assert_eq!(helper.matches(".on_hover_ui(").count(), 1);
+        assert!(!helper.contains("Label::new(galley)"));
+        assert!(helper.contains("commit_text_with_links_ui(ui, value, rules, true)"));
+        assert!(helper.contains(".max_height(280.0)"));
+    }
+
+    #[test]
+    fn commit_branch_summary_is_limited_to_two_rows() {
+        let ctx = egui::Context::default();
+        let branches = (0..80)
+            .map(|index| format!("origin/feature/用户信息模块-very-long-branch-{index}"))
+            .collect::<Vec<_>>();
+        for scale in [1.0, 1.5, 2.0] {
+            ctx.set_pixels_per_point(scale);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for width in [100.0, 240.0, 520.0] {
+                        let galley = ui.fonts(|fonts| {
+                            fonts.layout_job(commit_branches_layout(&branches.join(", "), width))
+                        });
+                        assert_eq!(galley.rows.len(), 2);
+                        assert!(galley.elided);
+                        assert!(galley.size().x <= width + 1.0);
+                        assert_eq!(galley.rows.last().unwrap().glyphs.last().unwrap().chr, '…');
+                        ui.scope(|ui| {
+                            ui.set_width(width + 22.0);
+                            let response = commit_summary_branches(ui, &branches);
+                            assert!(response.rect.height() <= galley.size().y + 1.0);
+                        });
+                    }
+                    let short = ui.fonts(|fonts| {
+                        fonts.layout_job(commit_branches_layout("main", 240.0))
+                    });
+                    assert_eq!(short.rows.len(), 1);
+                    assert!(!short.elided);
+                });
+            });
+        }
+        let source = include_str!("app.rs");
+        let helper = source.split("fn commit_summary_branches(").nth(1).unwrap()
+            .split("fn commit_summary_icon(").next().unwrap();
+        assert!(helper.contains(".on_hover_ui("));
+        assert_eq!(helper.matches(".on_hover_ui(").count(), 1);
+        assert!(helper.contains("ui.painter().galley("));
+        assert!(!helper.contains("Label::new(galley)"));
+        assert!(!helper.contains(".on_hover_text("));
+        assert!(helper.contains("ScrollArea::vertical()"));
+        assert!(helper.contains("branches.join(\"\\n\")"));
+        assert!(helper.contains(".selectable(true)"));
+    }
+
+    #[test]
+    fn file_search_input_has_real_height_and_task_drop_cancels() {
+        let ctx = egui::Context::default();
+        for scale in [1.0, 1.5, 2.0] {
+            ctx.set_pixels_per_point(scale);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect = Rect::from_min_size(ui.cursor().min, Vec2::new(400.0, 36.0));
+                    let mut query = "usePinService".to_owned();
+                    let response = ui.put(rect, themed_singleline_text_edit(&mut query, "搜索提交")
+                        .desired_width(rect.width()).min_size(rect.size()).vertical_align(Align::Center));
+                    assert!((response.rect.height() - 36.0).abs() <= 0.5 / scale);
+                });
+            });
+        }
+        let (_sender, receiver) = mpsc::channel();
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        drop(FileSearchTask { root: PathBuf::from("test-repo"), cancelled: cancelled.clone(), timed_out: false, receiver });
+        assert!(cancelled.load(Ordering::Relaxed));
+        let source = include_str!("app.rs");
+        let poll = source.split("if let Some(mut task) = self.file_search_task.take()").nth(1).unwrap()
+            .split("if let Some(receiver) = self.blame_task.take()").next().unwrap();
+        for token in ["self.active_repo_root_matches(&task.root)", "self.file_search_complete = finished",
+            "task.timed_out = true", "task.cancelled.store(true", "self.file_search_task = Some(task)",
+            "search.timeout", "search.disconnected"] { assert!(poll.contains(token), "{token}"); }
+        for language in [Language::Chinese, Language::English] {
+            assert_ne!(i18n::t(language, "search.timeout"), "search.timeout");
+        }
+        assert!(i18n::t(Language::Chinese, "search.timeout").contains("搜索"));
     }
 
     #[test]
