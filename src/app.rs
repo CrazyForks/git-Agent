@@ -14431,7 +14431,14 @@ impl GitAgentApp {
                         ui.spinner();
                         ui.label(self.tr("search.running"));
                         let task = self.file_search_task.as_ref().unwrap();
-                        if ui.add_enabled(!task.cancelled.load(Ordering::Relaxed), egui::Button::new(self.tr("search.cancel"))).clicked() {
+                        if text_action_button(
+                            ui,
+                            self.tr("search.cancel"),
+                            None,
+                            !task.cancelled.load(Ordering::Relaxed),
+                            TextActionTone::Secondary,
+                            Vec2::new(100.0, 26.0),
+                        ).clicked() {
                             task.cancelled.store(true, Ordering::Relaxed);
                         }
                     });
@@ -40941,6 +40948,13 @@ mod ui_tests {
         assert!(search_source.contains("search_dimension_dropdown("));
         assert!(search_source.contains("search_submit_button("));
         assert!(search_source.contains("file_search_busy"));
+        let cancel_start = search_source.find("let task = self.file_search_task.as_ref().unwrap();").unwrap();
+        let cancel_source = &search_source[cancel_start..search_source[cancel_start..].find("ui.ctx().request_repaint_after").unwrap() + cancel_start];
+        assert!(cancel_source.contains("text_action_button("));
+        assert!(cancel_source.contains("self.tr(\"search.cancel\")"));
+        assert!(cancel_source.contains("!task.cancelled.load(Ordering::Relaxed)"));
+        assert!(cancel_source.contains("task.cancelled.store(true, Ordering::Relaxed)"));
+        assert!(!cancel_source.contains("egui::Button::new"));
         assert!(search_source.contains("add_enabled_ui(!file_search_busy"));
         assert!(!search_source.contains("content_panel_frame(theme::bg())"));
         assert!(search_source.contains("start_file_change_search()"));

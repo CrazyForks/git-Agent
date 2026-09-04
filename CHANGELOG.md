@@ -5,7 +5,15 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 1.4.3 — 2026-09-04
+
+### Fixed
+
+- Restored the shared button styling for Cancel search, retaining cancellation and disabled-state behavior and fixing the regression that blocked the 1.4.2 installer builds. This release includes the search and layout improvements listed below.
+
 ## 1.4.2 — 2026-09-04
+
+Installer builds failed; use 1.4.3 or later for these changes.
 
 ### Changed
 
