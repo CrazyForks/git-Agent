@@ -5,6 +5,19 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 1.4.8 — 2026-09-21
+
+### Added
+
+- Added an optional “Push current branch after a successful pull” action. It is available only when merged changes are committed immediately; turning that prerequisite off also clears the push option. Existing upstreams are reused, while branches without an upstream are pushed to a same-name branch on the selected remote and start tracking it.
+- Added “View file commit history” to repository file context menus across the workspace, commit details, search results, conflicts, patch creation, and interactive rebase views. The action opens commit search with the complete repository-relative path.
+- Full-path file searches now use exact `git log --follow -- <path>` history, preserving rename history and avoiding unrelated files with the same basename.
+
+### Fixed
+
+- Cleared file-search text, tasks, results, selected commits, selected files, and diffs immediately when switching repositories, preventing details from the previous repository from remaining visible.
+- Manual navigation from Workspace or History into Commit Search now starts with an empty search. Explicit file-history navigation remains the only path that carries a filename into the search view.
+
 ## 1.4.7 — 2026-09-10
 
 ### Fixed

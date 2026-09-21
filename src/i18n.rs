@@ -1742,6 +1742,10 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{7acb}\u{5373}\u{63d0}\u{4ea4}\u{5408}\u{5e76}\u{7684}\u{6539}\u{52a8}",
     ),
     (
+        "pull.push_after_pull",
+        "\u{62c9}\u{53d6}\u{6210}\u{529f}\u{540e}\u{7acb}\u{5373}\u{63a8}\u{9001}\u{5f53}\u{524d}\u{5206}\u{652f}",
+    ),
+    (
         "pull.include_tags",
         "\u{5305}\u{62ec}\u{88ab}\u{5408}\u{5e76}\u{63d0}\u{4ea4}\u{7684}\u{6807}\u{7b7e}\u{5185}\u{5bb9}",
     ),
@@ -1903,6 +1907,10 @@ const EN: &[(&str, &str)] = &[
     ("pull.local_branch", "Pull into local branch"),
     ("pull.options", "Options"),
     ("pull.commit_merge", "Commit merged changes immediately"),
+    (
+        "pull.push_after_pull",
+        "Push current branch after a successful pull",
+    ),
     ("pull.include_tags", "Include tags from merged commits"),
     (
         "pull.force_merge_commit",
@@ -3037,6 +3045,7 @@ const EN: &[(&str, &str)] = &[
     ("worktree.unstage_file", "Unstage file"),
     ("worktree.open_file", "Open"),
     ("worktree.reveal_file", "Open containing folder"),
+    ("file.view_history", "View file commit history"),
     ("worktree.open_failed", "Unable to open file"),
     ("worktree.reveal_failed", "Unable to open containing folder"),
     ("worktree.discard", "Discard changes"),
@@ -3348,6 +3357,7 @@ const ZH: &[(&str, &str)] = &[
     ("worktree.unstage_file", "取消暂存"),
     ("worktree.open_file", "打开"),
     ("worktree.reveal_file", "打开所在文件夹"),
+    ("file.view_history", "查看文件提交历史"),
     ("worktree.open_failed", "无法打开文件"),
     ("worktree.reveal_failed", "无法打开所在文件夹"),
     ("worktree.discard", "丢弃更改"),

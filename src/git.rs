@@ -1089,6 +1089,30 @@ pub fn search_commits_by_changed_file(
     Ok(hashes)
 }
 
+pub fn commits_for_file_path(
+    root: impl AsRef<Path>, path: &str, cancelled: &AtomicBool,
+) -> Result<Vec<String>> {
+    let path = path.trim().replace('\\', "/");
+    if path.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max_count = format!("--max-count={HISTORY_COMMIT_LIMIT}");
+    let output = search_git_output(
+        root.as_ref(),
+        &[
+            "log",
+            "--date-order",
+            &max_count,
+            "--follow",
+            "--format=%H",
+            "--",
+            &path,
+        ],
+        cancelled,
+    )?;
+    Ok(parse_hash_lines(&output))
+}
+
 fn search_git_output(root: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<String> {
     Ok(String::from_utf8_lossy(&search_git_output_bytes(root, args, cancelled)?).into_owned())
 }
@@ -4689,6 +4713,30 @@ mod tests {
             cancelled.store(true, AtomicOrdering::Relaxed);
         }).is_err());
         assert!(search_git_output(&root, &["not-a-command"], &cancelled).unwrap_err().to_string().contains("cancelled"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_file_history_follows_renames_and_accepts_full_paths() -> Result<()> {
+        let root = init_patch_test_repo("file-history-follow")?;
+        let original_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+        fs::create_dir_all(root.join("src/nested"))?;
+        git_output(&root, &["mv", "selected.txt", "src/nested/renamed.txt"])?;
+        git_output(&root, &["commit", "-m", "rename selected file"])?;
+        let rename_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+        fs::write(root.join("src/nested/renamed.txt"), "after rename\n")?;
+        git_output(&root, &["add", "src/nested/renamed.txt"])?;
+        git_output(&root, &["commit", "-m", "edit renamed file"])?;
+        let edit_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        let cancelled = AtomicBool::new(false);
+        let hashes = commits_for_file_path(
+            &root,
+            "src\\nested\\renamed.txt",
+            &cancelled,
+        )?;
+        assert_eq!(hashes, vec![edit_hash, rename_hash, original_hash]);
         fs::remove_dir_all(root)?;
         Ok(())
     }
